@@ -50,6 +50,7 @@ import html
 import inspect
 import io
 import re
+import signal
 import socket
 import ssl
 import subprocess
@@ -63,6 +64,11 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+try:                                     # POSIX only: pdftotext 子进程内存上限 (Batch 7 修复 A5)
+    import resource
+except ImportError:                      # Windows 无 resource; 降级为不设上限 (本项目目标 macOS)
+    resource = None
 
 HOME = Path.home()
 CONF = HOME / ".pi/agent/etc/futures-news.json"
@@ -89,6 +95,32 @@ BUDGET_S = 45                        # 全局抓取预算(秒): BUDGET_S + 单�
 # 单源最小份额(秒)依据: 生产日志 626 轮实测 p99/max —— 见闻商品 5.40/7.50s、Nasdaq 4.10/4.20s、
 # 东财 max 5.20s; 5.0s 会把见闻商品约 1% 的轮次砍成失败, 故抬到 7.0 (Batch 6.1 U-B / fix C1)
 MIN_SLICE = 7.0                      # 单源抓取最小份额(秒)
+
+# ---- Batch 7 研报源 (东财研报 / 中金所 / 中期协): 列表抓取 + PDF 正文摘要
+# 设计口径: PDF 只在「条目首次进入队列」时解析一次 (见 extract_research), 历史条目
+# 永远不重复下载; 解析预算与 45s 抓取预算解耦, 保证既有 14 源的时间行为不变。
+RESEARCH_EVERY_S = 1800              # 研报源最小运行间隔(秒): 研报是分钟级信息, 30 分钟足够
+RESEARCH_MAX_PDF = 2                 # 每轮最多解析的 PDF 篇数 (串行, 单篇实测 1-2s)
+PDF_TIMEOUT = 6.0                    # pdftotext 子进程最长秒数
+# 每轮 PDF 总预算 = 下载 8s + 解析 6s = 14s: 45(抓取)+14=59 <= ROUND_SOFT_S(60)。
+# ROUND_MARGIN_S(6s 本地余量)另计, 最坏情况只会把发送推迟到下一轮, 不会丢消息。
+PDF_BUDGET_S = 14.0                  # 每轮 PDF 下载+解析总预算(秒); 硬上界见 extract_research
+PDF_DL_BUDGET_S = PDF_BUDGET_S - PDF_TIMEOUT   # 单篇下载子预算(8s): 必须给 pdftotext 留出解析时间
+PDF_MAX_BYTES = 8 * 1024 * 1024      # 单个 PDF 上限 8MB (实测最大为中金所月报 2.17MB)
+PDF_CAP = 10                         # curl 最长秒数上限; 生产路径被 PDF_DL_BUDGET_S 夹到 <=8s
+PDF_RLIMIT_AS = 256 * 1024 * 1024    # pdftotext 子进程内存上限: 391KB PDF 炸弹实测 926MB RSS; 真实 PDF 仅 ~10MB
+PDF_MAX_PAGES = 8                    # 只解析前 N 页: 8 页保住中金所月报 240 字摘要, 后半是表格/附录
+RESEARCH_URL_MAX = 1000              # 研报链接上限; 超长 URL 会让单条 u16>4096 且 split_msg 无法拆
+RESEARCH_META_MAX = 200              # 研报元信息(text 的「机构 · 日期」段)上限
+PDF_MIN_CHARS = 40                   # 清洗后正文短于此数 -> 判「无文本层」, 摘要留空
+SNIPPET_MAX = 240                    # 摘要取前 N 字 (需求区间 200-300)
+RESEARCH_TAG = "研究"                # 研报 key 前缀 (含 ':' -> 与 dedupe_key 输出天然不相交)
+RESEARCH_SRCS = ("东财研报", "中金所", "中期协")
+# pdftotext 为 poppler CLI (非 Python 依赖); 不存在时 pdf_text 直接降级为「无摘要」
+PDFTOTEXT = (os.environ.get("FUTNEWS_PDFTOTEXT")
+             or next((p for p in ("/opt/homebrew/bin/pdftotext", "/usr/local/bin/pdftotext")
+                      if os.path.exists(p)), ""))
+
 ROUND_SOFT_S = 60                    # 单轮软截止(秒): 120 - 单次 send 最坏(由 send_plan() 推导, 当前 54) - 余量 6
 ROUND_HARD_S = 120                   # launchd StartInterval 硬上界(秒): 单轮总耗时不得超过
 ROUND_MARGIN_S = 6                   # 本地阶段(锁/落盘/过滤)余量(秒)
@@ -492,6 +524,28 @@ def esc(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def esc_url(u: str) -> str:
+    """HTML 属性转义 (Batch 7): esc() 不转义引号, href 里一个 `"` 就会截断标签."""
+    return esc(u).replace('"', "&quot;")
+
+
+def esc_quote(s: str) -> str:
+    """研报文本字段转义 (Batch 7 修复 C2): 在 esc() 之上再实体化双引号.
+
+    标题/元信息/摘要都来自外部 PDF 与源站, 与 href 同等对待; 非研报路径仍用 esc(),
+    逐字节行为不变 (由 B6/B7 的旧断言守住)。
+    """
+    return esc(s).replace('"', "&quot;")
+
+
+def is_http_url(u) -> bool:
+    """URL 协议白名单 (Batch 7 修复 C1): 只有 http(s) 允许落盘与渲染成链接.
+
+    与 load_queue 原口径一致; 非字符串 (int/None/dict) 一律 False, 不再抛 AttributeError。
+    """
+    return isinstance(u, str) and u.startswith(("http://", "https://"))
+
+
 # ------------------------------------------------------------------ queue (v5)
 def load_queue() -> tuple[list[dict], str, int]:
     """读聚合队列; 返回 (条目, 问题描述). 文件不存在 = 空队列 (非错误)."""
@@ -524,6 +578,13 @@ def load_queue() -> tuple[list[dict], str, int]:
             bad += 1
             continue
         out.append({"src": str(it.get("src") or "?"), "ts": ts, "text": text, "key": str(key)})
+        # Batch 7: 研报条目额外携带 url/snippet; 非研报条目仍只有上面 4 个字段 (JSON 逐字节不变)
+        url = it.get("url")
+        if is_http_url(url):
+            out[-1]["url"] = url
+            snip = it.get("snippet")
+            if isinstance(snip, str):
+                out[-1]["snippet"] = snip
     if bad:
         if out:
             log(f"队列有 {bad} 条结构/时间戳异常, 已跳过 (保留其余 {len(out)} 条)")
@@ -547,7 +608,14 @@ def queue_upsert(queue: list[dict], items: list[dict]) -> tuple[int, int]:
     for it in items:
         if it["key"] in have:
             continue
-        queue.append({"src": it["src"], "ts": it["ts"], "text": it["text"], "key": it["key"]})
+        rec = {"src": it["src"], "ts": it["ts"], "text": it["text"], "key": it["key"]}
+        # Batch 7: 研报条目附带 url/snippet (snippet=None 表示待解析, 不落盘 -> 下轮重试)
+        url = it.get("url")
+        if is_http_url(url):
+            rec["url"] = url
+            if it.get("snippet") is not None:
+                rec["snippet"] = str(it["snippet"])
+        queue.append(rec)
         have.add(it["key"])
         added += 1
     return added, len(items) - added
@@ -681,7 +749,8 @@ def clean_text(raw) -> str:
 
 def http(url: str, referer: str | None = None, tries: int = 3,
          deadline: float | None = None, cap: int = 12,
-         proxy: str | None = None, ua: str | None = None) -> bytes:
+         proxy: str | None = None, ua: str | None = None,
+         max_bytes: int = 0) -> bytes:
     """curl 取数据; 非 2xx 视作失败并重试; deadline 为本次调用的预算截止 (time.monotonic).
 
     Batch 6 新增三个**默认等于旧行为**的关键字参数:
@@ -691,8 +760,20 @@ def http(url: str, referer: str | None = None, tries: int = 3,
       ua    非空时替换 UA (仅 MiningTech 需要 Feed 阅读器 UA)
     proxy 为空时 argv 与 Batch 6 之前逐元素相同 —— 这是「不得改变现有中文源抓取行为」
     的落点, 由 selftest「无代理时 curl 命令行与旧版逐元素一致」守住。
+
+    Batch 7 新增 max_bytes (默认 0 = 不追加任何参数, argv 与旧版逐元素一致):
+    仅 PDF 下载使用, 交给 curl --max-filesize 在超过上限时中止 (exit 63), 避免
+    2GB 级错误文件把内存吃光。
+
+    Batch 7 修复 A2: 一律检查 curl 退出码 (超时 28 / 超限 63 / chunked 残体 18 都非 0),
+    非 0 即视为失败, 不再把 `-w` 打印的 200 当成成功。对 max_bytes 路径另做两道严格校验:
+    ① `--max-filesize` 由 curl 侧在超过声明体积时中止; ② 返回体长度必须 <= max_bytes。
+    Batch 7 修复 A5: max_bytes>0 (仅 PDF) 时不再请求 --compressed —— gzip 64MB 正文
+    压缩后仅 ~64KB, curl 的 --max-filesize 只认 Content-Length(压缩后), 解压峰值 128MB;
+    不发 Accept-Encoding 即从源头消掉解压放大。非研报路径的 argv 保持逐元素不变。
     """
     last = ""
+    strict = max_bytes > 0
     for i in range(tries):
         left = (deadline - time.monotonic()) if deadline else 30.0
         if left < 2:
@@ -700,7 +781,11 @@ def http(url: str, referer: str | None = None, tries: int = 3,
         max_time = max(2, min(cap, int(left)))
         cmd = ["curl", "-sS"]
         cmd += ["--proxy", proxy] if proxy else ["--noproxy", "*"]
-        cmd += ["--compressed", "--max-time", str(max_time), "-A", ua or UA,
+        if not strict:                       # PDF 路径不请求压缩, 见 docstring A5
+            cmd += ["--compressed"]
+        if strict:
+            cmd += ["--max-filesize", str(int(max_bytes))]
+        cmd += ["--max-time", str(max_time), "-A", ua or UA,
                 "-w", "\n%{http_code}", url]
         if referer:
             cmd += ["-H", f"Referer: {referer}"]
@@ -711,10 +796,18 @@ def http(url: str, referer: str | None = None, tries: int = 3,
                 # 击穿「代理失败不得回退直连」语义 (Batch 6 M4)。子进程环境里显式清空,
                 # argv 不变以免影响既有命令行断言。
                 kw["env"] = {**os.environ, "no_proxy": "", "NO_PROXY": ""}
-            raw = subprocess.run(cmd, **kw).stdout
+            r = subprocess.run(cmd, **kw)
+            rc = getattr(r, "returncode", 0)          # 旧测试桩无该属性时按成功处理
+            if rc != 0:                               # A2: curl 中止/超时/超限一律失败
+                last = f"curl rc={rc}"
+                raw = b""
+            else:
+                raw = r.stdout
             body, _, code = raw.rpartition(b"\n")
-            last = code.decode(errors="ignore").strip()
+            last = code.decode(errors="ignore").strip() if rc == 0 else last
             if body and last.startswith("2"):
+                if strict and len(body) > max_bytes:  # A2/A4: 体积兜底 (chunked 无长度时)
+                    raise RuntimeError(f"body 超上限 {len(body)}>{max_bytes}")
                 return body
         except Exception as e:
             last = f"{type(e).__name__}"
@@ -724,6 +817,259 @@ def http(url: str, referer: str | None = None, tries: int = 3,
         if nap > 0:
             time.sleep(nap)
     raise RuntimeError(f"http failed ({last or 'empty'})")
+
+
+def http_ok(url: str, deadline: float | None = None, timeout: int = 6) -> bool:
+    """HEAD 探测资源是否存在 (2xx): 只取状态码, 不下载 body (Batch 7).
+
+    中金所的日/周报是 0.5MB 级 XML、非交易日/未发布时会 302 到错误页, 用 GET 探测
+    等于每轮白拉半兆; 故只发 `curl -I`。网络失败/超时/参数非法一律返回 False,
+    由调用方按「本期未发布」处理 (不抛错、不计入源失败)。
+    """
+    left = (deadline - time.monotonic()) if deadline else 30.0
+    if left < 1.5:
+        return False
+    t = max(1, min(timeout, int(left)))
+    cmd = ["curl", "-sS", "--noproxy", "*", "-I", "--max-time", str(t),
+           "-A", UA, "-o", "/dev/null", "-w", "%{http_code}", url]
+    try:
+        raw = subprocess.run(cmd, capture_output=True, timeout=t + 3).stdout
+    except Exception:
+        return False
+    return raw.decode(errors="ignore").strip().startswith("2")
+
+
+# ---- Batch 7 PDF 正文提取 (只跑 poppler CLI; 任一失败都降级为「无摘要」)
+PDF_TABLE = re.compile(r"^\[?[Tt]able[_\-\w]*\]?$|^[图表]\s*\d")     # 版式标记/图表编号行
+PDF_NUM = re.compile(r"^[\s\d.,%+\-—–/()（）亿元万股手吨桶美元]+$")   # 纯数字/单位行 (表格碎片)
+PDF_CJK = re.compile(r"[\u4e00-\u9fff]")
+
+
+def pdf_clean(text: str, limit: int = SNIPPET_MAX) -> str:
+    """把 pdftotext 输出收拾成可推的一段摘要 (Batch 7).
+
+    版式噪音三类: ① 页码/页眉页脚 (纯数字、`- 3 -`); ② 表格碎片 (价格/占比/产品代码行);
+    ③ 版式标记 (`[Table_StockNameRptType]`、`图 2`). 只保留「含 ≥6 个汉字且 ≥10 字」的
+    成句行; 成句行合计不足 limit 时退回全部非空行 —— 中金所月报几乎全是表格, 只有
+    小节标题是成句行, 退回策略保证有文本层的 PDF 不被误判成「无文本层」。
+    """
+    lines: list[str] = []
+    for raw in (text or "").splitlines():
+        s = raw.strip()
+        if not s or PDF_TABLE.match(s) or PDF_NUM.match(s):
+            continue
+        lines.append(s)
+    good = [s for s in lines if len(s) >= 10 and len(PDF_CJK.findall(s)) >= 6]
+    body = re.sub(r"\s+", " ", " ".join(good or lines)).strip()
+    body = re.sub(r"[\ue000-\uf8ff\ufffd\x0c]", "", body)   # Wingdings 项目符号/换页符
+    return body[:limit].strip()
+
+
+def _pdf_child_limits() -> None:
+    """pdftotext 子进程的地址空间硬上限 (Batch 7 修复 A5).
+
+    PDF 内部 Flate 流可以 391KB -> 926MB RSS; `PDF_MAX_BYTES` 只限传输字节,
+    `PDF_TIMEOUT` 只限时间, 二者都不是内存上限。RLIMIT_AS 让 poppler 在超限时
+    分配失败并退出 (rc != 0), 由 pdf_text 按「确定性无文本」降级。
+    """
+    if resource is None:                     # Windows: preexec_fn 不可用, 由调用方传 None
+        return
+    try:
+        resource.setrlimit(resource.RLIMIT_AS, (PDF_RLIMIT_AS, PDF_RLIMIT_AS))
+    except (ValueError, OSError):
+        pass                                 # 平台不支持时退回「仅靠超时」
+
+
+def _pdftotext_children() -> list[tuple[int, int]]:
+    """返回 (pid, rss_kb) 形式的 pdftotext 直接子进程 (Batch 7 修复 A5 内存看门狗).
+
+    macOS 的 RLIMIT_AS 无法设到进程当前 VSZ 以下 (setrlimit 返回 EINVAL), 因此
+    preexec_fn 里的上限在 macOS 上不生效; 这里用 ps 轮询子进程 RSS 并在超限时 kill,
+    让 391KB -> 926MB 的 PDF 炸弹在 ~256MB 处终止 (Linux 上则由 RLIMIT_AS 直接生效)。
+    """
+    try:
+        raw = subprocess.run(["ps", "-axo", "pid=,ppid=,rss=,comm="],
+                             capture_output=True, timeout=2).stdout
+    except Exception:
+        return []
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "ignore")
+    me, out = os.getpid(), []
+    for line in str(raw).splitlines():
+        parts = line.split(None, 3)
+        if len(parts) < 4:
+            continue
+        try:
+            pid, ppid, rss = int(parts[0]), int(parts[1]), int(parts[2])
+        except ValueError:
+            continue
+        if ppid == me and "pdftotext" in parts[3]:
+            out.append((pid, rss))
+    return out
+
+
+def pdf_text(url: str, deadline: float | None = None,
+             referer: str | None = None) -> str | None:
+    """下载 PDF 并提取正文摘要; 绝不抛错 (Batch 7).
+
+    返回语义 (修复 A1):
+      None  瞬时失败 —— 下载失败/超时/预算耗尽, **下轮重试** (extract_research 保持延迟入队)
+      ""    确定性无文本 —— 非 PDF 响应、pdftotext 缺失、子进程非 0 退出、清洗后过短,
+            **视为已判定, 不再重试** (避免一次抖动把该篇摘要永久写死成 "")
+
+    安全上限 (修复 A5): 下载 8MB + pdftotext 前 8 页 + 子进程内存上限 256MB
+    (preexec_fn 设 RLIMIT_AS, Linux 直接生效; macOS 上由 ps RSS 看门狗 kill)。
+    """
+    if not url:
+        return ""
+    dl = time.monotonic() + PDF_DL_BUDGET_S
+    if deadline:                              # 总预算里给解析预留 PDF_TIMEOUT (修复 A3)
+        dl = min(dl, deadline - PDF_TIMEOUT)
+    try:
+        raw = http(url, referer=referer, tries=1, deadline=dl,
+                   cap=PDF_CAP, max_bytes=PDF_MAX_BYTES)
+    except Exception as e:
+        log(f"pdf 下载失败, 下轮重试: {type(e).__name__}: {str(e)[:60]}")
+        return None
+    if not raw.lstrip()[:5].startswith(b"%PDF"):
+        log("pdf 响应不是 PDF (疑似 302 错误页), 无摘要")
+        return ""
+    if not PDFTOTEXT or not os.path.exists(PDFTOTEXT):
+        log("pdftotext 不存在, 无摘要 (降级)")
+        return ""
+    _res: dict = {}
+
+    def _run_pdf() -> None:
+        try:
+            _res["r"] = subprocess.run(
+                [PDFTOTEXT, "-f", "1", "-l", str(PDF_MAX_PAGES), "-", "-"],
+                input=raw, capture_output=True, timeout=PDF_TIMEOUT,
+                preexec_fn=_pdf_child_limits if os.name == "posix" else None)
+        except BaseException as e:            # 线程内异常必须显式传递, 否则会静默丢失
+            _res["e"] = e
+
+    _t = threading.Thread(target=_run_pdf, daemon=True)
+    _t.start()
+    _killed = False
+    while _t.is_alive():                      # macOS 上 RLIMIT_AS 无法降到进程当前 VSZ 以下
+        for _pid, _rss in _pdftotext_children():
+            if _rss > PDF_RLIMIT_AS // 1024:  # ps 的 rss 单位是 KB
+                try:
+                    os.kill(_pid, signal.SIGKILL)
+                    _killed = True
+                except OSError:
+                    pass
+        _t.join(0.1)
+    _exc = _res.get("e")
+    if isinstance(_exc, subprocess.TimeoutExpired):
+        log("pdftotext 超时, 下轮重试")
+        return None
+    if _exc is not None:
+        log(f"pdftotext 不可用({type(_exc).__name__}), 无摘要")
+        return ""
+    r = _res.get("r")
+    if _killed:
+        log(f"pdftotext 内存超限 (>{PDF_RLIMIT_AS // 1048576}MB), 已终止, 无摘要")
+        return ""
+    if r is None:
+        return ""
+    if r.returncode != 0:
+        log(f"pdftotext 退出码 {r.returncode}, 无摘要")
+        return ""
+    body = pdf_clean(r.stdout.decode("utf-8", "ignore"))
+    if len(body) < PDF_MIN_CHARS:
+        log(f"pdf 无文本层 (清洗后仅 {len(body)} 字), 无摘要")
+        return ""
+    return body
+
+
+def research_key(src: str, ident: str) -> str:
+    """研报稳定去重键 (Batch 7): 同一篇研报每轮拉回都是同一个 key.
+
+    ident 取源站唯一 ID (东财 infoCode / 中金所 YYYYMM(DD) / 中期协 docId), 无 ID 的源
+    退化为「标题+日期」。前缀带 ':' —— norm_text() 会删除标点, 故 dedupe_key() 的输出
+    永远不含 ':', 两类 key 命名空间天然不相交。
+    """
+    return f"{RESEARCH_TAG}:{src}:{ident}"[:120]
+
+
+def research_item(src: str, ident: str, title: str, url: str, ts: int,
+                  meta: str = "", snippet: str | None = None) -> dict:
+    """构造研报条目 (Batch 7): 新增 url/snippet 两个持久化字段, 其余沿用既有 item 结构.
+
+    text 保持纯文本「标题｜机构 · 发布日期」(全角竖线分隔, 不新增第三个持久化字段):
+    过滤、日志、--queue/--dry-run 打印全部沿用既有逻辑, 只有 build_messages 见到 url
+    才走 HTML 链接样式。snippet=None = 待提取, "" = 已判定无文本层 (不重试)。
+
+    ts 一律取**首次发现时刻**(int(time.time())): 研报源只给日期级发布时间(00:00), 直接
+    用会把「当天上午发布的研报」判成 12 小时前, 触发 max_age 老化与 max_hold 立即冲刷;
+    真实发布日期写在 text 的元信息里, 人眼可读, 机器不拿它做时间闸门。
+    """
+    text = f"{title}｜{meta}" if meta else title
+    return {"src": src, "ts": ts, "text": text, "url": url,
+            "snippet": snippet, "key": research_key(src, ident)}
+
+
+def research_reason(text: str) -> str:
+    """研报源的过滤口径 (Batch 7): 豁免「品种锚点」硬门槛, 保留栏目/噪声否决.
+
+    中金所/中期协的标题是官方统计口径 (「中金所月度数据统计」「全国期货市场交易情况
+    简报」), 走 filter_reason 会被判「泛语境无品种」; 但栏目/日历、超短内容、股票
+    口径噪声 (业绩/个股/沪深指数…) 仍然要丢。
+    顺序与 filter_reason 一致: 具体品种/产业锚点优先于噪声词 —— 否则「夯实股东回报」
+    里的「股东」会把「电解铝量价齐升」这种正牌商品研报误杀。
+    """
+    t = (text or "").strip()
+    if SKIP_RE.search(strip_decor(t)):
+        return "栏目/日历"
+    if len(norm_text(t)) < 4:
+        return "内容过短"
+    if hit(t, STRONG) or hit(t, ANCHOR):
+        return ""
+    hard = first_hit(t, NOISE_HARD)
+    if hard:
+        return f"噪声:{hard}"
+    return ""
+
+
+def extract_research(queue: list[dict], fresh: list[dict]) -> tuple[int, int]:
+    """只给「研报类 + 队列里还没有摘要」的条目提取 PDF 正文 (Batch 7).
+
+    返回 (实际解析篇数, 被补上摘要的队列条目数)。串行执行: pdftotext 是 CPU 密集
+    子进程, 并发只会抢同一份 PDF 预算。每轮最多 RESEARCH_MAX_PDF 篇、总预算
+    PDF_BUDGET_S(下载 8s + 解析 6s) —— 研报条目的正文晚一轮补上也比拖垮 45s 抓取预算好。
+    """
+    known = {q["key"]: q.get("snippet", "") for q in queue
+             if q.get("url") and "snippet" in q}
+    qids = {id(q) for q in queue}
+    todo: list[dict] = []                       # 待解析条目 (队列内的先于 fresh)
+    seen_keys: set[str] = set()
+    for it in list(queue) + list(fresh):
+        if not it.get("url"):
+            continue
+        if it["key"] in known:                  # 同篇已解析过 (空串 = 无文本层) -> 直接复用
+            it["snippet"] = known[it["key"]]
+            continue
+        if it.get("snippet") is not None:       # 源已给出结论 (如中金所日/周报无正文)
+            continue
+        if it["key"] in seen_keys:              # 队列与 fresh 同时出现同一篇 -> 只解析一次
+            continue
+        seen_keys.add(it["key"])
+        todo.append(it)
+    dl = time.monotonic() + PDF_BUDGET_S
+    calls = q_changed = 0
+    for it in todo:
+        if (calls >= RESEARCH_MAX_PDF or time.monotonic() >= dl
+                or time.monotonic() + PDF_TIMEOUT > dl):   # 给解析留时间 -> 14s 是硬上界 (A3)
+            break
+        got = pdf_text(it["url"], deadline=dl)
+        calls += 1
+        if got is None:                      # A1: 瞬时失败 -> snippet 保持 None, 下轮重试
+            log(f"研报正文提取瞬时失败, 下轮重试: {it['key']}")
+            continue
+        it["snippet"] = got                  # "" = 已判定无文本层, 不再重试
+        q_changed += int(id(it) in qids)
+    return calls, q_changed
 
 
 def sane_ts(v: int) -> int:
@@ -899,6 +1245,8 @@ def merge_near(items: list[dict]) -> tuple[list[dict], list[tuple]]:
         for prev in reversed(kept):
             if it["ts"] - prev["ts"] > NEAR_WINDOW:
                 break
+            if it.get("url") or prev.get("url"):
+                continue                      # Batch 7: 研报按稳定 key 精确去重, 不做近似合并
             a, b = prev.get("key", ""), it.get("key", "")
             if len(a) < NEAR_MIN_LEN or len(b) < NEAR_MIN_LEN:
                 continue
@@ -1312,6 +1660,132 @@ def src_hellenic(deadline: float | None = None) -> list[dict]:
     return rss_items(_feed_via_proxy(FEED_HELLENIC, deadline, "Hellenic"), "Hellenic")
 
 
+# ------------------------------------------------------------------ Batch 7 研报源
+def _month_back(now: datetime, back: int) -> str:
+    """往前数 back 个自然月的 YYYYMM (back>=1; 2026-11 + back=1 -> '202610')."""
+    y, m = now.year, now.month - back
+    while m <= 0:
+        m += 12
+        y -= 1
+    return f"{y}{m:02d}"
+
+
+def src_em_report(deadline: float | None = None) -> list[dict]:
+    """东财券商研报 (Batch 7): 全市场研报列表 -> 既有期货词表筛 -> 只留商品/期货相关.
+
+    CTO 授权偏差 (覆盖规格 U4 的 qType=0): 只接 qType=1(行业研报) 与 qType=2(策略研报);
+    qType=0(个股) 实测 0/100 命中不接, 合并 qType=1,2 会 HTTP 400, 故两次请求并按
+    infoCode 去重. 实测 3 天窗口: qType=1 放行 6/100, qType=2 放行 2/100.
+    publishDate 只精确到日期 ("2026-11-06 00:00:00.000"), 故 ts 取首次发现时刻,
+    真实日期只写进 text 的元信息 (理由见 research_item)。
+    """
+    end = datetime.now(TZ_CN).date()
+    begin = end - timedelta(days=3)          # 覆盖周末/长假: 列表按发布时间倒序, 100 条足够
+    out = []
+    now_ts = int(time.time())
+    seen_codes: set[str] = set()
+    for qtype in (1, 2):                     # CTO 裁决: 行业研报 + 策略研报, 不接个股(0)
+        u = ("https://reportapi.eastmoney.com/report/list?industryCode=*&pageSize=100"
+             f"&industry=*&rating=&ratingChange=&beginTime={begin:%Y-%m-%d}"
+             f"&endTime={end:%Y-%m-%d}&pageNo=1&fields=&qType={qtype}&orgCode=&code=*"
+             "&rcode=&p=1&pageNum=1")
+        d = json.loads(http(u, "https://data.eastmoney.com/report/", deadline=deadline))
+        for it in d.get("data") or []:
+            title = clean_text(it.get("title"))
+            if not title:
+                continue
+            org = clean_text(it.get("orgSName"))
+            industry = clean_text(it.get("industryName"))
+            if filter_reason(f"{title} {industry}", DEFAULT_KEYWORDS, True):
+                continue                      # 与快讯同一套词表: 无品种/产业锚点的研报不留
+            code = str(it.get("infoCode") or "").strip()
+            if not code or code in seen_codes:
+                continue
+            seen_codes.add(code)
+            day = str(it.get("publishDate") or "")[:10]
+            out.append(research_item("东财研报", code, title,
+                                     f"https://pdf.dfcfw.com/pdf/H3_{code}_1.pdf", now_ts,
+                                     f"{org} · {day}" if day else org))
+    return out
+
+
+def src_cffex(deadline: float | None = None) -> list[dict]:
+    """中金所 (Batch 7): 月报是 PDF 正文; 日/周报是逐合约行情 XML, 无正文可提取.
+
+    实测路径 (2026-11):
+      日报 /sj/hqsj/rtj/YYYYMM/DD/index.xml   交易日 200, 非交易日 302
+      周报 /sj/hqsj/ztj/YYYYMM/MM/index.xml   MM = 该周周一 (不是周序号; 周五日期会 302)
+      月报 /sj/monthlyReport/YYYYMM/YYYYMMMonthlyReport.pdf  次月上旬发布, 2.17MB/9 页
+    日报/周报正文是 540KB/455KB 的逐合约数字表, 摘要化没有意义; 故只做 HEAD 存在性
+    探测 + 官方 CSV 链接的提示条目 (不下载 body), 月报才下载 PDF 提摘要。
+    """
+    out: list[dict] = []
+    now = datetime.now(TZ_CN)
+    # 1) 月报: 从上月起回看两个月, 取最新一份已发布的 PDF (当月未发布时 302)
+    for back in (1, 2):
+        ym = _month_back(now, back)
+        pdf = f"http://www.cffex.com.cn/sj/monthlyReport/{ym}/{ym}MonthlyReport.pdf"
+        if not http_ok(pdf, deadline):
+            continue
+        title = f"中金所月度数据统计 {ym[:4]}年{int(ym[4:])}月"
+        out.append(research_item("中金所", f"m{ym}", title, pdf,
+                                 int(time.time()), "中国金融期货交易所"))
+        break
+    # 2) 日报: 只回看最近 3 天 (周末直接跳过, 省掉必然 302 的探测)
+    for back in range(0, 3):
+        d = now - timedelta(days=back)
+        if d.weekday() >= 5:
+            continue
+        ymd = d.strftime("%Y%m%d")
+        u = f"http://www.cffex.com.cn/sj/hqsj/rtj/{d:%Y%m}/{d:%d}/index.xml"
+        if not http_ok(u, deadline):
+            continue
+        csv = f"http://www.cffex.com.cn/sj/hqsj/rtj/{d:%Y%m}/{d:%d}/{ymd}_1.csv"
+        out.append(research_item("中金所", f"d{ymd}",
+                                 f"中金所日度行情统计 {d:%Y年%m月%d日}", csv,
+                                 int(time.time()), "中国金融期货交易所 · 收盘后发布", ""))
+        break
+    # 3) 周报: 本周周一 / 上周周一的汇总 XML (当前周数据自周一起滚动更新)
+    monday = now - timedelta(days=now.weekday())
+    for back in (0, 1):
+        d = monday - timedelta(days=7 * back)
+        u = f"http://www.cffex.com.cn/sj/hqsj/ztj/{d:%Y%m}/{d:%d}/index.xml"
+        if not http_ok(u, deadline):
+            continue
+        csv = f"http://www.cffex.com.cn/sj/hqsj/ztj/{d:%Y%m}/{d:%d}/{d:%Y%m%d}_1.csv"
+        out.append(research_item("中金所", f"w{d:%Y%m%d}",
+                                 f"中金所周度数据统计 {d:%Y年%m月%d日}当周", csv,
+                                 int(time.time()), "中国金融期货交易所 · 周度汇总", ""))
+        break
+    return out
+
+
+def src_cfa(deadline: float | None = None) -> list[dict]:
+    """中期协「全国期货市场交易情况简报」(Batch 7): 月频, 正文是 4 页 PDF (有文本层).
+
+    搜索接口实测 pageSize=20 回列表、按 docRelTime 降序; 只取最新 2 期 (本月与上月),
+    再多就是历史归档, 首轮接入会一次性灌一堆旧简报。docRelTime 只有日期, 真实发布日期
+    写进 text 元信息, ts 取首次发现时刻 (理由见 research_item)。
+    """
+    q = urllib.parse.urlencode({"programName": "交易情况简报", "pageNo": 1, "pageSize": 20})
+    u = ("https://www.cfachina.org/qx-search/api/wcmSearch/searchDocsByProgram?" + q)
+    d = json.loads(http(u, "https://www.cfachina.org/", deadline=deadline))
+    rows = (d.get("data") or {}).get("dataList") or []
+    out = []
+    now_ts = int(time.time())
+    for it in rows[:2]:
+        title = clean_text(it.get("docTitle"))
+        path = str(it.get("docPubUrl") or "").strip()
+        if not title or not path.startswith("/"):
+            continue
+        ident = str(it.get("docId") or path.rsplit("/", 1)[-1])
+        day = str(it.get("docRelTime") or "")[:10]
+        out.append(research_item("中期协", ident, title,
+                                 "https://www.cfachina.org" + path, now_ts,
+                                 f"中国期货业协会 · {day}" if day else "中国期货业协会"))
+    return out
+
+
 # 2026-11-04 源体检 (7 源同批抓取实测, 双评审):
 #   · 见闻商品: 页面 50 条跨 ~15h, 滞后 75min, 有效 44%; 单 180min 窗均值 ~2 条 / 3.7 品种,
 #     价值在黑色/农产/能化等其它源 0 覆盖的品种, 不是实时宽度 (别据此放宽 max_age_min)。
@@ -1328,7 +1802,10 @@ SOURCES = [("财联社", src_cls), ("东财", src_em), ("同花顺", src_ths),
            ("Mining", src_mining), ("OilPrice", src_oilprice),
            ("MiningTech", src_miningtech), ("Nasdaq", src_nasdaq),
            ("CNBC", src_cnbc), ("MarketWatch", src_marketwatch),
-           ("Investing", src_investing), ("Hellenic", src_hellenic)]
+           ("Investing", src_investing), ("Hellenic", src_hellenic),
+           # Batch 7 研报源: 排在最后, 前 14 源的先后与 MIN_SLICE 份额不变; 每 30 分钟
+           # 才真正跑一次 (见 main 的 _research 节流), PDF 正文在抓取循环之后单独提。
+           ("东财研报", src_em_report), ("中金所", src_cffex), ("中期协", src_cfa)]
 
 
 # ------------------------------------------------------------------ telegram
@@ -1728,6 +2205,36 @@ def source_health(seen: dict, outcomes: list[tuple[str, str]], conf: dict,
     return changed
 
 
+def research_line(it: dict, dt: datetime) -> str:
+    """研报条目渲染 (Batch 7): 标题 / 机构·日期 / 摘要 / 「查看原文」链接.
+
+    只对带 url 的条目生效; 非研报条目的行拼接仍走 build_messages 原分支, 逐字节不变。
+    text 的「标题｜机构 · 日期」按第一个全角竖线切开 (标题里的括号不再参与解析)。
+
+    修复 C1/C3: 非 http(s) / 非字符串 url 退回纯文本 (不渲染链接); 标题/元信息/摘要/
+    URL 各有硬上限, 保证单条 u16 <= MSG_MAX (否则 split_msg 拆不开, 整批永久重试)。
+    """
+    url = it.get("url")
+    if not is_http_url(url):                 # C1 协议白名单 + C 轻微: int url 不再抛 AttributeError
+        body = it["text"]
+        if len(body) > ITEM_MAX:
+            body = body[:ITEM_MAX] + "…"
+        return f"<b>{esc(it['src'])} {dt:%m-%d}</b>\n{esc(body)}"
+    head, _, meta = it["text"].partition("｜")
+    title = head[:ITEM_MAX] + ("…" if len(head) > ITEM_MAX else "")
+    lines = [f"<b>{esc(it['src'])} {dt:%m-%d}</b>", f"<b>{esc_quote(title)}</b>"]
+    if meta:
+        lines.append(esc_quote(meta[:RESEARCH_META_MAX]))
+    snip = str(it.get("snippet") or "").strip()
+    if snip:
+        lines.append(esc_quote(snip[:SNIPPET_MAX + 20]))
+    if len(url) > RESEARCH_URL_MAX:           # C3: 超长 URL 退化为纯文本提示, 保证可拆批
+        lines.append(f"（原文链接过长 {len(url)} 字符, 已省略）")
+    else:
+        lines.append(f'<a href="{esc_url(url)}">查看原文</a>')
+    return "\n".join(lines)
+
+
 # ------------------------------------------------------------------ main
 def build_messages(batch: list[dict]) -> list[tuple[str, list[dict]]]:
     """整行拼接, 不切断标签; 按 UTF-16 码元装满一条就开下一条 (F-09 拆批发送)."""
@@ -1740,7 +2247,8 @@ def build_messages(batch: list[dict]) -> list[tuple[str, list[dict]]]:
             body = body[:ITEM_MAX] + "…"
         dt = datetime.fromtimestamp(it["ts"], TZ_CN)
         stamp = dt.strftime("%H:%M") if dt.date() == now_date else dt.strftime("%m-%d %H:%M")
-        line = f"<b>{esc(it['src'])} {stamp}</b>\n{esc(body)}"
+        line = (research_line(it, dt) if is_http_url(it.get("url"))
+                else f"<b>{esc(it['src'])} {stamp}</b>\n{esc(body)}")
         add = u16(line) + (2 if lines else 0)
         if lines and budget + add > MSG_MAX:
             msgs.append(("\n\n".join(lines), used))
@@ -1865,8 +2373,22 @@ def main() -> int:
 
     TS_BAD.clear()
     items, errors, outcomes = [], [], []
+    # Batch 7: 研报源按源节流 (默认 30 分钟一轮); 跳过记 SRC_SKIP, 不算失败也不告警.
+    # 失败源 5 分钟后重试, 避免「一坏就静默半小时」.
+    ra: dict = seen.get("_research") if isinstance(seen.get("_research"), dict) else {}
+    now_run = int(time.time())
+    research_ran: list[tuple[str, bool]] = []
     total = len(SOURCES)
     for idx, (name, fn) in enumerate(SOURCES):
+        if name in RESEARCH_SRCS:
+            last_run = to_int(ra.get(name))
+            if last_run > now_run + 60:       # B1 修复: 时钟回拨/NTP 前跳后校正 -> 视为未运行
+                log(f"{name}: 研报节流时间戳在未来 ({last_run - now_run}s), 按未运行处理")
+                last_run = 0
+            if now_run - last_run < RESEARCH_EVERY_S:
+                outcomes.append((name, SRC_SKIP))
+                log(f"{name}: 跳过 (研报源 {RESEARCH_EVERY_S // 60} 分钟节流)")
+                continue
         now = time.monotonic()
         left = deadline - now
         if left < 2:
@@ -1875,10 +2397,12 @@ def main() -> int:
             continue
         src_dl = slice_deadline(deadline, now, total - idx)   # 单源份额: 慢源吃不掉整轮 (6.1 U-B)
         t0 = time.monotonic()
+        ok = False
         try:
             got = fn(src_dl)
             items.extend(got)
             outcomes.append((name, ""))
+            ok = True
             bad = TS_BAD.get(name, 0)
             log(f"{name}: {len(got)} 条 ({time.monotonic() - t0:.1f}s)"
                 + (f", 丢弃 {bad} 条时间不可解析" if bad else ""))
@@ -1887,6 +2411,14 @@ def main() -> int:
             outcomes.append((name, f"{type(e).__name__}: {str(e)[:90]}"))
             log(f"{name} FAILED: {type(e).__name__}: {str(e)[:90]} "
                 f"({time.monotonic() - t0:.1f}s)")
+        if name in RESEARCH_SRCS:
+            research_ran.append((name, ok))
+
+    if research_ran:                          # 节流时间戳随 state 落盘 (_ 前缀不会被 prune)
+        ra = dict(ra)
+        for name, ok in research_ran:
+            ra[name] = now_run if ok else now_run - RESEARCH_EVERY_S + 300
+        seen["_research"] = ra
 
     skipped_all = bool(outcomes) and all(e == SRC_SKIP for _, e in outcomes)
     if skipped_all:                           # 全轮被预算跳过: 既无成功也无失败 -> 不告警、不返回失败
@@ -1924,7 +2456,8 @@ def main() -> int:
     best: dict[str, dict] = {}
     dropped_short = 0
     for it in live:
-        key = dedupe_key(it["text"])
+        # Batch 7: 研报条目自带稳定 key (源站 ID), 其余源仍旧按正文算跨源签名
+        key = it.get("key") or dedupe_key(it["text"])
         if not key:
             dropped_short += 1
             continue
@@ -1937,7 +2470,10 @@ def main() -> int:
 
     relevant, dropped = [], []
     for it in merged:
-        reason = filter_reason(it["text"], keywords, use_filter)
+        # Batch 7: 研报条目豁免「品种锚点」硬门槛 (中金所/中期协标题是官方统计口径),
+        # 但仍走栏目/超短/股票口径噪声检查; 非研报条目一字不改地走原 filter_reason。
+        reason = (research_reason(it["text"]) if it.get("url")
+                  else filter_reason(it["text"], keywords, use_filter))
         if reason:
             dropped.append((reason, it))
         else:
@@ -1974,6 +2510,17 @@ def main() -> int:
     if diverged:
         log(f"队列清理: 剔除 {diverged} 条已读残留")
         queue = keep
+    # Batch 7: 只给「新进队列且还没有摘要」的研报提正文 (队列里已有的复用, 不重复下载);
+    # 独立 8s 预算 + 串行, 排在抓取循环之后, 不挤占既有 14 源的 45s 预算。
+    pdf_calls, pdf_q = extract_research(queue, fresh)
+    if pdf_calls:
+        log(f"研报正文: 解析 {pdf_calls} 篇 PDF, 队列补摘要 {pdf_q} 条")
+    # 摘要还没取到的研报本轮先不入队: 宁可晚一轮, 也不把「只有标题没有正文」的研报推出去
+    kept_fresh = [it for it in fresh
+                  if not (it.get("url") and it.get("snippet") is None)]
+    if len(kept_fresh) < len(fresh):
+        log(f"研报摘要待补: {len(fresh) - len(kept_fresh)} 篇推迟到下一轮入队")
+    fresh = kept_fresh
     added, dup_q = queue_upsert(queue, fresh)
 
     meta = digest_meta(seen)
@@ -2027,7 +2574,7 @@ def main() -> int:
         stale.extend(dropped_q)                   # 记账, 免被源站反复拉回再丢
         log(f"队列溢出: 丢弃最旧 {cut} 条 (已按 stale 记账, 不再重推)")
 
-    queue_dirty = bool(added or dropped_q or q_problem or diverged or q_bad)
+    queue_dirty = bool(added or dropped_q or q_problem or diverged or q_bad or pdf_q)
 
     if stats:
         log(f"raw={len(items)} merged_exact={len(merged_exact)} merged={len(merged)} "
@@ -3756,6 +4303,563 @@ def selftest() -> int:
           and _ub_sd(1003.0, 1000.0, 2) == 1003.0
           and _ub_sd(1045.0, 1000.0, 1) == 1045.0,
           f"share14={_ub_sd(1045.0, 1000.0, 14) if callable(_ub_sd) else None}")
+
+    # ---- Batch 7: 研报源 (PDF 正文提取 / 稳定 key / 渲染 / 队列字段) 全离线
+    _a7_raw = "\n".join([
+        "[Table_StockNameRptType]", "12.13", "- 3 -", "第 2 页",
+        "2026年8月全国期货市场交易情况简报",
+        "1-8月全国期货市场累计成交量为7194.34百万手；同比增长20.36%",
+        "8,000", "百万手", "产品 当月 占比 去年同期 同比 上月 环比",
+        "上期所1-8月累计成交量为1717.83百万手，占全国市场的23.88%，同比增长15.08%"])
+    _a7_clean = pdf_clean(_a7_raw)
+    check("B7-01 pdf_clean 去页码/表格碎片且只留成句行",
+          _a7_clean.startswith("2026年8月全国期货市场交易情况简报")
+          and "12.13" not in _a7_clean and "- 3 -" not in _a7_clean
+          and "[Table_" not in _a7_clean and "8,000" not in _a7_clean
+          and "上期所" in _a7_clean, repr(_a7_clean[:80]))
+    _a7_long = pdf_clean("沪铜" * 500)
+    check("B7-02 pdf_clean 按 SNIPPET_MAX 截断",
+          len(_a7_long) == SNIPPET_MAX and len(pdf_clean("沪铜" * 500, 50)) == 50,
+          f"{len(_a7_long)}")
+
+    # 打桩 http / subprocess / PDFTOTEXT, 全程不联网也不依赖真实 PDF
+    _a7_http, _a7_run, _a7_bin = globals()["http"], subprocess.run, globals()["PDFTOTEXT"]
+
+    def _a7_http_bytes(data):
+        return lambda *a, **k: data
+
+    class _A7R:
+        def __init__(self, out):
+            self.stdout = out
+            self.returncode = 0
+
+    try:
+        globals()["PDFTOTEXT"] = ""
+        globals()["http"] = _a7_http_bytes(b"%PDF-1.7\nfake")
+        check("B7-03 pdf_text 无 pdftotext 时降级为空摘要", pdf_text("https://x/a.pdf") == "")
+        globals()["PDFTOTEXT"] = sys.executable           # 真实存在的路径占位; run 已打桩
+        subprocess.run = _a7_run                         # 未走到子进程即返回
+        globals()["http"] = _a7_http_bytes(b"<html>302 Found</html>")
+        check("B7-04 pdf_text 非 PDF 响应(302 错误页)降级为空摘要",
+              pdf_text("https://x/a.pdf") == "")
+        globals()["http"] = _a7_http_bytes(b"%PDF-1.7\nfake")
+        subprocess.run = lambda *a, **k: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired("pdftotext", 6))
+        check("B7-05 pdf_text 子进程超时降级为可重试(None), 绝不抛错",
+              pdf_text("https://x/a.pdf") is None)
+        subprocess.run = lambda *a, **k: _A7R("  12.13 \n - 3 - \n 百万手".encode())
+        check("B7-06 pdf_text 无文本层(仅表格碎片)降级为空摘要",
+              pdf_text("https://x/a.pdf") == "")
+        _a7_body = "2026年8月全国期货市场交易情况简报 " + "1-8月全国期货市场累计成交量同比增长20.36%；" * 8
+        subprocess.run = lambda *a, **k: _A7R(_a7_body.encode())
+        _a7_pdf = pdf_text("https://x/a.pdf")
+        check("B7-07 pdf_text 正常提取出摘要且不超过 SNIPPET_MAX",
+              0 < len(_a7_pdf) <= SNIPPET_MAX and _a7_pdf.startswith("2026年8月"),
+              repr(_a7_pdf[:60]))
+    finally:
+        globals()["http"] = _a7_http
+        globals()["PDFTOTEXT"] = _a7_bin
+        subprocess.run = _a7_run
+
+    _a7_k1 = research_key("东财研报", "AP202611041831390808")
+    check("B7-08 research_key 同 ID 稳定/异 ID 不同且与 dedupe_key 命名空间不相交",
+          _a7_k1 == research_key("东财研报", "AP202611041831390808")
+          and _a7_k1 != research_key("东财研报", "AP202611041831390809")
+          and ":" in _a7_k1
+          and ":" not in dedupe_key("研究:东财研报:AP1")
+          and ":" not in dedupe_key("【研究】沪铜夜盘上涨"), _a7_k1)
+
+    _a7_ts = int(time.time())
+    _a7_dt = datetime.fromtimestamp(_a7_ts, TZ_CN)
+    _a7_mix = [{"src": "财联社", "ts": _a7_ts, "text": "沪铜夜盘上涨1.2%"},
+               {"src": "中期协", "ts": _a7_ts,
+                "text": "2026年8月全国期货市场交易情况简报｜中国期货业协会",
+                "url": 'https://x/y?a=1&b="2"', "snippet": "1-8月累计成交量同比增长20.36%"}]
+    _a7_msg = build_messages(_a7_mix)[0][0]
+    check("B7-09 研报条目渲染出可点击链接且非研报行逐字节不变",
+          '<a href="https://x/y?a=1&amp;b=&quot;2&quot;">查看原文</a>' in _a7_msg
+          and "<b>中期协" in _a7_msg and "<b>2026年8月" in _a7_msg
+          and f"<b>财联社 {_a7_dt:%H:%M}</b>\n{esc('沪铜夜盘上涨1.2%')}" in _a7_msg,
+          _a7_msg[:100])
+
+    with tempfile.TemporaryDirectory() as _td:
+        _a7_qp = Path(_td) / "q.json"
+        _a7_old = {"src": "财联社", "ts": _a7_ts, "text": "沪铜夜盘上涨1.2%", "key": "沪铜夜盘上涨12"}
+        _a7_new = {"src": "中期协", "ts": _a7_ts, "text": "简报｜协会", "key": "研究:中期协:1",
+                   "url": "https://x/y.pdf", "snippet": "摘要"}
+        _a7_saved = save_json(_a7_qp, {"items": [_a7_old, _a7_new], "ts": _a7_ts})
+        _a7_glob = globals()["QUEUE"]
+        globals()["QUEUE"] = _a7_qp
+        try:
+            _a7_got, _a7_prob, _a7_bad = load_queue()
+        finally:
+            globals()["QUEUE"] = _a7_glob
+        check("B7-10 队列往返保留 url/snippet 且非研报条目字段与顺序不变",
+              _a7_saved and not _a7_prob and _a7_bad == 0 and len(_a7_got) == 2
+              and list(_a7_got[0].keys()) == ["src", "ts", "text", "key"]
+              and _a7_got[1].get("url") == "https://x/y.pdf"
+              and _a7_got[1].get("snippet") == "摘要", str(_a7_got))
+
+    check("B7-11 研报过滤豁免官方统计口径但仍拦栏目/日历与股票噪声",
+          research_reason("2026年8月全国期货市场交易情况简报｜中国期货业协会") == ""
+          and filter_reason("2026年8月全国期货市场交易情况简报｜中国期货业协会",
+                            DEFAULT_KEYWORDS, True) != ""
+          and research_reason("【财经日历】今日重要数据公布时间表") == "栏目/日历"
+          and research_reason("英伟达美股盘前涨超2%") == "噪声:美股"
+          and research_reason("天山铝业：电解铝量价齐升，夯实股东回报｜华安证券") == "",
+          research_reason("英伟达美股盘前涨超2%"))
+
+    # 东财: 列表 -> PDF 直链 + 稳定 key; 非商品研报被既有词表拦掉
+    _a7_em_json = json.dumps({"hits": 2, "data": [
+        {"title": "沪铜周报：库存去化", "orgSName": "某证券",
+         "publishDate": "2026-11-06 00:00:00.000", "infoCode": "AP1", "industryName": ""},
+        {"title": "英伟达美股盘前涨超2%", "orgSName": "某证券",
+         "publishDate": "2026-11-06 00:00:00.000", "infoCode": "AP2", "industryName": ""}]})
+    globals()["http"] = _a7_http_bytes(_a7_em_json.encode())
+    try:
+        _a7_em = src_em_report(time.monotonic() + 5)
+    finally:
+        globals()["http"] = _a7_http
+    check("B7-12 东财研报走 PDF 直链/稳定 key, 且非商品研报被词表拦掉",
+          len(_a7_em) == 1
+          and _a7_em[0]["url"] == "https://pdf.dfcfw.com/pdf/H3_AP1_1.pdf"
+          and _a7_em[0]["key"] == "研究:东财研报:AP1"
+          and _a7_em[0]["snippet"] is None, str(_a7_em)[:160])
+
+    # 中金所: 月报有 PDF(待提取), 日/周报只发链接不发正文
+    _a7_ok_urls: list[str] = []
+    _a7_ok = globals()["http_ok"]
+    globals()["http_ok"] = lambda url, deadline=None, timeout=6: (
+        _a7_ok_urls.append(url) or url.endswith("MonthlyReport.pdf"))
+    try:
+        _a7_cffex = src_cffex(time.monotonic() + 5)
+    finally:
+        globals()["http_ok"] = _a7_ok
+    check("B7-13 中金所月报走 PDF 摘要、日/周报无正文只留官方链接",
+          len(_a7_cffex) == 1 and _a7_cffex[0]["url"].endswith("MonthlyReport.pdf")
+          and _a7_cffex[0]["snippet"] is None
+          and _a7_cffex[0]["key"].startswith("研究:中金所:m")
+          and any("/ztj/" not in u for u in _a7_ok_urls), str(_a7_cffex)[:160])
+
+    # 研报 ts = 首次发现时刻, 发布日期只进元信息 (避免 max_age/max_hold 把日期级时间误判)
+    _a7_t0 = int(time.time())
+    globals()["http"] = _a7_http_bytes(_a7_em_json.encode())
+    try:
+        _a7_em2 = src_em_report(time.monotonic() + 5)
+    finally:
+        globals()["http"] = _a7_http
+    check("B7-14 研报 ts 取首次发现时刻、真实发布日期保留在元信息里",
+          len(_a7_em2) == 1 and abs(_a7_em2[0]["ts"] - _a7_t0) <= 2
+          and "2026-11-06" in _a7_em2[0]["text"], str(_a7_em2)[:140])
+
+    # 每轮最多 2 篇; 已入队条目不重复下载, 被预算挤掉的下一轮补齐
+    with tempfile.TemporaryDirectory() as _td:
+        _a7_clk = _B6Clock(1793800000)
+        _a7_calls: list[str] = []
+        _a7_pdf_real = globals()["pdf_text"]
+        globals()["pdf_text"] = lambda url, deadline=None, referer=None: (
+            _a7_calls.append(url) or f"摘要{len(_a7_calls)}")
+
+        def _a7_three(deadline=None):
+            return [research_item("东财研报", f"AP{i}", f"沪铜研报{i}",
+                                  f"https://x/{i}.pdf", int(_a7_clk.time()) - 60,
+                                  "某证券 · 2026-11-06") for i in range(3)]
+
+        try:
+            _n = []
+            for _round in range(3):
+                _rc, _pay, _stt, _q, _cfg = _b6_run_main(
+                    Path(_td), _a7_clk, [("研报源", _a7_three)],
+                    conf_extra={"digest_max_items": 40}, state={"seedmarker": 1})
+                _n.append(len(_a7_calls) - sum(_n))
+        finally:
+            globals()["pdf_text"] = _a7_pdf_real
+        check("B7-15 每轮最多解析 2 篇且已入队条目不重复解析",
+              _n == [2, 1, 0] and len(_q) == 3
+              and sum(1 for x in _q if x.get("snippet")) == 3, f"calls={_n} q={len(_q)}")
+
+    # 研报不做近邻合并: 同日期日/周报的 key 只差一个字母、数字完全相同, difflib 会把它们判成同一事件
+    _a7_mts = int(time.time())
+    _a7_m1 = research_item("中金所", "d20261105", "中金所日度行情统计 2026年11月05日",
+                           "https://x/d.csv", _a7_mts, "中国金融期货交易所", "")
+    _a7_m2 = research_item("中金所", "w20261105", "中金所周度数据统计 2026年11月05日当周",
+                           "https://x/w.csv", _a7_mts, "中国金融期货交易所", "")
+    _a7_kept, _a7_pairs = merge_near([_a7_m1, _a7_m2])
+    check("B7-16 研报条目不做近邻合并 (同日期日/周报不会互相吞掉)",
+          len(_a7_kept) == 2 and not _a7_pairs,
+          f"kept={len(_a7_kept)} pairs={len(_a7_pairs)}")
+
+    # ==== Batch 7 w4 修复回归 (A1-A5 / B1-B3 / C1-C3 + 轻微) ====
+    class _A7RR:
+        def __init__(self, out=b"", rc=0):
+            self.stdout = out
+            self.returncode = rc
+
+    # ---- A1: 瞬时失败 -> None (下轮重试); 确定性无文本 -> "" (不再重试)
+    _a7_fix_http, _a7_fix_run, _a7_fix_bin = globals()["http"], subprocess.run, globals()["PDFTOTEXT"]
+    try:
+        globals()["PDFTOTEXT"] = sys.executable
+        globals()["http"] = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("curl timeout"))
+        _a7_transient = pdf_text("https://x/a.pdf")
+        globals()["http"] = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("http 预算耗尽"))
+        _a7_budgetfail = pdf_text("https://x/a.pdf")
+        globals()["http"] = _a7_http_bytes(b"%PDF-1.7\nfake")
+        subprocess.run = lambda *a, **k: _A7RR(b"", rc=1)
+        _a7_det = pdf_text("https://x/a.pdf")
+    finally:
+        globals()["http"] = _a7_fix_http
+        globals()["PDFTOTEXT"] = _a7_fix_bin
+        subprocess.run = _a7_fix_run
+    check("B7-17 pdf_text 瞬时失败(下载/预算)返回 None 可重试, 确定性无文本返回 '' (A1)",
+          _a7_transient is None and _a7_budgetfail is None and _a7_det == "",
+          f"transient={_a7_transient!r} budget={_a7_budgetfail!r} det={_a7_det!r}")
+
+    _a7_retry = {"n": 0, "val": None}
+    _a7_pdf0 = globals()["pdf_text"]
+    globals()["pdf_text"] = lambda url, deadline=None, referer=None: (
+        _a7_retry.__setitem__("n", _a7_retry["n"] + 1) or _a7_retry["val"])
+    try:
+        _a7_rit = research_item("东财研报", "AP1", "沪铜周报：库存去化",
+                                "https://x/1.pdf", _a7_ts, "某证券 · 2026-11-06")
+        _a7_c1, _a7_qn1 = extract_research([], [_a7_rit])
+        _a7_first = _a7_rit.get("snippet")
+        _a7_retry["val"] = "1-8月全国期货市场累计成交量同比增长20.36%"
+        _a7_c2, _a7_qn2 = extract_research([], [_a7_rit])
+    finally:
+        globals()["pdf_text"] = _a7_pdf0
+    check("B7-18 extract_research 对瞬时失败保持延迟入队, 下一轮重试成功 (A1)",
+          _a7_c1 == 1 and _a7_first is None and _a7_retry["n"] == 2
+          and _a7_rit.get("snippet", "").startswith("1-8月")
+          and _a7_c2 == 1 and _a7_qn1 == 0 and _a7_qn2 == 0,
+          f"calls={_a7_retry['n']} first={_a7_first!r} snip={_a7_rit.get('snippet')!r}")
+
+    # A1 第二条路径: "" = 已判定无文本层, 队列/源内都不再重试
+    _a7_known_calls: list[str] = []
+    _a7_pdf1 = globals()["pdf_text"]
+    globals()["pdf_text"] = lambda url, deadline=None, referer=None: (
+        _a7_known_calls.append(url) or "不应重试")
+    try:
+        _a7_qknown = [research_item("中金所", "d20261105", "中金所日度行情统计",
+                                    "https://x/d.csv", _a7_ts, "中金所", "")]
+        _a7_ec, _a7_eq = extract_research(_a7_qknown, [])
+        _a7_fknown = [research_item("中金所", "w20261102", "中金所周度数据统计",
+                                    "https://x/w.csv", _a7_ts, "中金所", "")]
+        _a7_ec2, _a7_eq2 = extract_research([], _a7_fknown)
+    finally:
+        globals()["pdf_text"] = _a7_pdf1
+    check("B7-34 已判定无文本层(snippet=\"\")的队列/源内条目不再重试 pdf_text (A1 第二条路径)",
+          _a7_ec == 0 and _a7_ec2 == 0 and not _a7_known_calls
+          and _a7_qknown[0].get("snippet") == "" and _a7_fknown[0].get("snippet") == "",
+          f"calls={_a7_known_calls} ec={_a7_ec}/{_a7_ec2}")
+
+    # ---- A2/A4/A5: curl 退出码、--max-filesize、体积兜底、PDF 路径不请求 gzip
+    _a7_hcmd, _a7_hrun = [], subprocess.run
+    try:
+        subprocess.run = lambda cmd, **kw: (_a7_hcmd.append(list(cmd))
+                                            or _A7RR(b"x" * 1024 + b"\n200"))
+        _a7_ok_body = http("https://x/a.pdf", tries=1, max_bytes=1024,
+                           deadline=time.monotonic() + 10)
+        _a7_capped_argv = list(_a7_hcmd[-1])
+        subprocess.run = lambda cmd, **kw: (_a7_hcmd.append(list(cmd))
+                                            or _A7RR(b"x" * 1025 + b"\n200"))
+        _a7_oversize = None
+        try:
+            http("https://x/a.pdf", tries=1, max_bytes=1024,
+                 deadline=time.monotonic() + 10)
+        except RuntimeError as e:
+            _a7_oversize = str(e)
+        subprocess.run = lambda cmd, **kw: (_a7_hcmd.append(list(cmd))
+                                            or _A7RR(b"%PDF" + b"x" * 64 + b"\n200", rc=63))
+        _a7_rcfail = None
+        try:
+            http("https://x/a.pdf", tries=1, max_bytes=1024,
+                 deadline=time.monotonic() + 10)
+        except RuntimeError as e:
+            _a7_rcfail = str(e)
+    finally:
+        subprocess.run = _a7_hrun
+    check("B7-19 http 检查 curl 退出码 + max_bytes 双闸且 PDF 路径不请求 gzip (A2/A4/A5)",
+          _a7_ok_body == b"x" * 1024
+          and "--max-filesize" in _a7_capped_argv
+          and _a7_capped_argv[_a7_capped_argv.index("--max-filesize") + 1] == "1024"
+          and "--compressed" not in _a7_capped_argv
+          and _a7_oversize is not None and "http failed" in _a7_oversize
+          and _a7_rcfail is not None and "curl rc=63" in _a7_rcfail,
+          f"argv={_a7_capped_argv} over={_a7_oversize!r} rc={_a7_rcfail!r}")
+
+    _a7_hokrun = subprocess.run
+    try:
+        subprocess.run = lambda cmd, **kw: _A7RR(b"200")
+        _a7_hok200 = http_ok("https://x/a.pdf", deadline=time.monotonic() + 5)
+        subprocess.run = lambda cmd, **kw: _A7RR(b"302")
+        _a7_hok302 = http_ok("https://x/a.pdf", deadline=time.monotonic() + 5)
+        subprocess.run = lambda cmd, **kw: _A7RR(b"404")
+        _a7_hok404 = http_ok("https://x/a.pdf", deadline=time.monotonic() + 5)
+        subprocess.run = lambda *a, **k: (_ for _ in ()).throw(OSError("probe down"))
+        _a7_hokexc = http_ok("https://x/a.pdf", deadline=time.monotonic() + 5)
+    finally:
+        subprocess.run = _a7_hokrun
+    check("B7-20 http_ok 只认 2xx: 200 True / 302 False / 404 False / 异常 False (A4)",
+          _a7_hok200 and not _a7_hok302 and not _a7_hok404 and not _a7_hokexc,
+          f"{_a7_hok200}/{_a7_hok302}/{_a7_hok404}/{_a7_hokexc}")
+
+    # ---- A3/A5: PDF 子预算含解析时间; pdftotext 限页 + RLIMIT_AS
+    _a7_now2 = time.monotonic()
+    _a7_pkw, _a7_prun = {}, []
+    _a7_bin3 = globals()["PDFTOTEXT"]
+    try:
+        globals()["PDFTOTEXT"] = sys.executable
+        globals()["http"] = lambda url, **kw: (_a7_pkw.update(kw) or b"%PDF-1.7\nfake")
+        subprocess.run = lambda cmd, **kw: (_a7_prun.append((list(cmd), dict(kw)))
+                                            or _A7RR(("正文" * 60).encode()))
+        pdf_text("https://x/a.pdf", deadline=_a7_now2 + PDF_BUDGET_S)
+    finally:
+        globals()["http"] = _a7_fix_http
+        globals()["PDFTOTEXT"] = _a7_bin3
+        subprocess.run = _a7_fix_run
+    _a7_pentry = next(((c, k) for c, k in _a7_prun if "-f" in c), ([], {}))
+    _a7_pargv, _a7_pokw = _a7_pentry
+    check("B7-21 PDF 预算=下载8+解析6且给解析预留 PDF_TIMEOUT; pdftotext 限页+RLIMIT_AS (A3/A5)",
+          BUDGET_S + PDF_BUDGET_S <= ROUND_SOFT_S
+          and PDF_BUDGET_S >= 14.0 and PDF_DL_BUDGET_S >= 8.0
+          and abs(PDF_DL_BUDGET_S - (PDF_BUDGET_S - PDF_TIMEOUT)) < 1e-9
+          and _a7_pkw.get("deadline", 1e18) <= _a7_now2 + PDF_DL_BUDGET_S + 0.5
+          and _a7_pkw.get("deadline", 1e18) <= _a7_now2 + PDF_BUDGET_S - PDF_TIMEOUT + 0.5
+          and "-f" in _a7_pargv and _a7_pargv[_a7_pargv.index("-f") + 1] == "1"
+          and "-l" in _a7_pargv and _a7_pargv[_a7_pargv.index("-l") + 1] == str(PDF_MAX_PAGES)
+          and PDF_RLIMIT_AS == 256 * 1024 * 1024
+          and callable(_a7_pokw.get("preexec_fn"))
+          and "setrlimit" in inspect.getsource(_pdf_child_limits),
+          f"dl={_a7_pkw.get('deadline')} argv={_a7_pargv}")
+
+    # ---- B1: 未来节流时间戳 -> 按未运行处理 (下一轮必须真跑并改写)
+    with tempfile.TemporaryDirectory() as _td:
+        _b1_clk = _B6Clock(1793800000)
+        _b1_calls: list[int] = []
+
+        def _b1_src(deadline=None):
+            _b1_calls.append(1)
+            return [research_item("东财研报", "AP1", "沪铜周报：库存去化",
+                                  "https://x/1.pdf", int(_b1_clk.time()) - 10,
+                                  "某证券 · 2026-11-06", "")]
+
+        _b1_r = _b6_run_main(Path(_td), _b1_clk, [("东财研报", _b1_src)],
+                             state={"seedmarker": 1,
+                                    "_research": {"东财研报": 1793800000 + 7200}})
+    check("B7-22 main 对未来研报节流时间戳自愈(真跑并改写为当前时刻) (B1)",
+          len(_b1_calls) == 1
+          and _b1_r[2].get("_research", {}).get("东财研报") == 1793800000,
+          f"calls={len(_b1_calls)} ra={_b1_r[2].get('_research')}")
+
+    # ---- B2①: 第二轮 30 分钟节流生效 (main 级)
+    with tempfile.TemporaryDirectory() as _td:
+        _b2_clk = _B6Clock(1793800000)
+        _b2_calls: list[int] = []
+
+        def _b2_src(deadline=None):
+            _b2_calls.append(int(_b2_clk.time()))
+            return [research_item("东财研报", "AP1", "沪铜周报：库存去化",
+                                  "https://x/1.pdf", int(_b2_clk.time()) - 10,
+                                  "某证券 · 2026-11-06", "")]
+
+        _b2_r1 = _b6_run_main(Path(_td), _b2_clk, [("东财研报", _b2_src)],
+                              state={"seedmarker": 1})
+        _b2_clk.t += 60
+        _b2_clk.mono += 1.0
+        _b2_buf, _b2_stdout = io.StringIO(), sys.stdout
+        try:
+            sys.stdout = _b2_buf
+            _b2_r2 = _b6_run_main(Path(_td), _b2_clk, [("东财研报", _b2_src)])
+        finally:
+            sys.stdout = _b2_stdout
+        _b2_log = _b2_buf.getvalue()
+    check("B7-23 main 第二轮研报源 30 分钟节流生效(不重复抓取) (B2①)",
+          len(_b2_calls) == 1 and "跳过 (研报源" in _b2_log
+          and _b2_r2[2].get("_research", {}).get("东财研报") == 1793800000,
+          f"calls={_b2_calls} log={_b2_log[-120:]!r}")
+
+    # ---- B2②: 摘要未取到的研报当轮不入队, 下一研报轮补齐 (main 级)
+    with tempfile.TemporaryDirectory() as _td:
+        _b3_clk = _B6Clock(1793800000)
+        _b3_pdf_calls: list[str] = []
+        _b3_pdf0 = globals()["pdf_text"]
+        globals()["pdf_text"] = lambda url, deadline=None, referer=None: (
+            _b3_pdf_calls.append(url) or f"1-8月全国期货市场累计成交量同比增长20.36%{len(_b3_pdf_calls)}")
+
+        def _b3_three(deadline=None):
+            return [research_item("东财研报", f"AP{i}", f"沪铜周报{i}：库存去化{i}",
+                                  f"https://x/{i}.pdf", int(_b3_clk.time()) - 10,
+                                  "某证券 · 2026-11-06") for i in range(3)]
+
+        try:
+            _b3_r1 = _b6_run_main(Path(_td), _b3_clk, [("东财研报", _b3_three)],
+                                  conf_extra={"digest_max_items": 40,
+                                              "digest_min": 120},
+                                  state={"seedmarker": 1})
+            _b3_q1 = _b3_r1[3]
+            _b3_clk.t += RESEARCH_EVERY_S
+            _b3_clk.mono += 1.0
+            _b3_r2 = _b6_run_main(Path(_td), _b3_clk, [("东财研报", _b3_three)],
+                                  conf_extra={"digest_max_items": 40,
+                                              "digest_min": 120})
+            _b3_q2 = _b3_r2[3]
+        finally:
+            globals()["pdf_text"] = _b3_pdf0
+    check("B7-24 main 摘要未取到的研报当轮不入队、下一研报轮补齐 (B2②)",
+          len(_b3_q1) == 2 and len(_b3_q2) == 3 and len(_b3_pdf_calls) == 3
+          and all(q.get("snippet") for q in _b3_q2),
+          f"q1={len(_b3_q1)} q2={len(_b3_q2)} calls={len(_b3_pdf_calls)}")
+
+    # ---- B2③: 研报条目走 research_reason, 非研报 filter_reason (main 级)
+    with tempfile.TemporaryDirectory() as _td:
+        _b4_clk = _B6Clock(1793800000)
+
+        def _b4_report(deadline=None):
+            return [research_item("中金所", "m202610",
+                                  "2026年8月全国期货市场交易情况简报",
+                                  "https://x/m.pdf", int(_b4_clk.time()) - 10,
+                                  "中国期货业协会", "")]
+
+        _b4_r = _b6_run_main(Path(_td), _b4_clk, [("中金所", _b4_report)],
+                             state={"seedmarker": 1})
+    check("B7-25 main 研报条目走 research_reason 而非 filter_reason (B2③)",
+          len(_b4_r[3]) == 1 and _b4_r[3][0]["key"] == "研究:中金所:m202610",
+          f"queue={_b4_r[3]}")
+
+    # ---- B2④: 主流程用 it["key"] (稳定研报键), 不用 dedupe_key(text) (main 级)
+    with tempfile.TemporaryDirectory() as _td:
+        _b5_clk = _B6Clock(1793800000)
+
+        def _b5_item(deadline=None):
+            return [research_item("东财研报", "AP999", "沪铜周报：库存去化",
+                                  "https://x/9.pdf", int(_b5_clk.time()) - 10,
+                                  "某证券 · 2026-11-06", "")]
+
+        _b5_r = _b6_run_main(Path(_td), _b5_clk, [("东财研报", _b5_item)],
+                             state={"seedmarker": 1})
+    check("B7-26 main 队列 key 取自 it['key'] 而非 dedupe_key(text) (B2④)",
+          len(_b5_r[3]) == 1 and _b5_r[3][0]["key"] == "研究:东财研报:AP999",
+          str(_b5_r[3])[:160])
+
+    # ---- B3: 中金所日/周报是 CSV, 绝不能进 pdf_text; 月报才解析
+    _b6_ok_urls: list[str] = []
+    _b6_hok = globals()["http_ok"]
+    globals()["http_ok"] = lambda url, deadline=None, timeout=6: (
+        _b6_ok_urls.append(url) or True)
+    try:
+        _b6_cffex = src_cffex(time.monotonic() + 5)
+    finally:
+        globals()["http_ok"] = _b6_hok
+    _b6_m = [x for x in _b6_cffex if x["key"].startswith("研究:中金所:m")]
+    _b6_d = [x for x in _b6_cffex if x["key"].startswith("研究:中金所:d")]
+    _b6_w = [x for x in _b6_cffex if x["key"].startswith("研究:中金所:w")]
+    _b6_pdf_calls: list[str] = []
+    _b6_pdf0 = globals()["pdf_text"]
+    globals()["pdf_text"] = lambda url, deadline=None, referer=None: (
+        _b6_pdf_calls.append(url) or "不应被调用的正文")
+    try:
+        _b6_ecalls, _b6_echg = extract_research([], _b6_d + _b6_w)
+    finally:
+        globals()["pdf_text"] = _b6_pdf0
+    check("B7-27 中金所日/周报(CSV)不会进 pdf_text, 月报才解析 (B3)",
+          len(_b6_m) == 1 and len(_b6_d) == 1 and len(_b6_w) == 1
+          and _b6_d[0]["url"].endswith("_1.csv") and _b6_d[0]["snippet"] == ""
+          and _b6_w[0]["url"].endswith("_1.csv") and _b6_w[0]["snippet"] == ""
+          and _b6_m[0]["url"].endswith("MonthlyReport.pdf") and _b6_m[0]["snippet"] is None
+          and _b6_ecalls == 0 and not _b6_pdf_calls,
+          f"m={_b6_m} d={_b6_d} w={_b6_w} calls={_b6_ecalls}")
+
+    _b7_em_urls: list[str] = []
+
+    def _b7_em_http(url, *a, **k):
+        _b7_em_urls.append(url)
+        return _a7_em_json.encode()
+
+    globals()["http"] = _b7_em_http
+    try:
+        _b7_em = src_em_report(time.monotonic() + 5)
+    finally:
+        globals()["http"] = _a7_http
+    _b7_qtypes = [re.search(r"[?&]qType=(\d+)", u).group(1) for u in _b7_em_urls]
+    check("B7-28 东财研报按 qType=1+2 两次请求, 不回退 qType=0 (B3)",
+          _b7_qtypes == ["1", "2"] and "qType=0" not in " ".join(_b7_em_urls)
+          and len(_b7_em) == 1, f"qtypes={_b7_qtypes} got={len(_b7_em)}")
+
+    # ---- C1: 协议白名单 (渲染 + 入队)
+    _c1_js = research_item("东财研报", "AP1", "沪铜周报：库存去化",
+                           "javascript:alert(document.cookie)", _a7_ts,
+                           "某证券 · 2026-11-06", "摘要")
+    _c1_data = research_item("东财研报", "AP2", "沪铜周报：库存去化",
+                             "data:text/html;base64,PHNjcmlwdD4=", _a7_ts,
+                             "某证券 · 2026-11-06", "摘要")
+    _c1_msg = build_messages([_c1_js])[0][0]
+    _c1_line = research_line(_c1_js, _a7_dt)
+    _c1_q: list[dict] = []
+    queue_upsert(_c1_q, [_c1_js, _c1_data])
+    check("B7-29 非 http(s) URL 不渲染成链接且不入队 url (协议白名单三处统一) (C1)",
+          "<a href" not in _c1_msg and "javascript:" not in _c1_msg
+          and "<a href" not in _c1_line
+          and len(_c1_q) == 2 and all("url" not in q for q in _c1_q),
+          f"msg={_c1_msg[:80]!r} q={_c1_q}")
+
+    # ---- C2: 研报标题/元信息/摘要的 HTML 实体化
+    _c2_it = research_item("东财研报", "AP3", "沪铜<b>深度</b>", "https://x/3.pdf",
+                           _a7_ts, "某证券 & <i>2026</i>",
+                           '摘要 "研报" <script>alert(1)</script>')
+    _c2_line = research_line(_c2_it, _a7_dt)
+    check("B7-30 研报标题/元信息/摘要的 < & \" 全部实体化 (C2)",
+          "&lt;b&gt;深度&lt;/b&gt;" in _c2_line
+          and "某证券 &amp; &lt;i&gt;2026&lt;/i&gt;" in _c2_line
+          and "&quot;研报&quot;" in _c2_line
+          and "&lt;script&gt;" in _c2_line
+          and "<b>深度" not in _c2_line,
+          _c2_line[:160])
+
+    # ---- C3: 超长 URL/元信息 -> 单条 u16 <= MSG_MAX (可正常拆批)
+    _c3_url = "https://x.example/" + "a" * 4500
+    _c3_it = research_item("东财研报", "AP4", "沪铜周报：库存去化", _c3_url,
+                           _a7_ts, "某证券 · 2026-11-06", "摘要")
+    _c3_line = research_line(_c3_it, _a7_dt)
+    _c3_msg = build_messages([_c3_it])[0][0]
+    _c3_meta_it = research_item("东财研报", "AP5", "沪铜周报：库存去化",
+                                "https://x/5.pdf", _a7_ts, "机" * 4000, "摘要")
+    _c3_line2 = research_line(_c3_meta_it, _a7_dt)
+    check("B7-31 超长 URL/元信息被约束, 单条 u16 <= MSG_MAX 可拆批 (C3)",
+          u16(_c3_line) <= MSG_MAX and "<a href" not in _c3_line
+          and "链接过长" in _c3_line and u16(_c3_msg) <= MSG_MAX
+          and u16(_c3_line2) <= MSG_MAX,
+          f"url_line={u16(_c3_line)} meta_line={u16(_c3_line2)}")
+
+    # ---- C 轻微: queue_upsert 字段语义 + 非字符串 url 容错
+    _c4_items = [
+        {"src": "财联社", "ts": _a7_ts, "text": "沪铜夜盘上涨1.2%", "key": "k1"},
+        {"src": "中期协", "ts": _a7_ts, "text": "简报｜协会", "key": "研究:中期协:1",
+         "url": "https://x/1.pdf", "snippet": None},
+        {"src": "中期协", "ts": _a7_ts, "text": "简报2｜协会", "key": "研究:中期协:2",
+         "url": "https://x/2.pdf", "snippet": ""},
+        {"src": "中期协", "ts": _a7_ts, "text": "简报3｜协会", "key": "研究:中期协:3",
+         "url": "javascript:alert(1)", "snippet": "s"},
+        {"src": "中期协", "ts": _a7_ts, "text": "简报4｜协会", "key": "研究:中期协:4",
+         "url": 123, "snippet": "s"}]
+    _c4_q: list[dict] = []
+    _c4_added, _c4_dup = queue_upsert(_c4_q, _c4_items)
+    check("B7-32 queue_upsert: 4字段键序/None不落盘/\"\"落6字段/非http不落url (C 轻微)",
+          _c4_added == 5 and _c4_dup == 0
+          and list(_c4_q[0].keys()) == ["src", "ts", "text", "key"]
+          and list(_c4_q[1].keys()) == ["src", "ts", "text", "key", "url"]
+          and list(_c4_q[2].keys()) == ["src", "ts", "text", "key", "url", "snippet"]
+          and "url" not in _c4_q[3] and "url" not in _c4_q[4],
+          str([list(q.keys()) for q in _c4_q]))
+
+    _c5_it = {"src": "东财研报", "ts": _a7_ts,
+              "text": "沪铜周报：库存去化｜某证券", "url": 123, "snippet": "摘要",
+              "key": "研究:东财研报:AP6"}
+    _c5_msg = build_messages([_c5_it])[0][0]
+    _c5_line = research_line(_c5_it, _a7_dt)
+    check("B7-33 research_line/build_messages 对非字符串 url 容错(int 不抛 AttributeError) (C 轻微)",
+          "<a href" not in _c5_msg and "<a href" not in _c5_line
+          and "沪铜周报" in _c5_msg,
+          _c5_msg[:80])
 
     print(f"selftest: {'PASS' if not fails else str(len(fails)) + ' FAILED: ' + ', '.join(fails)}")
     return 0 if not fails else 1
