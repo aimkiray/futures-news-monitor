@@ -73,7 +73,7 @@ python3 monitor.py --dry-run    # 只判定不发送（调试用）
 | 字段 | 必填 | 说明 |
 |---|---|---|
 | `token` | 是 | Telegram Bot Token；也可用环境变量 `FUTNEWS_TOKEN`（优先级更高，适合配合密钥管理） |
-| `chat_id` | 是 | 推送目标会话 ID |
+| `chat_id` | 否 | 推送目标会话 ID；缺省时自动从最近消息里的 chat 发现 |
 | `proxy` | 否 | 代理 URL，供 2 个需代理的英文源与发送链路使用；也可用 `HTTPS_PROXY` |
 
 已读状态、待发队列与锁文件默认落在 `~/.pi/agent/state/`（首次运行自动创建）。
