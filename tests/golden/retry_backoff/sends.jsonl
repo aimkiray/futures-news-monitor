@@ -1,0 +1,2 @@
+{"method": "sendMessage", "payload": {"chat_id": 1, "disable_web_page_preview": "true", "parse_mode": "HTML", "text": "<b>同花顺 21:43</b>\n铁矿石库存变化23吨环比23%\n\n<b>东财 21:44</b>\n螺纹钢库存变化22吨环比22%\n\n<b>财联社 21:45</b>\n沪铜库存变化21吨环比21%"}, "proxy": "", "timeout": 8}
+{"method": "sendMessage", "payload": {"chat_id": 1, "disable_web_page_preview": "true", "parse_mode": "HTML", "text": "<b>同花顺 21:43</b>\n铁矿石库存变化23吨环比23%\n\n<b>东财 21:44</b>\n螺纹钢库存变化22吨环比22%\n\n<b>财联社 21:45</b>\n沪铜库存变化21吨环比21%"}, "proxy": "", "timeout": 8}

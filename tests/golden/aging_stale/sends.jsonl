@@ -1,0 +1,2 @@
+{"method": "sendMessage", "payload": {"chat_id": 1, "disable_web_page_preview": "true", "parse_mode": "HTML", "text": "<b>SMM 18:44</b>\n沪铝库存变化45吨环比45%\n\n<b>新浪 18:45</b>\n白银库存变化44吨环比44%\n\n<b>同花顺 18:45</b>\n铁矿石库存变化43吨环比43%"}, "proxy": "", "timeout": 8}
+{"method": "sendMessage", "payload": {"chat_id": 1, "disable_web_page_preview": "true", "parse_mode": "HTML", "text": "<b>东财 21:00</b>\n螺纹钢库存变化52吨环比52%"}, "proxy": "", "timeout": 8}

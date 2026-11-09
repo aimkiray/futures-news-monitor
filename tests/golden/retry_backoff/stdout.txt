@@ -1,0 +1,45 @@
+[<TS>] 财联社: 1 条 (0.0s)
+[<TS>] 东财: 0 条 (0.0s)
+[<TS>] 同花顺: 0 条 (0.0s)
+[<TS>] 新浪: 0 条 (0.0s)
+[<TS>] 见闻商品: 0 条 (0.0s)
+[<TS>] SMM: 0 条 (0.0s)
+[<TS>] Mining: 0 条 (0.0s)
+[<TS>] OilPrice: 0 条 (0.0s)
+[<TS>] MiningTech: 0 条 (0.0s)
+[<TS>] Nasdaq: 0 条 (0.0s)
+[<TS>] CNBC: 0 条 (0.0s)
+[<TS>] MarketWatch: 0 条 (0.0s)
+[<TS>] Investing: 0 条 (0.0s)
+[<TS>] Hellenic: 0 条 (0.0s)
+[<TS>] 东财研报: 0 条 (0.0s)
+[<TS>] 中金所: 0 条 (0.0s)
+[<TS>] 中期协: 0 条 (0.0s)
+[<TS>]   丢弃[噪声:沪指] 财联社: 沪指收盘上涨0.52%，两市成交额1.2万亿元
+[<TS>] send proxy= HTTP 429: {"ok":false}
+[<TS>] 第 1/1 批发送失败 (u16=98, 原因: HTTP 429 限流), 已送达 0 条
+[<TS>] 第 1 次发送失败, 240s 后重试
+[<TS>] pushed 0/3 msgs=0 ok=False left=3 day_msgs=0
+--- round 2 ---
+[<TS>] 财联社: 1 条 (0.0s)
+[<TS>] 东财: 0 条 (0.0s)
+[<TS>] 同花顺: 0 条 (0.0s)
+[<TS>] 新浪: 0 条 (0.0s)
+[<TS>] 见闻商品: 0 条 (0.0s)
+[<TS>] SMM: 0 条 (0.0s)
+[<TS>] Mining: 0 条 (0.0s)
+[<TS>] OilPrice: 0 条 (0.0s)
+[<TS>] MiningTech: 0 条 (0.0s)
+[<TS>] Nasdaq: 0 条 (0.0s)
+[<TS>] CNBC: 0 条 (0.0s)
+[<TS>] MarketWatch: 0 条 (0.0s)
+[<TS>] Investing: 0 条 (0.0s)
+[<TS>] Hellenic: 0 条 (0.0s)
+[<TS>] 东财研报: 跳过 (研报源 30 分钟节流)
+[<TS>] 中金所: 跳过 (研报源 30 分钟节流)
+[<TS>] 中期协: 跳过 (研报源 30 分钟节流)
+[<TS>]   丢弃[噪声:沪指] 财联社: 沪指收盘上涨0.52%，两市成交额1.2万亿元
+[<TS>] send proxy= HTTP 429: {"ok":false}
+[<TS>] 第 1/1 批发送失败 (u16=98, 原因: HTTP 429 限流), 已送达 0 条
+[<TS>] 第 2 次发送失败, 480s 后重试
+[<TS>] pushed 0/3 msgs=0 ok=False left=3 day_msgs=0

@@ -1,0 +1,1 @@
+[<TS>] 缺少 bot token: 需设置 FUTNEWS_TOKEN 或 <TMP>/conf.json 的 token 字段

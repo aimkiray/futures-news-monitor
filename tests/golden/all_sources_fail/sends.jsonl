@@ -1,0 +1,1 @@
+{"method": "sendMessage", "payload": {"chat_id": 1, "disable_web_page_preview": "true", "parse_mode": "HTML", "text": "⚠️ 期货快讯源全部抓取失败: 财联社, 东财, 同花顺, 新浪, 见闻商品, SMM, Mining, OilPrice, MiningTech, Nasdaq, CNBC, MarketWatch, Investing, Hellenic, 东财研报, 中金所, 中期协"}, "proxy": "", "timeout": 8}

@@ -61,6 +61,25 @@ PDF 正文只在条目首次进入队列时解析一次：`curl` 下载（单篇
 `SKIP → STRONG → NOISE_HARD → 目标价条件 → MACRO → ANCHOR → NOISE_SOFT → CONTEXT`：
 逐层短路，任一否决层命中即丢弃，只有全部通过的条目才进入聚合队列。
 
+## 失败归因与告警
+
+抓取失败的诊断按 `curl` 退出码归因，不再一律标成「预算耗尽」：
+
+| 退出码 | 归因文案 |
+|---|---|
+| 28 | `curl 超时` |
+| 6 / 7 / 35 | `连接失败(SSL/DNS)` |
+| 16 | `HTTP/2 帧错误` |
+| 63 | `超过体积上限` |
+
+错误信息同时带 `rc` 与耗时（如 `curl 超时 (rc=28, 6.1s)`）。只有「一次尝试都没发起」就因剩余份额不足 2 秒退出时，
+才报「预算耗尽」并注明「未发起尝试」——预算耗尽因此是一个可区分的事实，而不是兜底说法。
+归因只改诊断文案，不改抓取时序：单次尝试仍一次用满剩余份额。
+
+告警分两级：全源失败首轮发 1 条，之后每 `ALERT_EVERY=3600` 秒汇总 1 条，恢复再发 1 条；
+单源连续失败满 `SRC_ALERT_ROUNDS=6` 轮发 1 条（可由配置 `src_alert_rounds` 覆盖，下限 1），
+同轮多个失败源合并成 1 条，恢复发 1 条并清零。全源故障轮不重复计单源失败，恢复轮只发全源恢复那一条。
+
 ## 运行
 
 要求 Python 3.11+，不依赖任何第三方 Python 包。
@@ -108,16 +127,38 @@ launchd 定时任务由使用者自行创建，推荐 `StartInterval` 设为 120
 | 6 | 队列落盘失败 |
 | 7 | 锁文件不可写 |
 
+检视模式：`--stats` / `--queue` 为只读检视，**零落盘**——不写 state / queue / pending，损坏文件只留痕不改名，
+退出码恒为 0（不因源失败返 1）。`--dry-run` 仍按普通 dry 语义：只判定不发送，状态照常推进。
+
 ## 测试
 
 ```bash
-python3 tests/sim.py       # 23 个行为场景（临时目录，不碰真实状态）
-python3 tests/probe2.py    # 69 条语料判定回归
-python3 tests/probe4.py    # 词表边界正反例
-python3 tests/ab.py        # 与旧版本 baseline-v4.py 的语料 A/B 对照
+python3 monitor.py --selftest    # 内嵌断言回归（414 条）
+python3 tests/sim.py             # 23 个行为场景（临时目录，不碰真实状态）
+python3 tests/probe2.py          # 69 条语料判定回归
+python3 tests/probe4.py          # 词表边界正反例
+python3 tests/ab.py              # 与旧版本 baseline-v4.py 的语料 A/B 对照
+python3 tests/golden.py --check  # 28 个确定性场景的行为等价基线
 ```
 
 测试全部离线运行，使用临时目录隔离状态，不会发送真实消息。
+
+### 行为等价基线
+
+`tests/golden.py` 把 28 个确定性场景的**可观测输出**冻结成快照：stdout / stderr、发送记录（`sends.jsonl`）、
+落盘状态文件与退出码。场景覆盖抓取失败组合、告警阈值、聚合窗口与积压、限流退避、发送时间闸门、
+状态损坏与落盘失败、锁不可写、发送三腿回退以及真实源函数等。快照连同逐文件 SHA256 存放在
+`tests/golden/`（163 个夹具文件 + `MANIFEST.json`，约 600K）。
+
+```bash
+python3 tests/golden.py --check                        # 默认模式：先校验 MANIFEST，再跑 28 场景比对
+python3 tests/golden.py --check --scenario proxy_leg    # 只跑单个场景（仍先校验整个 MANIFEST）
+```
+
+`--check` 先校验每个夹具的 SHA256 与 `MANIFEST.json` 记录一致（防止快照被手工改动，不一致直接报错退出），
+再逐场景重放并与快照逐字节比对。用途是给重构上锁：判定、聚合、发送与状态机的**行为**必须保持等价，
+任何 diff 一律按回归处理。只有确认行为变化符合预期时才允许 `--record` 重录，且必须同时提供
+`--reason` 与环境变量 `GOLDEN_RECORD_APPROVED`（两者取值一致），重录会重算 MANIFEST 的哈希。
 
 ## 部署
 
@@ -132,10 +173,12 @@ python3 tests/ab.py        # 与旧版本 baseline-v4.py 的语料 A/B 对照
 ## 目录
 
 ```
-monitor.py        主程序（部署源）
-baseline-v4.py    旧版判定实现，供 tests/ab.py 对照
-deploy.sh         部署脚本
-tests/            行为场景、语料回归与 A/B 对照
+monitor.py          主程序（部署源）
+baseline-v4.py      旧版判定实现，供 tests/ab.py 对照
+deploy.sh           部署脚本
+tests/              行为场景、语料回归与 A/B 对照
+tests/golden.py     行为等价基线：28 场景录制/校验
+tests/golden/       快照夹具 + MANIFEST.json（逐文件 SHA256）
 ```
 
 ## License

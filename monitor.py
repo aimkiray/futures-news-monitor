@@ -39,8 +39,10 @@
 """
 from __future__ import annotations
 
+import ast
 import difflib
 import email.utils
+import errno
 import fcntl
 import hashlib
 import json
@@ -61,7 +63,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from http.client import IncompleteRead   # 不能 import http.client: 会被 def http() 覆盖
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -86,15 +90,58 @@ NEAR_WINDOW = 30 * 60                # 近邻合并时间窗(秒)
 NEAR_RATIO = 0.90                    # 近邻合并阈值(实测依据见 w2-fix 报告 F-13)
 NEAR_MIN_LEN = 8                     # 太短的签名不做近似比对(误合并风险高)
 NUM_RE = re.compile(r"\d+")          # 数字不同视为不同事件, 避免「库存减12万吨/减10万吨」被误合并
+# 近邻合并方向否决 (Batch 9 C-F-01 / batch9-fix U3-F-01): 反义方向词的两条不同事件不得按字面
+# 相似度合并. 方向检测产出**集合** {(轴, 符号)}：同一句里「涨跌互现」= 同一轴双符号并存,
+# 仍可与同形句合并；而「新增」里的「增」不得把一侧误判成上行（中性复合词先屏蔽）。
+# 规模口径（准确数）：21 对反义词 = 原 13 对（11 条中文轴 + 累增/回落、升水/贴水 2 对扩展）
+#   + 补 8 对反义缺口（下滑/上行、走弱/走强、下挫/冲高、跳水/拉升、扩产/停产、复产/停产、
+#     反弹/回落、加息/降息）。轴 = 同义方向词族；同族同向只记一个 (轴, +1/-1)，
+# 所以「上涨」vs「上升」不会因措辞不同被误判为方向相反。
+DIR_AXES = (
+    ("价格",
+     ("涨", "上涨", "上升", "上行", "走强", "冲高", "拉升", "反弹", "走高",
+      "升", "上调", "升水", "加息"),
+     ("跌", "下跌", "下降", "下滑", "走弱", "下挫", "跳水", "回落", "走低",
+      "降", "下调", "贴水", "降息")),
+    ("数量",
+     ("增", "增加", "增产", "扩产", "复产", "扩张", "累库", "累增"),
+     ("减", "减少", "减产", "停产", "收缩", "去库", "负增长")),
+)
+# 中性复合词：含方向字但本身不表方向（或同时含两侧），匹配前整词屏蔽，避免单字子串误判.
+# 「增」不得匹配「新增」；「涨跌互现」不得被当成双向并存之外的任何方向.
+DIR_NEUTRAL = ("涨跌互现", "涨跌幅", "涨跌", "增减持", "增减", "升降",
+               "新增", "增速", "增量", "增幅")
+_DIR_TOKEN_SIGNS: dict[str, tuple[str, int]] = {}
+for _axis, _ups, _downs in DIR_AXES:
+    for _w in _ups:
+        _DIR_TOKEN_SIGNS[_w] = (_axis, 1)
+    for _w in _downs:
+        _DIR_TOKEN_SIGNS[_w] = (_axis, -1)
+del _axis, _ups, _downs, _w
+# 长词优先：同一位置先匹配「上涨/下降」等整词，不会再拆出「涨/降」.
+_DIR_TOKEN_RE = re.compile(
+    "|".join(re.escape(w) for w in sorted(_DIR_TOKEN_SIGNS, key=len, reverse=True)))
+_DIR_NEUTRAL_RE = re.compile(
+    "|".join(re.escape(w) for w in sorted(DIR_NEUTRAL, key=len, reverse=True)))
+# 兼容旧接口的扁平词表（selftest 成员检查 / 外部探针）.
+DIR_UP = tuple(w for _a, ups, _d in DIR_AXES for w in ups)
+DIR_DOWN = tuple(w for _a, _u, downs in DIR_AXES for w in downs)
+# 只认「带量词/单位」的中文数字串: 「一万二千吨」「一万吨」; 「一致」「进一步」不算 (Batch 9 C-F-02)
+CN_NUM_RE = re.compile(r"[零〇一二三四五六七八九十百千万亿两]+(?=[吨桶手元%个家座台辆天周月年倍成])")
 ALERT_EVERY = 3600                   # 全源故障期间两条告警的最小间隔(秒)
-SRC_ALERT_ROUNDS = 3                 # 单源连续失败多少轮发告警 (可被 conf.src_alert_rounds 覆盖)
+SRC_ALERT_ROUNDS = 6                 # 单源连续失败多少轮发告警 (可被 conf.src_alert_rounds 覆盖)
 SRC_ALERT_EVERY = ALERT_EVERY        # 单源告警抑制窗口(秒), 与全源告警保持一致
 SRC_FAIL_KEY = "_src_fail"           # seen 里的单源失败状态块; '_' 前缀保证 prune 保留
+META_KEYS = ("_alert", "_digest", "_day", "_src_fail", "_research")   # prune 白名单: 新增元数据必须登记
 SRC_SKIP = "__budget_skip__"         # outcomes 哨兵: 全局预算跳过, 既不算成功也不算失败 (Batch 6 U4)
 BUDGET_S = 45                        # 全局抓取预算(秒): BUDGET_S + 单次 send 最坏(按 send_plan() 推导) + 本地开销 < 120s
 # 单源最小份额(秒)依据: 生产日志 626 轮实测 p99/max —— 见闻商品 5.40/7.50s、Nasdaq 4.10/4.20s、
 # 东财 max 5.20s; 5.0s 会把见闻商品约 1% 的轮次砍成失败, 故抬到 7.0 (Batch 6.1 U-B / fix C1)
 MIN_SLICE = 7.0                      # 单源抓取最小份额(秒)
+# curl 退出码 -> 人话 (Batch 8 失败归因): 28 超时 / 6,7,35 连接(SSL/DNS) / 16 HTTP/2 帧 / 63 体积上限
+# 注: 按评审 F-01/F-02 撤回「按剩余次数切分」, 只保留归因; 单次预算仍是一次用满剩余份额.
+CURL_RC_REASON = {28: "curl 超时", 6: "连接失败(SSL/DNS)", 7: "连接失败(SSL/DNS)",
+                  35: "连接失败(SSL/DNS)", 16: "HTTP/2 帧错误", 63: "超过体积上限"}
 
 # ---- Batch 7 研报源 (东财研报 / 中金所 / 中期协): 列表抓取 + PDF 正文摘要
 # 设计口径: PDF 只在「条目首次进入队列」时解析一次 (见 extract_research), 历史条目
@@ -111,6 +158,7 @@ PDF_CAP = 10                         # curl 最长秒数上限; 生产路径被 
 PDF_RLIMIT_AS = 256 * 1024 * 1024    # pdftotext 子进程内存上限: 391KB PDF 炸弹实测 926MB RSS; 真实 PDF 仅 ~10MB
 PDF_MAX_PAGES = 8                    # 只解析前 N 页: 8 页保住中金所月报 240 字摘要, 后半是表格/附录
 RESEARCH_URL_MAX = 1000              # 研报链接上限; 超长 URL 会让单条 u16>4096 且 split_msg 无法拆
+RESEARCH_URL_U16_MAX = 1000          # 研报链接**转义后**的 u16 预算 (& -> &amp; 放大 5 倍); 超了退纯文本
 RESEARCH_META_MAX = 200              # 研报元信息(text 的「机构 · 日期」段)上限
 PDF_MIN_CHARS = 40                   # 清洗后正文短于此数 -> 判「无文本层」, 摘要留空
 SNIPPET_MAX = 240                    # 摘要取前 N 字 (需求区间 200-300)
@@ -121,14 +169,19 @@ PDFTOTEXT = (os.environ.get("FUTNEWS_PDFTOTEXT")
              or next((p for p in ("/opt/homebrew/bin/pdftotext", "/usr/local/bin/pdftotext")
                       if os.path.exists(p)), ""))
 
-ROUND_SOFT_S = 60                    # 单轮软截止(秒): 120 - 单次 send 最坏(由 send_plan() 推导, 当前 54) - 余量 6
 ROUND_HARD_S = 120                   # launchd StartInterval 硬上界(秒): 单轮总耗时不得超过
 ROUND_MARGIN_S = 6                   # 本地阶段(锁/落盘/过滤)余量(秒)
+SEND_GATE_S = ROUND_HARD_S - ROUND_MARGIN_S   # 发送预算硬顶(秒): 闸门与软截止的唯一派生源
 ROUND_START = 0.0                    # main 每轮起点(time.monotonic); 逐次发送闸门共用 (Batch 6 F-02)
 
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36")
-PROXY = os.environ.get("HTTPS_PROXY") or ""   # 未设置则纯直连
+def proxy_from_env() -> str:
+    """代理环境变量口径: 大写优先, 兼容 curl 同样认识的小写形式 (Batch 9 B-D-05)."""
+    return os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or ""
+
+
+PROXY = proxy_from_env()   # 代理只取自环境变量, 不再内置默认地址；未设置则纯直连
 CFG: dict = {}                        # main 每轮注入的配置快照 (英文代理源读 proxy; Batch 6 U2)
 SEEN_MAX = 3000
 MSG_MAX = 3800                       # 按 UTF-16 码元计长, 留出 4096 上限余量
@@ -141,6 +194,20 @@ DIGEST_MAX_ITEMS = 40                # 队列攒到这么多立刻提前发 (尖
 MAX_HOLD_MIN = 45                    # 最早一条在队里最多待这么久就强制发 (V2: 90 -> 45, 单条迟到减半)
 QUEUE_MAX = 200                      # 队列硬上限, 超出的最旧条目丢弃并记账
 DAILY_MSG_CAP = 80                   # 单日通知条数上限 (安全阀; 实测自然峰值 44/天)
+
+# ---- Batch 10 R6: 聚合/退避/回拨阈值 (值=基线字面量, 只命名不改值)
+ROLLBACK_TOL_S = 60                  # 时钟回拨/前跳容差: last_flush/last_round/_research 三处共用
+LEFT_PENDING_RETRY_S = 60            # 有剩余待发时的最短重试间隔(秒)
+LONG_GAP_S = 3600.0                  # 判定「长间隔/休眠」的秒数: 关老化、先补发
+BLOCK_ACC_CAP_S = 7 * 86400.0        # block_acc 封顶(秒), 只作诊断与门闩
+BLOCK_ACC_STEP_MIN_S = 120.0         # block_acc 单轮最小累加步长(秒)
+CAP_NOTICE_RETRY_S = 600.0           # 触顶提示发送失败后的重试间隔(秒)
+RETRY_BASE_S = 120                   # 发送失败指数退避基数(秒)
+RETRY_MAX_S = 1800                   # 发送失败退避封顶(秒), 与 RA_MAX 一致
+RETRY_EXP_CAP = 4                    # 指数退避的指数封顶: 120*2^4=1920 -> 被 1800 截断
+MAX_HOLD_FLOOR_S = 300               # max_hold_min 的下限(秒)
+BUDGET_FLOOR_S = 15                  # timeout_s 的下限(秒)
+RESEARCH_RETRY_S = 300               # 研报源失败后 5 分钟重试: now - (1800 - 300)
 
 # 通用短标题: 不能单独作为去重签名, 必须回退到正文
 GENERIC_TITLES = {"快讯", "要闻", "早报", "午报", "晚报", "研报", "提醒", "公告", "周报",
@@ -267,7 +334,7 @@ NOISE_HARD = [
     "铜仁", "铜川", "锡山", "锡盟", "铝城", "铅山", "镍都", "铜锣湾", "铅笔",
     "紧急降落", "迫降",
     "锌合金", "铅酸", "玻璃钢", "玻璃纤维", "玻璃幕墙", "玻璃杯",
-    "股权", "收购", "并购", "增持", "回购", "股东", "营业利润", "净利润", "营收", "毛利率", "每股收益",
+    "股权", "收购", "营业利润", "净利润", "毛利率", "每股收益",
     "加息概率", "降息概率", "山东黄金", "中金黄金", "赤峰黄金", "紫金矿业",
     "洛阳钼业", "天齐锂业", "赣锋锂业", "锂电",
 ]
@@ -438,6 +505,58 @@ TS_MIN = 946684800                   # 2000-01-01, 早于此的时间串视为�
 TS_MAX_AHEAD = 366 * 86400           # 允许源站领先至多一年; 近期未来值由 FUTURE_TOL 丢弃并计数
 
 
+# ------------------------------------------------------------------ R3 上下文 (无状态视图)
+class RoundContext:
+    """本轮上下文。所有字段都是模块级测试接缝的**视图**，不复制状态。"""
+
+    __slots__ = ()
+
+    @property
+    def start(self) -> float:
+        return ROUND_START
+
+    @start.setter
+    def start(self, value: float) -> None:
+        global ROUND_START
+        ROUND_START = value
+
+    @property
+    def cfg(self) -> dict:
+        return CFG
+
+    @property
+    def ts_bad(self) -> dict[str, int]:
+        return TS_BAD
+
+
+class SendContext:
+    """发送上下文。所有字段都是模块级测试接缝的**视图**，不复制状态。"""
+
+    __slots__ = ()
+
+    @property
+    def err(self) -> str:
+        return SEND_ERR
+
+    @err.setter
+    def err(self, value: str) -> None:
+        global SEND_ERR
+        SEND_ERR = value
+
+    @property
+    def retry_after(self) -> float | None:
+        return SEND_RETRY_AFTER
+
+    @retry_after.setter
+    def retry_after(self, value: float | None) -> None:
+        global SEND_RETRY_AFTER
+        SEND_RETRY_AFTER = value
+
+
+_DEFAULT_ROUND = RoundContext()
+_DEFAULT_SEND = SendContext()
+
+
 # ------------------------------------------------------------------ utils
 def log(msg: str) -> None:
     print(f"[{datetime.now(TZ_CN).strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
@@ -514,8 +633,12 @@ def save_json(path: Path, data, tries: int = 3) -> bool:
 
 
 def prune(state: dict) -> dict:
-    """按插入顺序截断 SEEN_MAX, 但保留 '_' 前缀的元数据键 (如 _alert)."""
-    meta = {k: v for k, v in state.items() if k.startswith("_")}
+    """按插入顺序截断 SEEN_MAX, 只保留显式白名单 META_KEYS 的 '_' 键 (Batch 9 A-D-08①).
+
+    白名单化: 未登记的 '_' 键直接丢弃 (而不是靠 '_' 前缀静默存活), 新增元数据必须
+    登记 META_KEYS; 业务键按既有规则截到 SEEN_MAX, 且 dedupe_key 产出永不带 '_' 前缀。
+    """
+    meta = {k: state[k] for k in META_KEYS if k in state}
     keys = [(k, v) for k, v in state.items() if not k.startswith("_")][-SEEN_MAX:]
     return {**dict(keys), **meta}
 
@@ -538,12 +661,32 @@ def esc_quote(s: str) -> str:
     return esc(s).replace('"', "&quot;")
 
 
+def esc_quote_limited(s, limit: int) -> str:
+    """按 esc_quote 转义后截到 u16 <= limit; 截断不劈开实体, 超限补 '…' (Batch 9 R-E-F-01).
+
+    先转义再量长: esc_quote 会把 `"` 放大 6 倍、`&` 放大 5 倍; 按转义前 len() 截断
+    会得到远超预算的行 (Telegram 按 u16 计 4096 上限, MSG_MAX=3800 是留余量后的阈值)。
+    """
+    out: list[str] = []
+    used = 0
+    cut = False
+    for ch in str(s or ""):
+        piece = esc_quote(ch)
+        need = u16(piece)
+        if used + need + 1 > limit:          # 预留 '…' 的 1 个 u16
+            cut = True
+            break
+        out.append(piece)
+        used += need
+    return "".join(out) + ("…" if cut else "")
+
+
 def is_http_url(u) -> bool:
     """URL 协议白名单 (Batch 7 修复 C1): 只有 http(s) 允许落盘与渲染成链接.
 
     与 load_queue 原口径一致; 非字符串 (int/None/dict) 一律 False, 不再抛 AttributeError。
     """
-    return isinstance(u, str) and u.startswith(("http://", "https://"))
+    return isinstance(u, str) and u.lower().startswith(("http://", "https://"))
 
 
 # ------------------------------------------------------------------ queue (v5)
@@ -663,7 +806,7 @@ def day_counter(seen: dict, today: str) -> dict:
     if not isinstance(day, dict) or day.get("date") != today:
         day = {"date": today, "msgs": 0}
         seen["_day"] = day
-    elif not isinstance(day.get("msgs"), int):
+    elif not isinstance(day.get("msgs"), int) or isinstance(day.get("msgs"), bool):
         day["msgs"] = to_int(day.get("msgs"))
     return day
 
@@ -735,16 +878,35 @@ ATTR_RESIDUE = re.compile(
     r"\s*=\s*(?:\"[^\"]*\"|'[^']*'|[A-Za-z0-9#%.,:;/()+*?=&~_@-]*)", re.I)
 
 
+TAG_RE = re.compile(r"<\s*/?[A-Za-z][^>]*>")   # 只认 ASCII 标签名; 不吞「升水<150元」这类比较符 (Batch 9 C-F-03)
+COMMENT_RE = re.compile(r"<!--.*?-->|<\?.*?\?>", re.S)   # HTML 注释 / XML 处理指令: 整段剥除 (Batch 9 U3-F-03)
+
+
 def clean_text(raw) -> str:
-    """去标签 + 反转义 HTML 实体 + 清理残缺标签/裸露属性残留 (U4); 非字符串一律 str() 兜底."""
-    t = re.sub(r"<[^>]+>", "", str(raw or ""))
-    t = html.unescape(t).replace("\xa0", " ")
-    t = re.sub(r"<[^>]+>", "", t)           # 实体编码的完整标签反转义后才出现, 再剔一遍
-    t = TAG_RESIDUE.sub("", t)              # 缺 '>' 的残缺标签 (如 <span style=color:#ff0000)
-    t = ATTR_RESIDUE.sub("", t)             # 裸露属性 (如 spanstyle=color:rgb(255,0,0))
-    t = re.sub(r"[ \t\u3000]{2,}", " ", t)  # 收拾残留清掉后留下的多余空白/标点
+    """去标签 + 反转义 HTML 实体 + 清理残缺标签/裸露属性残留 (U4); 非字符串一律 str() 兜底.
+
+    Batch 9: ① 标签正则只认 ASCII 标签名, 比较运算符夹住的正文不再被当标签吞掉 (C-F-03);
+    ② 同一正则不再对 `<` 密集输入构造二次方回溯 (C-F-04);
+    ③ 实体反转义循环到稳定 (≤2 轮), 双重编码也幂等 (C-F-06);
+    ④ 注释 `<!-- -->` 与处理指令 `<?xml ?>` 整段剥除, 与基线行为一致 (U3-F-03).
+    """
+    t = COMMENT_RE.sub("", str(raw or ""))
+    t = TAG_RE.sub("", t)
+    for _ in range(2):                       # 双重编码实体: 反转义到稳定即停 (幂等)
+        u = COMMENT_RE.sub("", html.unescape(t).replace("\xa0", " "))
+        u = TAG_RE.sub("", u)
+        if u == t:
+            break
+        t = u
+    t = TAG_RESIDUE.sub("", t)               # 缺 '>' 的残缺标签 (如 <span style=color:#ff0000)
+    t = ATTR_RESIDUE.sub("", t)              # 裸露属性 (如 spanstyle=color:rgb(255,0,0))
+    t = re.sub(r"[ \t\u3000]{2,}", " ", t)   # 收拾残留清掉后留下的多余空白/标点
     t = re.sub(r"\s+([，。、；：！？,.;:!?])", r"\1", t)
     return t.strip()
+
+
+class HttpContractError(RuntimeError):
+    """curl 结果对象缺少 returncode/stdout: 契约破坏, 按失败关闭且不重试."""
 
 
 def http(url: str, referer: str | None = None, tries: int = 3,
@@ -771,15 +933,30 @@ def http(url: str, referer: str | None = None, tries: int = 3,
     Batch 7 修复 A5: max_bytes>0 (仅 PDF) 时不再请求 --compressed —— gzip 64MB 正文
     压缩后仅 ~64KB, curl 的 --max-filesize 只认 Content-Length(压缩后), 解压峰值 128MB;
     不发 Accept-Encoding 即从源头消掉解压放大。非研报路径的 argv 保持逐元素不变。
+
+    Batch 8 修复失败归因 (只改诊断, 不动抓取时序):
+      记录最近一次尝试的 curl 退出码, 抛错时按 rc 映射人话并带 rc 与耗时
+      (如 `curl 超时 (rc=28, 6.1s)`), 不再把 curl 超时/SSL 失败误标成「预算耗尽」;
+      只有一次尝试都没发起就因 left<2 退出, 才允许说预算耗尽并注明「未发起尝试」。
+      注: 按评审 F-01/F-02, 「按剩余次数切分」因 8-9s 份额会两次各 4s、把正常
+      4.1-6s 响应砍成两次失败而撤回; max_time 公式与基线逐字节等价。
+    Batch 9: argv 首位 -q; deadline is None 才视为无预算; 末次尝试后不 sleep。
     """
     last = ""
+    last_rc = None                       # 最近一次尝试的 curl 退出码 (Batch 8: 失败归因)
+    hard_error = ""                      # strict 体积超限: 确定性失败, 立即上抛并保留原因 (Batch 9 B-F-02)
+    started = time.monotonic()
     strict = max_bytes > 0
     for i in range(tries):
-        left = (deadline - time.monotonic()) if deadline else 30.0
+        left = (deadline - time.monotonic()) if deadline is not None else 30.0
         if left < 2:
-            raise RuntimeError(f"http 预算耗尽 ({last or 'no-attempt'})")
-        max_time = max(2, min(cap, int(left)))
-        cmd = ["curl", "-sS"]
+            # 仅「一次尝试都没发起」才允许报预算耗尽; 已尝试过则按最近一次 rc 报真实原因
+            if i == 0:
+                raise RuntimeError(
+                    f"http 预算耗尽 (未发起尝试, 剩余 {max(0.0, left):.1f}s)")
+            break
+        max_time = max(2, min(cap, int(left)))    # 与基线逐字节同款: 一次用满剩余份额
+        cmd = ["curl", "-q", "-sS"]      # -q: 忽略 ~/.curlrc, 防止用户级配置改写抓取语义 (Batch 9 B-D-01)
         cmd += ["--proxy", proxy] if proxy else ["--noproxy", "*"]
         if not strict:                       # PDF 路径不请求压缩, 见 docstring A5
             cmd += ["--compressed"]
@@ -797,25 +974,43 @@ def http(url: str, referer: str | None = None, tries: int = 3,
                 # argv 不变以免影响既有命令行断言。
                 kw["env"] = {**os.environ, "no_proxy": "", "NO_PROXY": ""}
             r = subprocess.run(cmd, **kw)
-            rc = getattr(r, "returncode", 0)          # 旧测试桩无该属性时按成功处理
+            if not hasattr(r, "returncode") or not hasattr(r, "stdout"):
+                raise HttpContractError(
+                    f"curl 结果缺少 returncode/stdout (fail-closed): {type(r).__name__}")
+            rc = r.returncode
             if rc != 0:                               # A2: curl 中止/超时/超限一律失败
+                last_rc = rc
                 last = f"curl rc={rc}"
                 raw = b""
             else:
+                last_rc = None                        # 最近一次已正常返回, 旧 rc 不再代表现状
                 raw = r.stdout
             body, _, code = raw.rpartition(b"\n")
             last = code.decode(errors="ignore").strip() if rc == 0 else last
             if body and last.startswith("2"):
                 if strict and len(body) > max_bytes:  # A2/A4: 体积兜底 (chunked 无长度时)
-                    raise RuntimeError(f"body 超上限 {len(body)}>{max_bytes}")
+                    hard_error = f"http failed (body 超上限 {len(body)}>{max_bytes})"
+                    break                             # 不重试、不 sleep, 由循环后统一上抛
                 return body
+        except HttpContractError:
+            raise
         except Exception as e:
+            last_rc = None                            # 本次尝试没拿到 rc, 不拿旧 rc 冒充
             last = f"{type(e).__name__}"
         nap = float(1 + i)
-        if deadline:
+        if deadline is not None:
             nap = min(nap, max(0.0, deadline - time.monotonic() - 1.0))
-        if nap > 0:
+        if nap > 0 and i < tries - 1:     # 末次尝试之后不再 sleep (Batch 9 B-F-03)
             time.sleep(nap)
+    if hard_error:
+        raise RuntimeError(hard_error)   # 保留「body 超上限」字样, 不再退化成 http failed (RuntimeError)
+    elapsed = time.monotonic() - started
+    if last_rc is not None:
+        reason = CURL_RC_REASON.get(last_rc) or f"curl rc={last_rc}"
+        detail = f"rc={last_rc}, {elapsed:.1f}s"
+        if last_rc == 63:
+            detail = f"curl {detail}"                # 保留既有 B7-19 断言的 "curl rc=63" 字样
+        raise RuntimeError(f"{reason} ({detail})")
     raise RuntimeError(f"http failed ({last or 'empty'})")
 
 
@@ -826,11 +1021,11 @@ def http_ok(url: str, deadline: float | None = None, timeout: int = 6) -> bool:
     等于每轮白拉半兆; 故只发 `curl -I`。网络失败/超时/参数非法一律返回 False,
     由调用方按「本期未发布」处理 (不抛错、不计入源失败)。
     """
-    left = (deadline - time.monotonic()) if deadline else 30.0
+    left = (deadline - time.monotonic()) if deadline is not None else 30.0
     if left < 1.5:
         return False
     t = max(1, min(timeout, int(left)))
-    cmd = ["curl", "-sS", "--noproxy", "*", "-I", "--max-time", str(t),
+    cmd = ["curl", "-q", "-sS", "--noproxy", "*", "-I", "--max-time", str(t),
            "-A", UA, "-o", "/dev/null", "-w", "%{http_code}", url]
     try:
         raw = subprocess.run(cmd, capture_output=True, timeout=t + 3).stdout
@@ -839,7 +1034,8 @@ def http_ok(url: str, deadline: float | None = None, timeout: int = 6) -> bool:
     return raw.decode(errors="ignore").strip().startswith("2")
 
 
-# ---- Batch 7 PDF 正文提取 (只跑 poppler CLI; 任一失败都降级为「无摘要」)
+# ---------------------------------------------------------------- PDF 正文提取 (Batch 7)
+# 只跑 poppler CLI; 任一失败都降级为「无摘要」
 PDF_TABLE = re.compile(r"^\[?[Tt]able[_\-\w]*\]?$|^[图表]\s*\d")     # 版式标记/图表编号行
 PDF_NUM = re.compile(r"^[\s\d.,%+\-—–/()（）亿元万股手吨桶美元]+$")   # 纯数字/单位行 (表格碎片)
 PDF_CJK = re.compile(r"[\u4e00-\u9fff]")
@@ -983,6 +1179,7 @@ def pdf_text(url: str, deadline: float | None = None,
     return body
 
 
+# ---------------------------------------------------------------- 研报管线 (Batch 7)
 def research_key(src: str, ident: str) -> str:
     """研报稳定去重键 (Batch 7): 同一篇研报每轮拉回都是同一个 key.
 
@@ -1016,8 +1213,9 @@ def research_reason(text: str) -> str:
     中金所/中期协的标题是官方统计口径 (「中金所月度数据统计」「全国期货市场交易情况
     简报」), 走 filter_reason 会被判「泛语境无品种」; 但栏目/日历、超短内容、股票
     口径噪声 (业绩/个股/沪深指数…) 仍然要丢。
-    顺序与 filter_reason 一致: 具体品种/产业锚点优先于噪声词 —— 否则「夯实股东回报」
-    里的「股东」会把「电解铝量价齐升」这种正牌商品研报误杀。
+    顺序与 filter_reason **不同**: 本函数把「具体品种/产业锚点」放在噪声否决**之前**
+    (更宽) —— 否则「夯实股东回报」里的「股东」会把「电解铝量价齐升」这种正牌商品
+    研报误杀。Batch 9 C-F-05 只同步注释, 行为一字不改。
     """
     t = (text or "").strip()
     if SKIP_RE.search(strip_decor(t)):
@@ -1072,6 +1270,7 @@ def extract_research(queue: list[dict], fresh: list[dict]) -> tuple[int, int]:
     return calls, q_changed
 
 
+# ------------------------------------------------------------------ 时间
 def sane_ts(v: int) -> int:
     """时间戳合理性闸门: 缺年份格式 (如 `10/14 09:00` -> 1900) 与跑飞值都判失败 (F-02)."""
     return v if TS_MIN <= v <= int(time.time()) + TS_MAX_AHEAD else 0
@@ -1105,10 +1304,11 @@ def parse_ts(raw) -> int:
         return 0
 
 
-def bad_ts(src: str) -> None:
+def bad_ts(src: str, ctx: RoundContext | None = None) -> None:
     """时间不可解析: 计数后丢弃该条 (F-02, 与金属网口径一致)."""
-    TS_BAD[src] = TS_BAD.get(src, 0) + 1
-    TS_BAD["total"] = TS_BAD.get("total", 0) + 1
+    ctx = ctx or _DEFAULT_ROUND
+    ctx.ts_bad[src] = ctx.ts_bad.get(src, 0) + 1
+    ctx.ts_bad["total"] = ctx.ts_bad.get("total", 0) + 1
 
 
 # ------------------------------------------------------------------ filter
@@ -1236,6 +1436,26 @@ def is_relevant(text: str, keywords: list[str] | None = None,
     return not filter_reason(text, keywords or DEFAULT_KEYWORDS, use_filter)
 
 
+def dir_axes(key: str) -> frozenset[tuple[str, int]]:
+    """方向集合: {(轴, +1/-1)}; 中性复合词先屏蔽, 长词优先匹配 (Batch 9 U3-F-01).
+
+    「沪铜新增产量下降5%」只产出下行 -1：不会被「新增」的「增」追加成上行；
+    「沪铜涨跌互现」产出 {("价格", +1), ("价格", -1)}。
+    """
+    t = _DIR_NEUTRAL_RE.sub("□", key or "")
+    return frozenset(_DIR_TOKEN_SIGNS[m.group(0)] for m in _DIR_TOKEN_RE.finditer(t))
+
+
+def dir_sign(key: str) -> int:
+    """近邻合并方向签名 (兼容旧接口): 1=上行/偏多, -1=下行/偏空, 0=不含或双侧同现 (「涨跌互现」)."""
+    axes = dir_axes(key)
+    up = any(sign > 0 for _axis, sign in axes)
+    down = any(sign < 0 for _axis, sign in axes)
+    if up == down:
+        return 0
+    return 1 if up else -1
+
+
 def merge_near(items: list[dict]) -> tuple[list[dict], list[tuple]]:
     """时间窗内高相似度条目合并 (同一事件不同措辞, F-13); 保留最早一条作为主条目."""
     kept: list[dict] = []
@@ -1254,6 +1474,12 @@ def merge_near(items: list[dict]) -> tuple[list[dict], list[tuple]]:
                 continue                      # 数字不一致 -> 不同事件 (指标型快讯最常见)
             if WEEKDAY.findall(a) != WEEKDAY.findall(b):
                 continue                      # 周一/周三等不一致 -> 不同日的日历条目
+            da, db = dir_axes(a), dir_axes(b)
+            if da and db and da != db:
+                continue                      # 方向集合不相等 -> 不同事件 (Batch 9 U3-F-01)
+                                               # 一侧无方向词 (空集) 不否决: 「上涨」vs 无词 仍可合并
+            if CN_NUM_RE.findall(a) != CN_NUM_RE.findall(b):
+                continue                      # 中文数字量词不同 -> 不近似合并 (Batch 9 C-F-02)
             ratio = difflib.SequenceMatcher(None, a, b).ratio()
             if ratio >= NEAR_RATIO:
                 dup = (prev, ratio)
@@ -1266,6 +1492,30 @@ def merge_near(items: list[dict]) -> tuple[list[dict], list[tuple]]:
 
 
 # ------------------------------------------------------------------ sources
+def feed_items(fetch, src_name: str, extract,
+               ctx: RoundContext | None = None) -> list[dict]:
+    """六个中文快讯源共享骨架: 取数 -> 抽取 -> 时间校验 -> 丢弃计数 -> 追加。
+
+    fetch() 返回原始条目序列; extract(raw) 返回 (text, ts) 或 None:
+      - None   = 本条无正文 / 源内噪声, 静默跳过, **不**计 bad_ts
+      - (text, 0) = 时间不可解析, 计 bad_ts(src_name) 后丢弃
+    空输入返回 []: 「空结果是否算失败」由调用方决定, 本函数不抛哨兵。
+    """
+    out: list[dict] = []
+    for raw in fetch():
+        got = extract(raw)
+        if got is None:
+            continue
+        text, ts = got
+        if not text:
+            continue
+        if not ts:
+            bad_ts(src_name, ctx)
+            continue
+        out.append({"src": src_name, "ts": ts, "text": text})
+    return out
+
+
 def src_cls(deadline: float | None = None) -> list[dict]:
     p = {"app": "CailianpressWeb", "category": "", "lastTime": "", "last_time": "",
          "os": "web", "refresh_type": "1", "rn": "40", "sv": "8.4.6"}
@@ -1273,34 +1523,34 @@ def src_cls(deadline: float | None = None) -> list[dict]:
     sign = hashlib.md5(hashlib.sha1(q.encode()).hexdigest().encode()).hexdigest()
     d = json.loads(http(f"https://www.cls.cn/v1/roll/get_roll_list?{q}&sign={sign}",
                         "https://www.cls.cn/telegraph", deadline=deadline))
-    out = []
-    for it in d.get("data", {}).get("roll_data", []):
+    rows = d.get("data", {}).get("roll_data", [])
+    if not rows:                          # 200+空列表 = 结构性变化, 不得静默当「今天没新闻」
+        raise RuntimeError("财联社: roll_data 为空列表 (疑似结构变化)")
+
+    def extract(it: dict) -> tuple[str, int] | None:
         text = (it.get("title") or it.get("brief") or "").strip()
         if not text:
-            continue
-        ts = parse_ts(it.get("ctime"))
-        if not ts:                       # 时间不可解析 -> 丢弃并计数, 不再伪造 now()
-            bad_ts("财联社")
-            continue
-        out.append({"src": "财联社", "ts": ts, "text": text})
-    return out
+            return None
+        return text, parse_ts(it.get("ctime"))   # 0 = 不可解析 -> feed_items 计 bad_ts 后丢弃
+
+    return feed_items(lambda: rows, "财联社", extract)
 
 
 def src_em(deadline: float | None = None) -> list[dict]:
     u = ("https://np-listapi.eastmoney.com/comm/web/getFastNewsList?client=web&biz=web_724"
          f"&fastColumn=102&sortEnd=&pageSize=40&req_trace={int(time.time()*1000)}")
     d = json.loads(http(u, "https://kuaixun.eastmoney.com/", deadline=deadline))
-    out = []
-    for it in d.get("data", {}).get("fastNewsList", []):
+    rows = d.get("data", {}).get("fastNewsList", [])
+    if not rows:
+        raise RuntimeError("东财: fastNewsList 为空列表 (疑似结构变化)")
+
+    def extract(it: dict) -> tuple[str, int] | None:
         text = (it.get("summary") or "").strip()
         if not text:
-            continue
-        ts = parse_ts(it.get("showTime"))
-        if not ts:
-            bad_ts("东财")
-            continue
-        out.append({"src": "东财", "ts": ts, "text": text})
-    return out
+            return None
+        return text, parse_ts(it.get("showTime"))
+
+    return feed_items(lambda: rows, "东财", extract)
 
 
 def merge_title_digest(title: str, digest: str) -> str:
@@ -1319,36 +1569,36 @@ def merge_title_digest(title: str, digest: str) -> str:
 def src_ths(deadline: float | None = None) -> list[dict]:
     u = "https://news.10jqka.com.cn/tapp/news/push/stock/?page=1&tag=&track=website&pagesize=40"
     d = json.loads(http(u, deadline=deadline))
-    out = []
-    for it in d.get("data", {}).get("list", []):
-        title = re.sub(r"<[^>]+>", "", (it.get("title") or "")).strip()
-        digest = re.sub(r"<[^>]+>", "", (it.get("digest") or "")).strip()
+    rows = d.get("data", {}).get("list", [])
+    if not rows:
+        raise RuntimeError("同花顺: list 为空列表 (疑似结构变化)")
+
+    def extract(it: dict) -> tuple[str, int] | None:
+        title = TAG_RE.sub("", (it.get("title") or "")).strip()
+        digest = TAG_RE.sub("", (it.get("digest") or "")).strip()
         body = merge_title_digest(title, digest)
         if not body:
-            continue
-        ts = parse_ts(it.get("ctime"))
-        if not ts:
-            bad_ts("同花顺")
-            continue
-        out.append({"src": "同花顺", "ts": ts, "text": body})
-    return out
+            return None
+        return body, parse_ts(it.get("ctime"))
+
+    return feed_items(lambda: rows, "同花顺", extract)
 
 
 def src_sina(deadline: float | None = None) -> list[dict]:
     u = ("https://zhibo.sina.com.cn/api/zhibo/feed?page=1&page_size=40"
          "&zhibo_id=152&tag_id=0&dire=f&dpc=1")
     d = json.loads(http(u, deadline=deadline))
-    out = []
-    for it in d.get("result", {}).get("data", {}).get("feed", {}).get("list", []):
-        text = re.sub(r"<[^>]+>", "", (it.get("rich_text") or it.get("content") or "")).strip()
+    rows = d.get("result", {}).get("data", {}).get("feed", {}).get("list", [])
+    if not rows:
+        raise RuntimeError("新浪: feed.list 为空列表 (疑似结构变化)")
+
+    def extract(it: dict) -> tuple[str, int] | None:
+        text = TAG_RE.sub("", (it.get("rich_text") or it.get("content") or "")).strip()
         if not text:
-            continue
-        ts = parse_ts(it.get("create_time"))
-        if not ts:
-            bad_ts("新浪")
-            continue
-        out.append({"src": "新浪", "ts": ts, "text": text})
-    return out
+            return None
+        return text, parse_ts(it.get("create_time"))
+
+    return feed_items(lambda: rows, "新浪", extract)
 
 
 def src_wscn_commodity(deadline: float | None = None) -> list[dict]:
@@ -1356,85 +1606,17 @@ def src_wscn_commodity(deadline: float | None = None) -> list[dict]:
     u = ("https://api-one-wscn.awtmt.com/apiv1/content/lives"
          "?channel=commodity-channel&client=pc&limit=50")
     d = json.loads(http(u, deadline=deadline))
-    out = []
-    for it in (d.get("data") or {}).get("items") or []:
+    rows = (d.get("data") or {}).get("items") or []
+    if not rows:
+        raise RuntimeError("见闻商品: items 为空列表 (疑似结构变化)")
+
+    def extract(it: dict) -> tuple[str, int] | None:
         text = clean_text(it.get("content_text"))
         if not text:
-            continue
-        ts = parse_ts(it.get("display_time"))
-        if not ts:
-            bad_ts("见闻商品")
-            continue
-        out.append({"src": "见闻商品", "ts": ts, "text": text})
-    return out
+            return None
+        return text, parse_ts(it.get("display_time"))
 
-
-def _err_line() -> str:
-    """抓 err() 写到 stderr 的那一行 (log() 只进 stdout)."""
-    buf = io.StringIO()
-    real = sys.stderr
-    try:
-        sys.stderr = buf
-        err("selftest probe")
-    finally:
-        sys.stderr = real
-    return buf.getvalue()
-
-
-def _send_retry_ok() -> bool:
-    """第一次腿抛 SSL EOF (19:48 那批的真实错因), 必须换腿重试且成功."""
-    calls: list[str] = []
-    real_tg, real_sleep = globals()["tg"], time.sleep
-
-    def fake_tg(method, payload, tk, proxy, timeout=25):
-        calls.append(proxy or "直连")
-        if len(calls) == 1:
-            raise urllib.error.URLError(ssl.SSLEOFError(8, "EOF in violation of protocol"))
-        return {"ok": True}
-
-    try:
-        globals()["tg"] = fake_tg
-        time.sleep = lambda s: None
-        ok = send("probe", {"chat_id": 1, "proxy": "http://127.0.0.1:8080"}, "tk")
-        return ok and len(calls) == 2 and calls[1] == "http://127.0.0.1:8080"
-    finally:
-        globals()["tg"], time.sleep = real_tg, real_sleep
-
-
-def _send_429(header: str | None) -> tuple[float | None, int, bool]:
-    """模拟 429 (可带 Retry-After): 返回 (SEND_RETRY_AFTER, tg 调用次数, send 结果)."""
-    calls: list[str] = []
-    hdrs = {} if header is None else {"Retry-After": header}
-    real_tg = globals()["tg"]
-
-    def fake_tg(method, payload, tk, proxy, timeout=25):
-        calls.append(proxy or "直连")
-        raise urllib.error.HTTPError("https://api.telegram.org", 429, "Too Many",
-                                     hdrs, io.BytesIO(b'{"ok":false}'))
-
-    try:
-        globals()["tg"] = fake_tg
-        ok = send("probe", {"chat_id": 1, "proxy": ""}, "tk")
-    finally:
-        globals()["tg"] = real_tg
-    return SEND_RETRY_AFTER, len(calls), ok
-
-
-def _smm_empty_raises() -> bool:
-    """变异体保护: listList 为空/缺失时必须 RuntimeError, 不能当成「今天没新闻」."""
-    fake = {"props": {"pageProps": {"liveListData": {"data": {"data": {}}}}}}
-    raw = ('<script id="__NEXT_DATA__" type="application/json">'
-           + json.dumps(fake) + "</script>")
-    real = http
-    try:
-        globals()["http"] = lambda *a, **k: raw.encode()
-        try:
-            src_smm(None)
-        except RuntimeError:
-            return True
-        return False
-    finally:
-        globals()["http"] = real
+    return feed_items(lambda: rows, "见闻商品", extract)
 
 
 # SMM 源内噪声: 分钟级行情预警 + 无对应合约的产业稿 (印尼煤炭/钼/有机硅),
@@ -1461,22 +1643,18 @@ def src_smm(deadline: float | None = None) -> list[dict]:
     lst = ((lld.get("data") or {}).get("data") or {}).get("listList") or []
     if not lst:
         raise RuntimeError("SMM: listList 为空 (前端结构变了)")
-    out = []
-    for it in lst:
+
+    def extract(it: dict) -> tuple[str, int] | None:
         title = clean_text(it.get("title"))
         profile = clean_text(it.get("profile"))
         # 5/30 条标题在正文开头重复一遍, 只留正文
         text = profile if title and profile.startswith(title[:min(len(title), 24)]) else \
             clean_text(f"{title} {profile}")
         if not smm_keep(text):
-            continue                      # 分钟级行情异动预警 = 纯噪声, 不进过滤器
-        
-        ts = parse_ts(it.get("pubDate"))
-        if not ts:
-            bad_ts("SMM")
-            continue
-        out.append({"src": "SMM", "ts": ts, "text": text})
-    return out
+            return None                   # 分钟级行情异动预警 = 纯噪声, 不进过滤器
+        return text, parse_ts(it.get("pubDate"))
+
+    return feed_items(lambda: lst, "SMM", extract)
 
 
 # --------------------------------------------------------------- 英文源 (Batch 6)
@@ -1637,9 +1815,10 @@ def src_marketwatch(deadline: float | None = None) -> list[dict]:
     return rss_items(feed_http(FEED_MARKETWATCH, deadline), "MarketWatch")
 
 
-def feed_proxy() -> str:
-    """英文代理源取值口径与 send_plan() 完全一致: conf.proxy -> 环境 HTTPS_PROXY."""
-    return str(CFG.get("proxy") or PROXY or "").strip()
+def feed_proxy(ctx: RoundContext | None = None) -> str:
+    """英文代理源取值口径与 send_plan() 完全一致: conf.proxy -> 环境 HTTPS_PROXY / https_proxy."""
+    ctx = ctx or _DEFAULT_ROUND
+    return str(ctx.cfg.get("proxy") or PROXY or "").strip()
 
 
 def _feed_via_proxy(url: str, deadline: float | None, src: str) -> bytes:
@@ -1786,7 +1965,7 @@ def src_cfa(deadline: float | None = None) -> list[dict]:
     return out
 
 
-# 2026-11-04 源体检 (7 源同批抓取实测, 双评审):
+# 源体检 (7 源同批抓取实测, 双评审):
 #   · 见闻商品: 页面 50 条跨 ~15h, 滞后 75min, 有效 44%; 单 180min 窗均值 ~2 条 / 3.7 品种,
 #     价值在黑色/农产/能化等其它源 0 覆盖的品种, 不是实时宽度 (别据此放宽 max_age_min)。
 #   · SMM: 有色产业快讯, 滞后 ~19min, 有效 83% 但 45% 是无合约产业稿 -> 源内先剔 (SMM_NOISE)。
@@ -1857,6 +2036,7 @@ SEND_ERR = ""                          # 最近一次发送失败原因 (供调�
 SEND_RETRY_AFTER: float | None = None  # 429 的 Retry-After 建议秒数 (None=头缺失/不可解析)
 RA_MIN = 30                            # Retry-After 夹取下限(秒): 0/负数也不立刻重打
 RA_MAX = 1800                          # Retry-After 夹取上限(秒): 与指数退避封顶一致, 不冻结队列
+NEXT_TRY_TOL_S = 60                    # next_try 未来值容差(秒): 合法上界 = RA_MAX + 本容差
 
 
 def parse_retry_after(raw: str | None) -> float | None:
@@ -1901,15 +2081,18 @@ def is_transient(e: BaseException) -> bool:
     if isinstance(e, urllib.error.HTTPError):
         return False
     transient_types = (ssl.SSLError, socket.gaierror, socket.timeout,
-                       ConnectionError, TimeoutError)
+                       ConnectionError, TimeoutError, IncompleteRead)
     # URLError 会把真正的错误塞在 .reason 里, 两层都要看
     for c in (e, getattr(e, "reason", None)):
         if c is None:
             continue
         if isinstance(c, transient_types):
             return True
-        if isinstance(c, OSError) and getattr(c, "errno", None) in (51, 54, 60, 61, 65):
-            return True                     # ENETUNREACH/ECONNRESET/ETIMEDOUT/ECONNREFUSED/EHOSTUNREACH
+        if isinstance(c, OSError) and getattr(c, "errno", None) in (
+                errno.ENETUNREACH, errno.ECONNRESET, errno.ETIMEDOUT,
+                errno.ECONNREFUSED, errno.EHOSTUNREACH,
+                errno.ENETDOWN, errno.EADDRNOTAVAIL):   # 语义常量, 不再硬编码 macOS 字面量
+            return True
     return False
 
 
@@ -1929,26 +2112,45 @@ def send_worst(conf: dict) -> int:
     return sum(t for _, t in plan) + 3 * (len(plan) - 1)
 
 
-SEND_WORST = send_worst({"proxy": "http://127.0.0.1:8080"})   # 生产口径(3 腿): 8+20+20+3×2=54
+SEND_WORST = send_worst({"proxy": "http://127.0.0.1:8080"})   # import 期兜底(3 腿 54s); main 按 conf 重算
 
 
-def send_time_ok() -> bool:
-    """逐次发送闸门: 现在再发一次 send 仍不会顶到 ROUND_HARD_S - ROUND_MARGIN_S.
+def send_backoff_s(fails: int) -> int:
+    """发送失败退避秒数: 120 * 2^min(fails, 4), 封顶 1800 (Batch 10 R6)."""
+    return min(RETRY_MAX_S, RETRY_BASE_S * (2 ** min(fails, RETRY_EXP_CAP)))
+
+
+def round_soft_s() -> float:
+    """单轮软截止(秒) = 发送预算硬顶 - 单次 send 最坏; 与 send_time_ok() 共用同一推导.
+
+    Batch 9 A-D-03: 同一物理阈值不再有「常量/推导/断言」三处来源。
+    """
+    return SEND_GATE_S - SEND_WORST
+
+
+ROUND_SOFT_S = round_soft_s()   # import 期快照(3 腿口径 60s), 供静态预算断言; 运行时用 round_soft_s()
+
+
+def send_time_ok(ctx: RoundContext | None = None) -> bool:
+    """逐次发送闸门: 现在再发一次 send 仍不会顶到 SEND_GATE_S (= ROUND_HARD_S - ROUND_MARGIN_S).
 
     ROUND_START 为 0 (直接单测 / 非 main 调用) 视为无耗时压力, 不阻断.
     每个 send 点发送前都必须先过这道闸门; 不满足就把该条消息推迟到下一轮, 不算失败.
     """
-    start = ROUND_START or time.monotonic()
-    return (time.monotonic() - start) + SEND_WORST <= ROUND_HARD_S - ROUND_MARGIN_S
+    ctx = ctx or _DEFAULT_ROUND
+    start = ctx.start or time.monotonic()
+    return (time.monotonic() - start) + SEND_WORST <= SEND_GATE_S
 
 
-def send(text: str, conf: dict, tk: str, depth: int = 0) -> bool:
-    global SEND_ERR, SEND_RETRY_AFTER
-    SEND_RETRY_AFTER = None                  # 本轮未遇 429 时必须为 None, 不得沿用上一轮
+def send(text: str, conf: dict, tk: str, depth: int = 0,
+         ctx: SendContext | None = None) -> bool:
+    ctx = ctx or _DEFAULT_SEND
+    ctx.retry_after = None                   # 本轮未遇 429 时必须为 None, 不得沿用上一轮
+    ctx.err = ""                             # 入口复位: 上一次的失败原因不得跨越本次调用 (Batch 9 A-F-04)
     chat_id = conf.get("chat_id") or discover_chat_id(conf, tk)
     if not chat_id:
-        SEND_ERR = "no chat_id (先给 bot 发一条消息)"
-        log(SEND_ERR)
+        ctx.err = "no chat_id (先给 bot 发一条消息)"
+        log(ctx.err)
         return False
     base = {"chat_id": chat_id, "disable_web_page_preview": "true"}
     for i, (proxy, timeout) in enumerate(send_plan(conf)):
@@ -1956,7 +2158,7 @@ def send(text: str, conf: dict, tk: str, depth: int = 0) -> bool:
             time.sleep(3)                            # 瞬时抖动给 3s 缓和, 别整轮作废
         try:
             tg("sendMessage", {**base, "text": text, "parse_mode": "HTML"}, tk, proxy, timeout)
-            SEND_ERR = ""
+            ctx.err = ""
             return True
         except urllib.error.HTTPError as e:
             detail = e.read()[:200].decode(errors="ignore")
@@ -1965,25 +2167,26 @@ def send(text: str, conf: dict, tk: str, depth: int = 0) -> bool:
                 parts = split_msg(text)                  # 超长 -> 拆批重发, 不换代理重试同一 payload
                 if len(parts) > 1:
                     log(f"消息超长 (u16={u16(text)}), 拆成 {len(parts)} 批重发")
-                    return all(send(p, conf, tk, depth + 1) for p in parts)
+                    return all(send(p, conf, tk, depth + 1, ctx) for p in parts)
             if e.code == 400 and "parse" in detail.lower():
                 try:                                     # HTML 实体炸了 -> 降级纯文本
                     tg("sendMessage", {**base, "text": re.sub(r"<[^>]+>", "", text)}, tk, proxy, timeout)
+                    ctx.err = ""             # 降级成功也要清因: 全局态不得残留过期失败 (Batch 9 R-E-F-02)
                     return True
                 except Exception as e2:
                     log(f"plain-text fallback failed: {e2}")
             if e.code == 429:
                 hdrs = getattr(e, "headers", None)
-                SEND_RETRY_AFTER = parse_retry_after(hdrs.get("Retry-After") if hdrs else None)
-                SEND_ERR = "HTTP 429 限流"
-                if SEND_RETRY_AFTER is not None:
-                    SEND_ERR += f" (Retry-After {int(SEND_RETRY_AFTER)}s)"
+                ctx.retry_after = parse_retry_after(hdrs.get("Retry-After") if hdrs else None)
+                ctx.err = "HTTP 429 限流"
+                if ctx.retry_after is not None:
+                    ctx.err += f" (Retry-After {int(ctx.retry_after)}s)"
                 return False                             # 限流: 下轮再推, 不标记已读
-            SEND_ERR = f"HTTP {e.code}: {detail[:120]}"
+            ctx.err = f"HTTP {e.code}: {detail[:120]}"
             return False                                 # 确定性失败, 不换腿重试同一 payload
         except Exception as e:
-            SEND_ERR = f"{type(e).__name__}: {e}"
-            log(f"send proxy={proxy or '直连'} failed: {SEND_ERR}"
+            ctx.err = f"{type(e).__name__}: {e}"
+            log(f"send proxy={proxy or '直连'} failed: {ctx.err}"
                 + ("" if is_transient(e) else " (非瞬时, 不再换腿)"))
             if not is_transient(e):
                 return False
@@ -1991,11 +2194,35 @@ def send(text: str, conf: dict, tk: str, depth: int = 0) -> bool:
 
 
 # ------------------------------------------------------------------ state extras
-def take_pending() -> list[str]:
-    """上一轮「已发送但 state 落盘失败」的待确认键 (F-07)."""
+def backup_path(path: Path) -> Path:
+    """损坏文件的备份路径: `<name>.bad-<ts>`; 同秒冲突时加 `-1`/`-2`..., 保证每份都留 (Batch 9 U4-F-03)."""
+    base = f"{path.name}.bad-{int(time.time())}"
+    cand = path.with_name(base)
+    seq = 0
+    while cand.exists():                       # 只读探测; 真正落盘由调用方 replace
+        seq += 1
+        cand = path.with_name(f"{base}-{seq}")
+    return cand
+
+
+def take_pending(inspect: bool = False) -> list[str]:
+    """上一轮「已发送但 state 落盘失败」的待确认键 (F-07).
+
+    inspect=True (--stats/--queue): 只读检视模式, 损坏时只 err 留痕, 不改名、不落盘 (Batch 9 U4-F-01).
+    命名注记: 参数名 inspect 与标准库 inspect 模块同名 (历史命名, 与 RunOpts.inspect /
+    CLI 语义一一对应); 本函数内不引用该模块, 故不构成实际遮蔽风险.
+    """
     data, problem = load_state(PENDING)
     if problem:
-        err(f"待确认标记文件不可读, 已忽略: {problem}")
+        if inspect:
+            err(f"待确认标记文件不可读({problem}), 检视模式只读, 未改动文件")
+            return []
+        badpath = backup_path(PENDING)
+        try:
+            PENDING.replace(badpath)
+            err(f"待确认标记文件不可读({problem}), 已备份为 {badpath.name}")
+        except OSError as e:
+            err(f"待确认标记文件不可读({problem}), 备份失败({e}), 已忽略")
         return []
     keys = data.get("keys") or []
     return [k for k in keys if isinstance(k, str) and k]
@@ -2032,11 +2259,14 @@ def record_stale(seen: dict, stale: list[dict], max_age: int) -> None:
 
 
 def alert_all_failed(seen: dict, errors: list[str], conf: dict, tk: str, dry: bool,
-                     skipped: int = 0) -> None:
+                     skipped: int = 0, partial: bool = False,
+                     ctx: RoundContext | None = None) -> None:
     """全源失败告警状态机 (F-15): 首轮发 1 条 -> 之后每 ALERT_EVERY 汇总 -> 恢复另有通知.
 
     skipped: 本轮被预算跳过的源数, 只进文案计数, 不进失败源名单 (Batch 6.1 U-A).
+    partial: 有源真失败、但同时有源「成功但 0 条」-> 文案降级为「部分失败」(Batch 9 D-F-01).
     """
+    ctx = ctx or _DEFAULT_ROUND
     now = int(time.time())
     alert = seen.get("_alert")
     alert = alert if isinstance(alert, dict) else {}
@@ -2049,15 +2279,17 @@ def alert_all_failed(seen: dict, errors: list[str], conf: dict, tk: str, dry: bo
             log(f"全源故障第 {alert['rounds']} 轮, 告警已抑制 (上次 {now - last}s 前)")
             seen["_alert"] = alert
             return
-        msg = f"⚠️ 期货快讯源仍全部失败 (累计 {alert['rounds']} 轮): {detail}" + suffix
+        head = "仍无可用条目" if partial else "仍全部失败"
+        msg = f"⚠️ 期货快讯源{head} (累计 {alert['rounds']} 轮): {detail}" + suffix
     else:
         alert = {"failing": True, "since": now, "rounds": 1, "last_sent": 0, "alerts": 0}
-        msg = f"⚠️ 期货快讯源全部抓取失败: {detail}" + suffix
+        head = "部分失败且无可用条目" if partial else "全部抓取失败"
+        msg = f"⚠️ 期货快讯源{head}: {detail}" + suffix
     if dry:
         log("(dry-run) 告警未发送")
         seen["_alert"] = alert
         return
-    if not send_time_ok():              # 逐次闸门: 再发会顶到 120s -> 推迟, rounds 已递增, last_sent 不更新
+    if not send_time_ok(ctx):           # 逐次闸门: 再发会顶到 120s -> 推迟, rounds 已递增, last_sent 不更新
         log("全源失败告警推迟到下一轮 (本轮再发会顶到 120s 上界)")
         seen["_alert"] = alert
         return
@@ -2071,8 +2303,10 @@ def alert_all_failed(seen: dict, errors: list[str], conf: dict, tk: str, dry: bo
     seen["_alert"] = alert
 
 
-def note_recovered(seen: dict, conf: dict, tk: str, dry: bool) -> bool:
+def note_recovered(seen: dict, conf: dict, tk: str, dry: bool,
+                   ctx: RoundContext | None = None) -> bool:
     """从全源故障恢复: 故障告警已送达 (alerts>=1) 才发 1 条恢复通知, 否则只静默复位."""
+    ctx = ctx or _DEFAULT_ROUND
     alert = seen.get("_alert")
     if not isinstance(alert, dict) or not alert.get("failing"):
         return False
@@ -2082,21 +2316,42 @@ def note_recovered(seen: dict, conf: dict, tk: str, dry: bool) -> bool:
     alerts = int(alert.get("alerts") or 0)
     if not alerts:                       # 告警从未送达 (发送全失败 / dry-run): 不发假"已恢复" (U-A-2)
         log(f"全源恢复: 故障告警从未送达 (故障 {rounds} 轮), 静默复位, 不发恢复通知")
-    elif not dry and not send_time_ok():  # 逐次闸门: 恢复通知推迟, _alert 状态保留, 下轮重试
+    elif not dry and not send_time_ok(ctx):  # 逐次闸门: 恢复通知推迟, _alert 状态保留, 下轮重试
         log("全源恢复通知推迟到下一轮 (本轮再发会顶到 120s 上界)")
         return False
     elif not dry:
         ok = send(f"✅ 期货快讯源已恢复 (故障 {rounds} 轮 / 约 {mins} 分钟)", conf, tk)
         log(f"恢复通知{'已发送' if ok else '发送失败'} (故障 {rounds} 轮)")
+        if not ok:
+            return False                      # 发送失败: failing 不清零, 下轮重试 (Batch 9 D-F-03)
     seen["_alert"] = {"failing": False, "since": 0, "rounds": 0, "last_sent": 0, "alerts": 0}
     return True
 
 
-# ---------------- 单源连续失败告警 (U2)
+# ---------------- 单源连续失败告警 (Batch 5 U2)
 def src_fail_state(seen: dict) -> dict:
     """取单源失败状态块 (_src_fail: {源名: 计数块}); 类型不对时返回空 dict, 由调用方覆盖."""
     state = seen.get(SRC_FAIL_KEY)
     return state if isinstance(state, dict) else {}
+
+
+def prune_src_fail(seen: dict) -> bool:
+    """清掉已不在 SOURCES 里的源失败残留, 防同名源复活继承旧计数 (Batch 9 D-D-02)."""
+    state = src_fail_state(seen)
+    if not state:
+        return False
+    known = {n for n, _ in SOURCES}
+    gone = sorted(n for n in state if n not in known)
+    if not gone:
+        return False
+    for n in gone:
+        state.pop(n, None)
+    if state:
+        seen[SRC_FAIL_KEY] = state
+    else:
+        seen.pop(SRC_FAIL_KEY, None)
+    log(f"清理下线源失败残留: {', '.join(gone)}")
+    return True
 
 
 def src_alert_rounds(conf: dict) -> int:
@@ -2105,16 +2360,19 @@ def src_alert_rounds(conf: dict) -> int:
 
 
 def source_health(seen: dict, outcomes: list[tuple[str, str]], conf: dict,
-                  tk: str, dry: bool) -> bool:
+                  tk: str, dry: bool, ctx: RoundContext | None = None) -> bool:
     """按源维护连续失败轮数: 连续 N 轮发 1 条, 之后每 SRC_ALERT_EVERY 汇总 1 条带累计轮数;
     该源恢复且此前告过警时发 1 条恢复通知并清零.
 
     outcomes = [(源名, ""), (源名, "错误摘要"), (源名, SRC_SKIP), ...] (与 SOURCES 同序).
     三态: "" = 成功 / 非空错误摘要 = 失败 / SRC_SKIP = 全局预算跳过 (不计失败、不清零、
     不告警、不发恢复; 跳过也不写入 errors/stats 的失败列表).
-    全源失败整轮交给 alert_all_failed, 这里不计数也不发, 避免重复告警.
+    全源失败整轮交给 alert_all_failed, 这里不计数也不发, 避免重复告警 (防御性分支:
+    main 的全源失败轮已在「无可用条目」分支提前 return, 正常流程下 all_failed 不可达;
+    保留该分支仅为直接调用与未来改动).
     返回是否改动过状态 (调用方据此决定落不落盘); dry=True 只记账不发送.
     """
+    ctx = ctx or _DEFAULT_ROUND
     if not outcomes:
         return False
     all_failed = all(bool(e) and e != SRC_SKIP for _, e in outcomes)
@@ -2128,7 +2386,7 @@ def source_health(seen: dict, outcomes: list[tuple[str, str]], conf: dict,
             continue
         cur = state.get(name)
         cur = dict(cur) if isinstance(cur, dict) else {}
-        if all_failed:                      # 全源故障: 既有 alert_all_failed 负责, 本机不发
+        if all_failed:                      # 防御性: main 正常流程不可达 (见 docstring)
             continue
         if not detail:                      # 本轮成功
             if not to_int(cur.get("alerts")):
@@ -2148,7 +2406,7 @@ def source_health(seen: dict, outcomes: list[tuple[str, str]], conf: dict,
                 state.pop(name, None)
                 changed = True
                 continue
-            if not send_time_ok():          # 逐次闸门: 恢复通知推迟, 状态保留不清零
+            if not send_time_ok(ctx):       # 逐次闸门: 恢复通知推迟, 状态保留不清零
                 log(f"单源恢复通知推迟到下一轮 ({name})")
                 continue
             ok = send(f"✅ 快讯源「{esc(name)}」已恢复 (此前连续失败 {rounds} 轮)", conf, tk)
@@ -2178,7 +2436,7 @@ def source_health(seen: dict, outcomes: list[tuple[str, str]], conf: dict,
         if dry:
             for name, cur in due_list:
                 log(f"(dry-run) 单源故障告警未发送 ({name}, 连续 {cur['rounds']} 轮)")
-        elif not send_time_ok():       # 逐次闸门: 告警推迟, pend/alerts/rounds 全部保留, 下轮重试
+        elif not send_time_ok(ctx):    # 逐次闸门: 告警推迟, pend/alerts/rounds 全部保留, 下轮重试
             for name, cur in due_list:
                 log(f"单源故障告警推迟到下一轮 ({name}, 连续 {cur['rounds']} 轮)")
         else:
@@ -2213,6 +2471,7 @@ def research_line(it: dict, dt: datetime) -> str:
 
     修复 C1/C3: 非 http(s) / 非字符串 url 退回纯文本 (不渲染链接); 标题/元信息/摘要/
     URL 各有硬上限, 保证单条 u16 <= MSG_MAX (否则 split_msg 拆不开, 整批永久重试)。
+    Batch 9 R-E-F-01: 标题/元信息/摘要/URL 的上限一律按**转义后 u16** 计量; 仍超 MSG_MAX 时整行降级纯文本。
     """
     url = it.get("url")
     if not is_http_url(url):                 # C1 协议白名单 + C 轻微: int url 不再抛 AttributeError
@@ -2221,18 +2480,25 @@ def research_line(it: dict, dt: datetime) -> str:
             body = body[:ITEM_MAX] + "…"
         return f"<b>{esc(it['src'])} {dt:%m-%d}</b>\n{esc(body)}"
     head, _, meta = it["text"].partition("｜")
-    title = head[:ITEM_MAX] + ("…" if len(head) > ITEM_MAX else "")
-    lines = [f"<b>{esc(it['src'])} {dt:%m-%d}</b>", f"<b>{esc_quote(title)}</b>"]
+    lines = [f"<b>{esc(it['src'])} {dt:%m-%d}</b>",
+             f"<b>{esc_quote_limited(head, ITEM_MAX)}</b>"]
     if meta:
-        lines.append(esc_quote(meta[:RESEARCH_META_MAX]))
+        lines.append(esc_quote_limited(meta, RESEARCH_META_MAX))
     snip = str(it.get("snippet") or "").strip()
     if snip:
-        lines.append(esc_quote(snip[:SNIPPET_MAX + 20]))
-    if len(url) > RESEARCH_URL_MAX:           # C3: 超长 URL 退化为纯文本提示, 保证可拆批
-        lines.append(f"（原文链接过长 {len(url)} 字符, 已省略）")
+        lines.append(esc_quote_limited(snip, SNIPPET_MAX + 20))
+    href = esc_url(url) if len(url) <= RESEARCH_URL_MAX else ""
+    if href and u16(href) > RESEARCH_URL_U16_MAX:
+        href = ""                             # 转义后仍超预算 -> 按「链接过长」降级
+    if href:
+        lines.append(f'<a href="{href}">查看原文</a>')
     else:
-        lines.append(f'<a href="{esc_url(url)}">查看原文</a>')
-    return "\n".join(lines)
+        lines.append(f"（原文链接过长 {len(url)} 字符, 已省略）")
+    line = "\n".join(lines)
+    if u16(line) <= MSG_MAX:
+        return line
+    plain = esc_quote_limited(f"{it['src']} {dt:%m-%d} {head}", MSG_MAX - 8)
+    return f"<b>{plain}</b>"                  # 保底: 整行纯文本, 保证 split_msg 一定拆得开
 
 
 # ------------------------------------------------------------------ main
@@ -2283,18 +2549,113 @@ def slice_deadline(deadline: float, now: float, remaining: int,
     return min(deadline, now + max(min_slice, share))
 
 
-def main() -> int:
-    global ROUND_START
-    args = sys.argv[1:]
-    dry = "--dry-run" in args
+def _resolve_annotations(cls):
+    """把本类的字符串注解还原为类型对象 (R2).
+
+    为何需要: monitor.py 用 ``from __future__ import annotations``, 模块内全部注解
+    都是字符串; 而本仓库的离线测试 (tests/sim.py、probe2.py、ab.py) 用
+    ``module_from_spec`` + ``exec_module`` 载入本文件**但不注册 sys.modules**;
+    此时 dataclass 解析注解会因 ``sys.modules.get(cls.__module__) is None`` 而抛
+    AttributeError. 这里在 @dataclass 之前用本模块 globals 求值注解, 保持 dataclass
+    语义不变 (求值后仍是真类型对象, 不是字符串).
+
+    去掉会怎样: 上述三个离线入口在 **import 阶段**即抛 AttributeError (R2 实测),
+    sim / probe2 / ab 全部不可用; golden 走常规 import 路径, 不经过该垫片,
+    所以这是一个只有离线测试才会踩到的**隐式约束**, 不能凭 golden 全绿就删掉.
+
+    隐式约束 (改本类定义时必须同时满足, 否则同样抛错):
+    ① 装饰器顺序固定: ``@dataclass`` 在外、``@_resolve_annotations`` 在内 ——
+       必须先求值注解, dataclass 再消费; 顺序反过来垫片拿到的已是处理过的类.
+    ② 注解必须能在本模块 globals 中求值: 前向引用到**后定义**的类会 NameError,
+       因此被引用的类型要么已定义, 要么写成字符串以外的可求值形式.
+    """
+    ann = cls.__dict__.get("__annotations__", {})
+    if ann:
+        g = globals()
+        cls.__annotations__ = {k: (eval(v, g) if isinstance(v, str) else v)
+                               for k, v in ann.items()}
+    return cls
+
+
+@dataclass(frozen=True)
+@_resolve_annotations
+class RunOpts:
+    """load_conf 的产物: 本轮 CLI/conf 解析结果 (R2 拆分 main 的入口参数对象)."""
+
+    dry: bool
+    seed: bool
+    stats: bool
+    explain: bool
+    force_flush: bool
+    show_queue: bool
+    inspect: bool
+    digest_items: int
+    digest_min_items: int
+    max_hold: int
+    digest_min: int
+    keywords: list[str]
+    use_filter: bool
+    budget: int
+
+
+@dataclass
+@_resolve_annotations
+class FetchResult:
+    """fetch_round 的产物; rc 非 None 时 main 直接透传退出码 (R2 的唯一退出码通道)."""
+
+    rc: int | None
+    items: list[dict]
+    errors: list[str]
+    outcomes: list[tuple[str, str]]
+
+
+@dataclass
+@_resolve_annotations
+class DigestPlan:
+    """digest_policy 的产物; rc 非 None 时 main 直接透传退出码 (R2 的唯一退出码通道).
+
+    queue/stale/meta/day 与基线局部变量是**同一对象**, flush_round 原地修改.
+    """
+
+    rc: int | None = None
+    queue: list[dict] = field(default_factory=list)
+    stale: list[dict] = field(default_factory=list)
+    meta: dict = field(default_factory=dict)
+    day: dict = field(default_factory=dict)
+    due: bool = False
+    cap_hit: bool = False
+    aging_on: bool = False
+    queue_dirty: bool = False
+    added: int = 0
+    now_f: float = 0.0
+    now_ts: int = 0
+    max_age: int = 0
+    digest_items: int = 0
+    digest_min_items: int = 0
+    max_hold: int = 0
+    waited: float = 0.0
+    interval: int = 0
+    oldest_age: float = 0.0
+    next_try: float = 0.0
+
+
+def load_conf(args: list[str]) -> tuple[dict, RunOpts]:
+    """解析 CLI 与 conf (R2 阶段 1). 只读 CONF, 不写 CFG、不加锁、不读 state.
+
+    连续实现 (R2 F-01 收口): 本函数是旧 main 中三段**纯解析**切片按原顺序的连续
+    重装配 —— FLAGS(参数开关) -> CFGPARSE(conf 派生) -> BUDGET(预算). 三段都只读
+    args / CONF, 因此一次解析完再交给 main 做 CFG 注入 / 加锁 / 读 state, 行为不变.
+    """
+    # 检视模式 (--stats / --queue) 一律按 dry 语义: 不发送、零落盘、rc=0 (Batch 9 D-D-03 / U4-F-01/F-02)
+    # 变量名 inspect 与标准库 inspect 模块同名 (历史命名): 本函数内不引用该模块,
+    # 该布尔值原样进入 RunOpts.inspect (字段名沿用规格 canonical 命名).
+    inspect = "--stats" in args or "--queue" in args
+    dry = "--dry-run" in args or inspect
     seed = "--seed" in args
     force_all = "--all" in args
     stats = "--stats" in args or dry
     explain = "--explain" in args
-
     conf = load_json(CONF, {})
-    CFG.clear()
-    CFG.update(conf)                  # 供无参源函数读取 proxy (Batch 6 U2)
     force_flush = "--flush-now" in args
     show_queue = "--queue" in args
     try:
@@ -2306,7 +2667,7 @@ def main() -> int:
     except (TypeError, ValueError):
         digest_min_items = DIGEST_MIN_ITEMS
     try:
-        max_hold = max(300, int(conf.get("max_hold_min") or MAX_HOLD_MIN) * 60)
+        max_hold = max(MAX_HOLD_FLOOR_S, int(conf.get("max_hold_min") or MAX_HOLD_MIN) * 60)
     except (TypeError, ValueError):
         max_hold = MAX_HOLD_MIN * 60
     if "--limit" in args:                                # 兼容旧参数: 直接当作队列上限
@@ -2318,60 +2679,24 @@ def main() -> int:
         digest_min = max(1, int(conf.get("digest_min") or DIGEST_MIN))
     except (TypeError, ValueError):
         digest_min = DIGEST_MIN
-
     keywords = conf.get("keywords") or DEFAULT_KEYWORDS
     use_filter = conf.get("filter", "futures") == "futures" and not force_all
-
-    rotate_log()
-
-    # 单实例锁: 防止 launchd 上一轮未结束又起一轮 -> 重复推送
-    LOCK.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        lock_fh = open(LOCK, "w")
-    except OSError as e:
-        err(f"锁文件不可写, 本轮不跑: {type(e).__name__}: {e} ({LOCK})")
-        print(f"锁文件不可写: {e}")
-        return 7                                      # 7 = 锁文件不可写 (原与 4 混用)
-    try:
-        fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        err("另一实例在跑 (launchd 正在抓取), 本轮跳过")   # 唯一一条提示
-        return 0
-
-    rotate_stderr()                                    # 锁内轮转: 两个实例不会同时截断同一个 fd
-
-    # state: 文件不存在 = 首轮; 存在但不可读 = 告警 + 不覆盖 + 非 0 (F-04)
-    seen, state_problem = load_state(STATE)
-    if state_problem:
-        err(f"state 文件不可读, 本轮不推送也不覆盖: {state_problem} ({STATE})")
-        return 4                                      # 4 = state 不可读 (7 才是锁不可写)
-
-    tk = resolve_token(conf)
-    if not dry and not tk:
-        err(f"缺少 bot token: 需设置 FUTNEWS_TOKEN 或 {CONF} 的 token 字段")
-        return 3
-
-    pending = take_pending()
-    if pending:
-        log(f"合并上轮待确认已发送标记: {len(pending)} 条")
-        for key in pending:
-            seen.setdefault(key, int(time.time()))
-        if not dry:                                  # 合并成功才清标记, 否则下轮重试 (F-07)
-            if save_json(STATE, prune(seen)):
-                clear_pending()
-            else:
-                err("待确认标记合并落盘失败, 保留标记下轮重试")
-
     budget = BUDGET_S
     try:
-        budget = max(15, int(conf.get("timeout_s") or BUDGET_S))
+        budget = max(BUDGET_FLOOR_S, int(conf.get("timeout_s") or BUDGET_S))
     except (TypeError, ValueError):
         budget = BUDGET_S
-    round_start = time.monotonic()          # 本轮起点: 聚合软截止 + 逐次发送闸门共用 (Batch 6 M1/F-02)
-    ROUND_START = round_start
-    deadline = time.monotonic() + budget
+    return conf, RunOpts(
+        dry=dry, seed=seed, stats=stats, explain=explain,
+        force_flush=force_flush, show_queue=show_queue, inspect=inspect,
+        digest_items=digest_items, digest_min_items=digest_min_items,
+        max_hold=max_hold, digest_min=digest_min, keywords=keywords,
+        use_filter=use_filter, budget=budget)
 
-    TS_BAD.clear()
+
+def fetch_round(conf: dict, opts: RunOpts, seen: dict, ctx: RoundContext,
+                deadline: float) -> FetchResult:
+    """17 源抓取循环 + 研报节流 + TS_BAD 归因 (R2 阶段 2). 不发告警、不落盘."""
     items, errors, outcomes = [], [], []
     # Batch 7: 研报源按源节流 (默认 30 分钟一轮); 跳过记 SRC_SKIP, 不算失败也不告警.
     # 失败源 5 分钟后重试, 避免「一坏就静默半小时」.
@@ -2382,7 +2707,7 @@ def main() -> int:
     for idx, (name, fn) in enumerate(SOURCES):
         if name in RESEARCH_SRCS:
             last_run = to_int(ra.get(name))
-            if last_run > now_run + 60:       # B1 修复: 时钟回拨/NTP 前跳后校正 -> 视为未运行
+            if last_run > now_run + ROLLBACK_TOL_S:       # B1 修复: 时钟回拨/NTP 前跳后校正 -> 视为未运行
                 log(f"{name}: 研报节流时间戳在未来 ({last_run - now_run}s), 按未运行处理")
                 last_run = 0
             if now_run - last_run < RESEARCH_EVERY_S:
@@ -2393,7 +2718,7 @@ def main() -> int:
         left = deadline - now
         if left < 2:
             outcomes.append((name, SRC_SKIP))   # 跳过不是失败: 不写 errors (Batch 6 U4-F-05)
-            log(f"{name}: 跳过, 全局预算 {budget}s 已耗尽")
+            log(f"{name}: 跳过, 全局预算 {opts.budget}s 已耗尽")
             continue
         src_dl = slice_deadline(deadline, now, total - idx)   # 单源份额: 慢源吃不掉整轮 (6.1 U-B)
         t0 = time.monotonic()
@@ -2403,7 +2728,7 @@ def main() -> int:
             items.extend(got)
             outcomes.append((name, ""))
             ok = True
-            bad = TS_BAD.get(name, 0)
+            bad = ctx.ts_bad.get(name, 0)
             log(f"{name}: {len(got)} 条 ({time.monotonic() - t0:.1f}s)"
                 + (f", 丢弃 {bad} 条时间不可解析" if bad else ""))
         except Exception as e:
@@ -2417,35 +2742,28 @@ def main() -> int:
     if research_ran:                          # 节流时间戳随 state 落盘 (_ 前缀不会被 prune)
         ra = dict(ra)
         for name, ok in research_ran:
-            ra[name] = now_run if ok else now_run - RESEARCH_EVERY_S + 300
+            ra[name] = now_run if ok else now_run - (RESEARCH_EVERY_S - RESEARCH_RETRY_S)
         seen["_research"] = ra
 
     skipped_all = bool(outcomes) and all(e == SRC_SKIP for _, e in outcomes)
     if skipped_all:                           # 全轮被预算跳过: 既无成功也无失败 -> 不告警、不返回失败
         log(f"全部 {len(outcomes)} 源被预算跳过, 本轮不抓取也不告警")
-        return 0
+        return FetchResult(rc=0, items=items, errors=errors,
+                           outcomes=outcomes)
+    return FetchResult(rc=None, items=items, errors=errors,
+                        outcomes=outcomes)
 
-    if not items:
-        skipped = sum(1 for _, _e in outcomes if _e == SRC_SKIP)
-        if skipped:                           # 无条目但有预算跳过: 仍按全源故障告警, 文案补跳过计数 (U-A)
-            log(f"本轮无可用条目: 失败 {len(errors)} 源 / 跳过 {skipped} 源: {errors}")
-        else:
-            log(f"全部源失败 {errors}")
-        alert_all_failed(seen, errors, conf, tk, dry, skipped)
-        if not dry and not save_json(STATE, prune(seen)):
-            err("告警状态落盘失败")
-        return 1
 
-    if source_health(seen, outcomes, conf, tk, dry):
-        if not dry and not save_json(STATE, prune(seen)):
-            err("单源告警状态落盘失败 (下轮计数从旧值起算)")
-    if note_recovered(seen, conf, tk, dry):
-        if not dry and not save_json(STATE, prune(seen)):
-            err("恢复状态落盘失败")
+def digest_policy(conf: dict, opts: RunOpts, seen: dict,
+                  fetched: FetchResult, ctx: RoundContext) -> DigestPlan:
+    """未来时间/去重/近邻合并/过滤/seed/队列自愈/聚合节奏 (R2 阶段 3).
+
+    不发聚合消息; 不落 queue/state (seed 分支除外).
+    """
 
     now_ts = int(time.time())
     live, dropped_future = [], 0
-    for it in items:
+    for it in fetched.items:
         if it["ts"] > now_ts + FUTURE_TOL:           # 未来时间戳丢弃, 不再改写成 now (F-05)
             dropped_future += 1
             continue
@@ -2473,21 +2791,22 @@ def main() -> int:
         # Batch 7: 研报条目豁免「品种锚点」硬门槛 (中金所/中期协标题是官方统计口径),
         # 但仍走栏目/超短/股票口径噪声检查; 非研报条目一字不改地走原 filter_reason。
         reason = (research_reason(it["text"]) if it.get("url")
-                  else filter_reason(it["text"], keywords, use_filter))
+                  else filter_reason(it["text"], opts.keywords, opts.use_filter))
         if reason:
             dropped.append((reason, it))
         else:
             relevant.append(it)
 
     seen_keys = {k for k in seen if not k.startswith("_")}
-    if (seed or not seen_keys) and not dry:
+    if (opts.seed or not seen_keys) and not opts.dry:
         for it in relevant:
             seen[it["key"]] = now_ts
-        if not save_json(STATE, prune(seen)):
-            err("seed 落盘失败, 下轮会重复 seed")
-        clear_pending()
+        if save_json(STATE, prune(seen)):
+            clear_pending()                   # 只有 seed 真正落盘才清待确认标记 (Batch 9 D-F-04)
+        else:
+            err("seed 落盘失败, 下轮会重复 seed, 保留待确认标记")
         log(f"seeded {len(relevant)} items (跨源已合并), nothing pushed")
-        return 0
+        return DigestPlan(rc=0)
 
     fresh = [it for it in relevant if it["key"] not in seen]
     max_age = int(conf.get("max_age_min", 180)) * 60
@@ -2497,8 +2816,11 @@ def main() -> int:
     # ---- v5 聚合: 本轮的 fresh 全部入队, 攒到窗口再合成一条发
     # (替掉 v4 的「有就推 + 超出 limit 直接丢」)
     queue, q_problem, q_bad = load_queue()
-    if q_problem:                                     # 队列坏了: 先留证据再重建, 不静默清空
-        badpath = QUEUE.with_name(f"{QUEUE.name}.bad-{int(time.time())}")
+    if q_problem and opts.inspect:                         # 检视模式零落盘: 只留痕, 不改名 (Batch 9 U4-F-01)
+        err(f"聚合队列不可读({q_problem}), 检视模式只读, 未改动文件")
+        queue = []
+    elif q_problem:                                   # 队列坏了: 先留证据再重建, 不静默清空
+        badpath = backup_path(QUEUE)
         try:
             QUEUE.replace(badpath)
             err(f"聚合队列不可读({q_problem}), 已备份为 {badpath.name} 后重建")
@@ -2524,44 +2846,50 @@ def main() -> int:
     added, dup_q = queue_upsert(queue, fresh)
 
     meta = digest_meta(seen)
-    interval = digest_min * 60
+    interval = opts.digest_min * 60
     now_f = time.time()
     last_flush = to_float(meta.get("last_flush"))
-    if not last_flush or last_flush > now_f + 60:     # 首轮 / 时钟回拨
+    if not last_flush or last_flush > now_f + ROLLBACK_TOL_S:     # 首轮 / 时钟回拨
         last_flush = now_f
         meta["last_flush"] = last_flush
     waited = now_f - last_flush
     next_try = to_float(meta.get("next_try"))
+    if next_try > now_f + RA_MAX + NEXT_TRY_TOL_S:
+        # 时钟前跳期间写下的 next_try 在回拨后遥遥在未来; 钳到 0 (无退避), 否则队列冻结
+        # 时长 ≈ 回拨幅度, 积压超 QUEUE_MAX 后按最旧丢消息 (Batch 9 D-F-02)
+        log(f"next_try 在未来 {int(next_try - now_f)}s, 超出 {RA_MAX + NEXT_TRY_TOL_S}s 上限, 按无退避处理")
+        next_try = 0.0
+        meta["next_try"] = 0.0
     fails_n = to_int(meta.get("fails"))
     day = day_counter(seen, datetime.now(TZ_CN).strftime("%Y-%m-%d"))
-    cap_hit = to_int(day.get("msgs")) >= DAILY_MSG_CAP and not force_flush
+    cap_hit = to_int(day.get("msgs")) >= DAILY_MSG_CAP and not opts.force_flush
 
     # 老化 (V1-P1-2 + V3-P1): 只有「本来能发」的轮次才清理; 被 cap/退避堵住的时长
     # block_acc>0 时暂停老化 -> 解冻后先补发而不是先判死 (它只当布尔门闩用)。
     oldest_age = (now_f - min((it["ts"] for it in queue), default=now_f)) if queue else 0
     # fails_n > 0 表示上一轮发失败: 退避到期必须重试, 不能等别的条件凑齐 (V1-P2-7)
-    due = (bool(queue) and (force_flush
-           or len(queue) >= digest_items
-           or (waited >= interval and len(queue) >= digest_min_items)
-           or oldest_age >= max_hold
-           or (bool(meta.get("left_pending")) and waited >= 60)
+    due = (bool(queue) and (opts.force_flush
+           or len(queue) >= opts.digest_items
+           or (waited >= interval and len(queue) >= opts.digest_min_items)
+           or oldest_age >= opts.max_hold
+           or (bool(meta.get("left_pending")) and waited >= LEFT_PENDING_RETRY_S)
            or fails_n > 0))
-    if next_try > now_f and not force_flush:          # 发送失败后的退避
+    if next_try > now_f and not opts.force_flush:          # 发送失败后的退避
         due = False
 
-    frozen = (next_try > now_f and not force_flush) or cap_hit
+    frozen = (next_try > now_f and not opts.force_flush) or cap_hit
     last_round = to_float(meta.get("last_round"))
-    rollback = last_round > now_f + 60               # 时钟回拨 (NTP 跳变/手改表)
+    rollback = last_round > now_f + ROLLBACK_TOL_S   # 时钟回拨 (NTP 跳变/手改表)
     if rollback:
         last_round = 0.0
     gap = now_f - last_round if (last_round and now_f > last_round) else 0.0
     if rollback:
-        gap = max(gap, 3600.0)                       # 按长间隔计 -> 关掉老化, 先补发
+        gap = max(gap, LONG_GAP_S)                   # 按长间隔计 -> 关掉老化, 先补发
     meta["last_round"] = now_f
     # block_acc > 0 表示「上次排空后被堵过」; 它只当布尔门闩用, 累加秒数仅供诊断
     block_acc = to_float(meta.get("block_acc"))
-    if frozen or gap >= 3600:                         # 退避/触顶/休眠长间隔都算阻塞 (V4-P1)
-        block_acc = min(7 * 86400.0, block_acc + max(gap, 120.0))
+    if frozen or gap >= LONG_GAP_S:                   # 退避/触顶/休眠长间隔都算阻塞 (V4-P1)
+        block_acc = min(BLOCK_ACC_CAP_S, block_acc + max(gap, BLOCK_ACC_STEP_MIN_S))
     meta["block_acc"] = block_acc
     aging_on = block_acc <= 0                         # 有过 cap/退避阻塞 -> 暂停老化直到排空
     aged: list[dict] = []                             # 老化清理在「发送成功后」才做 (V3-P1)
@@ -2576,15 +2904,15 @@ def main() -> int:
 
     queue_dirty = bool(added or dropped_q or q_problem or diverged or q_bad or pdf_q)
 
-    if stats:
-        log(f"raw={len(items)} merged_exact={len(merged_exact)} merged={len(merged)} "
+    if opts.stats:
+        log(f"raw={len(fetched.items)} merged_exact={len(merged_exact)} merged={len(merged)} "
             f"near_merged={len(near_pairs)} relevant={len(relevant)} fresh={len(fresh)} "
             f"stale={len(stale)} queued={len(queue)}(+{added}/dup{dup_q}) "
             f"queue_drop={len(dropped_q)} due={due} cap={cap_hit} oldest={oldest_age / 60:.0f}m "
             f"next_try={max(0, next_try - now_f) / 60:.0f}m "
-            f"dropped_ts={TS_BAD.get('total', 0)} dropped_future={dropped_future} "
-            f"dropped_short={dropped_short} filter={'on' if use_filter else 'off'} "
-            f"errors={errors or '-'}")
+            f"dropped_ts={ctx.ts_bad.get('total', 0)} dropped_future={dropped_future} "
+            f"dropped_short={dropped_short} filter={'on' if opts.use_filter else 'off'} "
+            f"errors={fetched.errors or '-'}")
     per_src: dict[str, int] = {}
     shown = 0
     for reason, it in dropped:                    # 每源最多 2 行, 共 12 行
@@ -2594,7 +2922,7 @@ def main() -> int:
         per_src[src] = per_src.get(src, 0) + 1
         shown += 1
         log(f"  丢弃[{reason}] {src}: {it['text'][:42]}")
-    if explain:
+    if opts.explain:
         print(f"--- 过滤样本 (共 {len(dropped)} 条) ---")
         for reason, it in dropped[:20]:
             print(f"  [{reason}] {it['src']} {it['text'][:80]}")
@@ -2602,154 +2930,351 @@ def main() -> int:
             print(f"  [近邻合并 {ratio:.3f}] {dup['src']} {dup['text'][:46]} "
                   f"-> {prev['src']} {prev['text'][:46]}")
 
-    if show_queue:
+    if opts.show_queue:
         for it in queue[:30]:
             print(f"  {datetime.fromtimestamp(it['ts'], TZ_CN).strftime('%m-%d %H:%M')} "
                   f"[{it['src']}] {it['text'][:60]}")
         last_flush_txt = (datetime.fromtimestamp(last_flush, TZ_CN).strftime("%m-%d %H:%M")
                           if last_flush > 0 else "无")
         print(f"--- 队列 {len(queue)} 条 / 上次发送 {last_flush_txt}"
-              f"({waited / 60:.0f} 分钟前) / 窗口 {digest_min} 分钟 (最少 {digest_min_items} 条)"
+              f"({waited / 60:.0f} 分钟前) / 窗口 {opts.digest_min} 分钟 (最少 {opts.digest_min_items} 条)"
               f" / 今日已发 {int(day.get('msgs') or 0)}/{DAILY_MSG_CAP} 条"
               f" / 最早一条 {oldest_age / 60:.0f} 分钟前 ---")
-        return 0
+        return DigestPlan(rc=0)
 
-    if dry:
+    if opts.dry:
         for it in queue[-15:]:
             print(f"  {datetime.fromtimestamp(it['ts'], TZ_CN).strftime('%H:%M')} "
                   f"[{it['src']}] {it['text'][:70]}")
         print(f"--- (dry-run) 队列 {len(queue)} 条, due={due}, "
               f"还差 {max(0, interval - waited) / 60:.0f} 分钟到窗口 ---")
-        return 0
+        return DigestPlan(rc=0)
 
-    if force_flush and not queue:                     # V1-P1-1: 空队列强制刷新不能算发送失败
-        record_stale(seen, stale, max_age)
-        persist_state(seen)
+    return DigestPlan(
+        rc=None, queue=queue, stale=stale, meta=meta, day=day, due=due,
+        cap_hit=cap_hit, aging_on=aging_on, queue_dirty=queue_dirty, added=added,
+        now_f=now_f, now_ts=now_ts, max_age=max_age,
+        digest_items=opts.digest_items, digest_min_items=opts.digest_min_items,
+        max_hold=opts.max_hold, waited=waited, interval=interval,
+        oldest_age=oldest_age, next_try=next_try)
+
+
+def flush_round(conf: dict, opts: RunOpts, seen: dict,
+                plan: DigestPlan, tk: str, pending: list[str],
+                ctx: RoundContext, send_ctx: SendContext) -> int:
+    """四条发送路径 + 老化/退避 + state/queue/pending 落盘 (R2 阶段 4).
+
+    落盘顺序固定为「先 state 后队列」; rc=5 判定优先于 rc=2.
+    """
+
+    if opts.force_flush and not plan.queue:                     # V1-P1-1: 空队列强制刷新不能算发送失败
+        record_stale(seen, plan.stale, plan.max_age)
+        if not persist_state(seen):
+            err("state 落盘失败 (--flush-now 空队列)")
+            return 5                                  # 5 = state 落盘失败 (Batch 9 D-F-06)
         print("队列为空, 无需发送")
         return 0
 
-    if not due or cap_hit:
-        why = ("队列空" if not queue else
-               (f"今日通知已达上限 {DAILY_MSG_CAP}" if cap_hit else
-                (f"退避中, {max(0, next_try - now_f) / 60:.0f} 分钟后重试"
-                 if next_try > now_f else
-                 (f"未到窗口 ({waited / 60:.0f}/{digest_min} 分钟, 队列 {len(queue)} 条)"
-                  if waited < interval else
-                  f"窗口已过, 但只有 {len(queue)} 条 < {digest_min_items} 条, "
-                  f"最早一条 {oldest_age / 60:.0f}/{max_hold / 60:.0f} 分钟 (到点兜底发)"))))
+    if not plan.due or plan.cap_hit:
+        why = ("队列空" if not plan.queue else
+               (f"今日通知已达上限 {DAILY_MSG_CAP}" if plan.cap_hit else
+                (f"退避中, {max(0, plan.next_try - plan.now_f) / 60:.0f} 分钟后重试"
+                 if plan.next_try > plan.now_f else
+                 (f"未到窗口 ({plan.waited / 60:.0f}/{opts.digest_min} 分钟, 队列 {len(plan.queue)} 条)"
+                  if plan.waited < plan.interval else
+                  f"窗口已过, 但只有 {len(plan.queue)} 条 < {plan.digest_min_items} 条, "
+                  f"最早一条 {plan.oldest_age / 60:.0f}/{plan.max_hold / 60:.0f} 分钟 (到点兜底发)"))))
         notice_ok = True
-        if cap_hit and not cap_notified_already(day):
-            if not send_time_ok():       # 逐次闸门: 触顶提示推迟, cap_notified/msgs 不动
+        if plan.cap_hit and not cap_notified_already(plan.day):
+            if not send_time_ok(ctx):    # 逐次闸门: 触顶提示推迟, cap_notified/msgs 不动
                 log("今日触顶提示推迟到下一轮 (本轮再发会顶到 120s 上界)")
             else:
-                day["cap_notified"] = True
-                day["msgs"] = int(day.get("msgs") or 0) + 1
+                plan.day["cap_notified"] = True
+                plan.day["msgs"] = int(plan.day.get("msgs") or 0) + 1
                 notice_ok = send(f"⚠️ 今日快讯已达 {DAILY_MSG_CAP} 条上限, 新条目暂缓推送, "
                                  f"明天 0 点恢复 (队列上限 {QUEUE_MAX} 条, 超出按最旧丢弃)", conf, tk)
                 if not notice_ok:
-                    day["cap_notified"] = False          # 没发出去就下轮再试
-                    day["msgs"] = to_int(day.get("msgs")) - 1
-                    meta["next_try"] = now_f + retry_gap(600.0, SEND_RETRY_AFTER)  # 别每 120s 打一次 (V1-P2-3a)
-                    err(f"触顶提示发送失败, {int(meta['next_try'] - now_f)}s 后重试")
-        if queue_dirty and not save_queue(queue):
+                    plan.day["cap_notified"] = False          # 没发出去就下轮再试
+                    plan.day["msgs"] = to_int(plan.day.get("msgs")) - 1
+                    plan.meta["next_try"] = plan.now_f + retry_gap(CAP_NOTICE_RETRY_S, send_ctx.retry_after)  # 别每 120s 打一次 (V1-P2-3a)
+                    err(f"触顶提示发送失败, {int(plan.meta['next_try'] - plan.now_f)}s 后重试")
+        if plan.queue_dirty and not save_queue(plan.queue):
             err("队列落盘失败, 下轮可能重复入队")
             queue_save_ok = False
         else:
             queue_save_ok = True
-        record_stale(seen, stale, max_age)            # 有 stale 时内部会落盘
-        if not stale or not notice_ok:                # P0-1: _digest/_day 必须每轮落盘
+        record_stale(seen, plan.stale, plan.max_age)            # 有 stale 时内部会落盘
+        if not plan.stale or not notice_ok:                # P0-1: _digest/_day 必须每轮落盘
             if not persist_state(seen):
                 err("state 落盘失败 (本轮未发送), 下轮计数从旧值起算")
-        log(f"queued 队列 {len(queue)} 条 (+{added}), {why}, 本轮不发送")
+        log(f"queued 队列 {len(plan.queue)} 条 (+{plan.added}), {why}, 本轮不发送")
         return 0 if queue_save_ok else 6
 
     # ---- 本轮软截止 (M1/F-02): 抓取 + 已发消息耗时过长 -> 聚合发送推迟到下一轮,
     # 队列原样保留 (本轮新增条目照常入队落盘), 不算发送失败. 与逐次闸门取严.
-    if time.monotonic() - round_start > ROUND_SOFT_S or not send_time_ok():
+    if time.monotonic() - ctx.start > round_soft_s() or not send_time_ok(ctx):
         log("本轮耗时超软截止, 聚合发送推迟到下一轮")
         queue_save_ok = True
-        if queue_dirty and not save_queue(queue):
+        if plan.queue_dirty and not save_queue(plan.queue):
             err("队列落盘失败, 下轮可能重复入队")
             queue_save_ok = False
-        record_stale(seen, stale, max_age)
-        if not stale:
+        record_stale(seen, plan.stale, plan.max_age)
+        if not plan.stale:
             if not persist_state(seen):
                 err("state 落盘失败 (软截止推迟), 下轮计数从旧值起算")
         return 0 if queue_save_ok else 6
 
     # ---- 到点: 按时间排序, 单轮最多发 digest_items 条 (避免一口气几十条撞限流)
-    queue.sort(key=lambda x: (x["ts"], x["src"]))
-    batch = queue[:digest_items]
-    rest_after = queue[digest_items:]
+    plan.queue.sort(key=lambda x: (x["ts"], x["src"]))
+    batch = plan.queue[:plan.digest_items]
+    rest_after = plan.queue[plan.digest_items:]
     msgs = build_messages(batch)
     sent: list[dict] = []
     sent_msgs = 0
     failed = False
+    deferred = False
     for idx, (text, used) in enumerate(msgs, 1):
+        if not send_time_ok(ctx):         # Batch 9 A-F-01: 每条消息发送前都过闸门
+            deferred = True
+            log(f"第 {idx}/{len(msgs)} 批发送推迟到下一轮 "
+                f"(再发会顶到 {SEND_GATE_S}s 上界), 已送达 {len(sent)} 条")
+            break
         if not send(text, conf, tk):
             failed = True
-            err(f"第 {idx}/{len(msgs)} 批发送失败 (u16={u16(text)}, 原因: {SEND_ERR or '未知'}), "
+            err(f"第 {idx}/{len(msgs)} 批发送失败 (u16={u16(text)}, 原因: {send_ctx.err or '未知'}), "
                 f"已送达 {len(sent)} 条")
             break
         sent.extend(used)
         sent_msgs = idx
-    ok = sent_msgs > 0 and not failed
+    ok = (sent_msgs > 0 or deferred) and not failed
     sent_keys = {it["key"] for it in sent}
     left = rest_after + [it for it in batch if it["key"] not in sent_keys]
-    cur_msgs = to_int(day.get("msgs")) + sent_msgs
-    if sent and force_flush and cur_msgs > DAILY_MSG_CAP:
+    cur_msgs = to_int(plan.day.get("msgs")) + sent_msgs
+    if sent and opts.force_flush and cur_msgs > DAILY_MSG_CAP:
         err(f"--flush-now 越限推送: 今日 {cur_msgs}/{DAILY_MSG_CAP} 条")   # 人工覆盖留痕
     if sent:
         for it in sent:                               # 只有真正送达才标记已读
-            seen[it["key"]] = now_ts
-        day["msgs"] = int(day.get("msgs") or 0) + sent_msgs
-    if ok and aging_on:                               # 老化只在「刚发成功且无阻塞史」时清理剩余
-        aged = [it for it in left if now_ts - it["ts"] > max_age]
+            seen[it["key"]] = plan.now_ts
+        plan.day["msgs"] = int(plan.day.get("msgs") or 0) + sent_msgs
+    if ok and not deferred and plan.aging_on:              # 推迟轮不得触发老化 (Batch 9 A-F-01)
+        aged = [it for it in left if plan.now_ts - it["ts"] > plan.max_age]
         if aged:
             akeys = {it["key"] for it in aged}
             left = [it for it in left if it["key"] not in akeys]
-            stale.extend(aged)
+            plan.stale.extend(aged)
     if sent and not failed and not left:
-        meta["last_flush"] = now_f                    # 老化后才算真排空, 排空才推进窗口
+        plan.meta["last_flush"] = plan.now_f                    # 老化后才算真排空, 排空才推进窗口
     if not left:                                      # 队列排空 -> 阻塞补偿归零
-        meta["block_acc"] = 0.0
+        plan.meta["block_acc"] = 0.0
     rest_count = len(left)                            # 老化清掉的不能算剩货 (V4-P2)
-    meta["left_pending"] = bool(rest_count > 0 and ok)   # 部分/单轮封顶后继续补发
+    plan.meta["left_pending"] = bool(rest_count > 0 and ok)   # 部分/单轮封顶后继续补发
     if not ok:                                        # 失败退避: 120s 起翻倍, 封顶 30 分钟
-        fails = to_int(meta.get("fails")) + 1
-        meta["fails"] = fails
-        meta["next_try"] = now_f + retry_gap(min(1800, 120 * (2 ** min(fails, 4))),
-                                             SEND_RETRY_AFTER)
-        err(f"第 {fails} 次发送失败, {int(meta['next_try'] - now_f)}s 后重试"
-            + (" (采纳 Retry-After)" if SEND_RETRY_AFTER is not None else ""))
+        fails = to_int(plan.meta.get("fails")) + 1
+        plan.meta["fails"] = fails
+        plan.meta["next_try"] = plan.now_f + retry_gap(send_backoff_s(fails),
+                                             send_ctx.retry_after)
+        err(f"第 {fails} 次发送失败, {int(plan.meta['next_try'] - plan.now_f)}s 后重试"
+            + (" (采纳 Retry-After)" if send_ctx.retry_after is not None else ""))
     else:
-        meta["fails"] = 0
-        meta.pop("next_try", None)
+        plan.meta["fails"] = 0
+        plan.meta.pop("next_try", None)
 
     queue_save_ok = True
-    if not dry:
-        state_ok = persist_state(seen)                # 先落 state, 再落队列
-        if sent and not state_ok:
-            keys = sorted(sent_keys | set(pending))
-            wrote = write_pending(keys)
-            err(f"state 落盘失败, 已写待确认标记{'成功' if wrote else '失败'}, "
-                f"下轮不会重复推送同一批")
-        elif sent:
-            clear_pending()
-        if (queue_dirty or sent or not ok) and not save_queue(left):
-            err("队列落盘失败, 已发条目下轮可能重复推送")
-            queue_save_ok = False
-        if sent and not state_ok:
-            return 5
+    # 此处 dry 恒为 False: --dry-run/--stats/--queue 已在前面 return (Batch 9 A-F-03)
+    state_ok = persist_state(seen)                # 先落 state, 再落队列
+    if sent and not state_ok:
+        keys = sorted(sent_keys | set(pending))
+        wrote = write_pending(keys)
+        err(f"state 落盘失败, 已写待确认标记{'成功' if wrote else '失败'}, "
+            f"下轮不会重复推送同一批")
+    elif sent:
+        clear_pending()
+    if (plan.queue_dirty or sent or not ok) and not save_queue(left):
+        err("队列落盘失败, 已发条目下轮可能重复推送")
+        queue_save_ok = False
+    # ==== U4-9 (D-F-05) 独立块: state 落盘失败时 rc=5 前补 stale 记账 ====
+    # 刻意不并入下一段 U1-3 的死条件块: 回滚 U1-3 时保留本块, 回滚本块时保留 rc=5.
+    if sent and not state_ok:
+        record_stale(seen, plan.stale, plan.max_age)
+    if sent and not state_ok:
+        return 5
     log(f"pushed {len(sent)}/{len(batch)} msgs={sent_msgs} ok={ok} left={len(left)} "
-        f"day_msgs={int(day.get('msgs') or 0)}")
-    if not dry:
-        record_stale(seen, stale, max_age)            # F-08: 推送之后记账, 失败不阻断
+        f"day_msgs={int(plan.day.get('msgs') or 0)}")
+    record_stale(seen, plan.stale, plan.max_age)                # F-08: 推送之后记账, 失败不阻断
     if not ok:
         if not queue_save_ok:
             err("注意: 本轮发送失败且队列落盘失败, 返回 2 (队列异常需人工检查)")
         return 2
     return 0 if queue_save_ok else 6
+
+
+# ---------------------------------------------------------------- selftest helpers
+def _err_line() -> str:
+    """抓 err() 写到 stderr 的那一行 (log() 只进 stdout)."""
+    buf = io.StringIO()
+    real = sys.stderr
+    try:
+        sys.stderr = buf
+        err("selftest probe")
+    finally:
+        sys.stderr = real
+    return buf.getvalue()
+
+
+def _send_retry_ok() -> bool:
+    """第一次腿抛 SSL EOF (19:48 那批的真实错因), 必须换腿重试且成功."""
+    calls: list[str] = []
+    real_tg, real_sleep = globals()["tg"], time.sleep
+    real_err, real_ra = globals()["SEND_ERR"], globals()["SEND_RETRY_AFTER"]
+
+    def fake_tg(method, payload, tk, proxy, timeout=25):
+        calls.append(proxy or "直连")
+        if len(calls) == 1:
+            raise urllib.error.URLError(ssl.SSLEOFError(8, "EOF in violation of protocol"))
+        return {"ok": True}
+
+    try:
+        globals()["tg"] = fake_tg
+        time.sleep = lambda s: None
+        ok = send("probe", {"chat_id": 1, "proxy": "http://127.0.0.1:8080"}, "tk")
+        return ok and len(calls) == 2 and calls[1] == "http://127.0.0.1:8080"
+    finally:
+        globals()["tg"], time.sleep = real_tg, real_sleep
+        globals()["SEND_ERR"], globals()["SEND_RETRY_AFTER"] = real_err, real_ra
+
+
+def _send_429(header: str | None) -> tuple[float | None, int, bool]:
+    """模拟 429 (可带 Retry-After): 返回 (SEND_RETRY_AFTER, tg 调用次数, send 结果)."""
+    calls: list[str] = []
+    hdrs = {} if header is None else {"Retry-After": header}
+    real_tg = globals()["tg"]
+    real_err, real_ra = globals()["SEND_ERR"], globals()["SEND_RETRY_AFTER"]
+
+    def fake_tg(method, payload, tk, proxy, timeout=25):
+        calls.append(proxy or "直连")
+        raise urllib.error.HTTPError("https://api.telegram.org", 429, "Too Many",
+                                     hdrs, io.BytesIO(b'{"ok":false}'))
+
+    got: float | None = None
+    try:
+        globals()["tg"] = fake_tg
+        ok = send("probe", {"chat_id": 1, "proxy": ""}, "tk")
+        got = _DEFAULT_SEND.retry_after      # 先取值再还原, 返回值不受还原影响
+    finally:
+        globals()["tg"] = real_tg
+        globals()["SEND_ERR"], globals()["SEND_RETRY_AFTER"] = real_err, real_ra
+    return got, len(calls), ok
+
+
+def _smm_empty_raises() -> bool:
+    """变异体保护: listList 为空/缺失时必须 RuntimeError, 不能当成「今天没新闻」."""
+    fake = {"props": {"pageProps": {"liveListData": {"data": {"data": {}}}}}}
+    raw = ('<script id="__NEXT_DATA__" type="application/json">'
+           + json.dumps(fake) + "</script>")
+    real = http
+    try:
+        globals()["http"] = lambda *a, **k: raw.encode()
+        try:
+            src_smm(None)
+        except RuntimeError:
+            return True
+        return False
+    finally:
+        globals()["http"] = real
+
+
+def main() -> int:
+    global SEND_WORST
+
+    args = sys.argv[1:]
+
+    conf, opts = load_conf(args)
+
+    round_ctx = RoundContext()
+    send_ctx = SendContext()
+    round_ctx.cfg.clear()
+    round_ctx.cfg.update(conf)        # 供无参源函数读取 proxy (Batch 6 U2)
+    SEND_WORST = send_worst(conf)     # 按实际腿数重算: 无代理 31s / 三腿 54s (Batch 9 A-F-02)
+
+    rotate_log()
+
+    # 单实例锁: 防止 launchd 上一轮未结束又起一轮 -> 重复推送
+    LOCK.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        lock_fh = open(LOCK, "w")
+    except OSError as e:
+        err(f"锁文件不可写, 本轮不跑: {type(e).__name__}: {e} ({LOCK})")
+        print(f"锁文件不可写: {e}")
+        return 7                                      # 7 = 锁文件不可写 (原与 4 混用)
+    try:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        err("另一实例在跑 (launchd 正在抓取), 本轮跳过")   # 唯一一条提示
+        return 0
+
+    rotate_stderr()                                    # 锁内轮转: 两个实例不会同时截断同一个 fd
+
+    # state: 文件不存在 = 首轮; 存在但不可读 = 告警 + 不覆盖 + 非 0 (F-04)
+    seen, state_problem = load_state(STATE)
+    if state_problem:
+        err(f"state 文件不可读, 本轮不推送也不覆盖: {state_problem} ({STATE})")
+        return 4                                      # 4 = state 不可读 (7 才是锁不可写)
+
+    tk = resolve_token(conf)
+    if not opts.dry and not tk:
+        err(f"缺少 bot token: 需设置 FUTNEWS_TOKEN 或 {CONF} 的 token 字段")
+        return 3
+
+    pending = take_pending(opts.inspect)
+    if pending:
+        log(f"合并上轮待确认已发送标记: {len(pending)} 条")
+        for key in pending:
+            seen.setdefault(key, int(time.time()))
+        if not opts.dry:                                  # 合并成功才清标记, 否则下轮重试 (F-07)
+            if save_json(STATE, prune(seen)):
+                clear_pending()
+            else:
+                err("待确认标记合并落盘失败, 保留标记下轮重试")
+
+    round_ctx.start = time.monotonic()      # 本轮起点: 聚合软截止 + 逐次发送闸门共用 (Batch 6 M1/F-02)
+    deadline = time.monotonic() + opts.budget
+
+    round_ctx.ts_bad.clear()
+
+    fetched = fetch_round(conf, opts, seen, round_ctx, deadline)
+    if fetched.rc is not None:
+        return fetched.rc
+
+    if not fetched.items:
+        skipped = sum(1 for _, _e in fetched.outcomes if _e == SRC_SKIP)
+        if not fetched.errors:                        # 全源健康但 0 条: 不是故障, 不得告警 (Batch 9 D-F-01)
+            log(f"本轮全部源健康但无可用条目 (跳过 {skipped} 源), 不发告警")
+            return 0
+        # 有源真失败才进入告警状态机; 若同时有源「成功但 0 条」, 文案降级为部分失败
+        partial = len(fetched.errors) < len(fetched.outcomes) - skipped
+        if skipped:
+            log(f"本轮无可用条目: 失败 {len(fetched.errors)} 源 / 跳过 {skipped} 源: {fetched.errors}")
+        else:
+            log(f"无可用条目: 失败 {len(fetched.errors)} 源: {fetched.errors}")
+        alert_all_failed(seen, fetched.errors, conf, tk, opts.dry, skipped, partial, round_ctx)
+        if not opts.dry and not save_json(STATE, prune(seen)):
+            err("告警状态落盘失败")
+        return 0 if opts.inspect else 1         # 检视模式 rc 恒 0, 不因源失败返 1 (Batch 9 U4-F-02)
+
+    if prune_src_fail(seen):
+        if not opts.dry and not save_json(STATE, prune(seen)):
+            err("单源失败残留清理落盘失败")
+    if source_health(seen, fetched.outcomes, conf, tk, opts.dry, round_ctx):
+        if not opts.dry and not save_json(STATE, prune(seen)):
+            err("单源告警状态落盘失败 (下轮计数从旧值起算)")
+    if note_recovered(seen, conf, tk, opts.dry, round_ctx):
+        if not opts.dry and not save_json(STATE, prune(seen)):
+            err("恢复状态落盘失败")
+
+    plan = digest_policy(conf, opts, seen, fetched, round_ctx)
+    if plan.rc is not None:
+        return plan.rc
+    return flush_round(conf, opts, seen, plan, tk, pending, round_ctx, send_ctx)
 
 
 # ------------------------------------------------------------------ selftest
@@ -2868,8 +3393,24 @@ def selftest() -> int:
           {n for n, _ in SOURCES} >= {"见闻商品", "SMM"},
           f"实际: {[n for n, _ in SOURCES]}")
     check("源列表无重复源名", len({n for n, _ in SOURCES}) == len(SOURCES))
+    _b9_cmd: list = []
+    _b9_run0x = subprocess.run
+
+    class _B9R:
+        def __init__(self, out):
+            self.stdout = out
+            self.returncode = 0                  # R5: http() 对缺 returncode 的桩 fail-closed
+
+    try:
+        subprocess.run = lambda cmd, **kw: (_b9_cmd.append(list(cmd)) or _B9R(b"ok\n200"))
+        http("https://x/y")
+        _b9_plain_gz = "--compressed" in _b9_cmd[-1]
+        http("https://x/y", max_bytes=1024)
+        _b9_strict_gz = "--compressed" in _b9_cmd[-1]
+    finally:
+        subprocess.run = _b9_run0x
     check("http 命令行带 --compressed (SMM 强制 gzip, 缺了整源失败)",
-          "--compressed" in inspect.getsource(http))
+          _b9_plain_gz and not _b9_strict_gz, str(_b9_cmd))
     check("SMM 空 listList 必须抛错, 不静默返回空",
           _smm_empty_raises())
     check("SMM 源内剔除行情异动预警",
@@ -3014,7 +3555,7 @@ def selftest() -> int:
     finally:
         QUEUE, STATE = _q, _s
 
-    # ---- U1: 429 Retry-After 精确退避 (整数秒 / HTTP-date / 夹取 / 回退)
+    # ---- Batch 5 U1: 429 Retry-After 精确退避 (整数秒 / HTTP-date / 夹取 / 回退)
     check("U1 Retry-After 整数秒", parse_retry_after("120") == 120.0,
           str(parse_retry_after("120")))
     check("U1 Retry-After 0 夹到下限", parse_retry_after("0") == RA_MIN,
@@ -3045,7 +3586,7 @@ def selftest() -> int:
           retry_gap(240.0) == 240.0 and retry_gap(1800.0, None) == 1800.0,
           f"{retry_gap(240.0)} {retry_gap(1800.0, None)}")
 
-    # ---- U1-F-01: 超长纯数字 Retry-After 不得抛异常 (309~4300 位曾 OverflowError)
+    # ---- Batch 5 U1-F-01: 超长纯数字 Retry-After 不得抛异常 (309~4300 位曾 OverflowError)
     try:
         _big_ra = parse_retry_after("9" * 400)
         _big_ok = _big_ra is not None and RA_MIN <= _big_ra <= RA_MAX
@@ -3059,7 +3600,7 @@ def selftest() -> int:
         _huge_ra, _huge_ok = f"{type(_e).__name__}: {_e}", False
     check("U1 4301 位整数不抛异常 (None 或夹取)", _huge_ok, str(_huge_ra))
 
-    # ---- U1 轻微: send() 入口必须清零上一轮的 SEND_RETRY_AFTER (变异: 删掉复位即红)
+    # ---- Batch 5 U1 轻微: send() 入口必须清零上一轮的 SEND_RETRY_AFTER (变异: 删掉复位即红)
     _real_tg_reset = globals()["tg"]
     try:
         globals()["tg"] = lambda method, payload, tk, proxy, timeout=25: {}
@@ -3072,7 +3613,7 @@ def selftest() -> int:
         globals()["tg"] = _real_tg_reset
         globals()["SEND_RETRY_AFTER"] = None
 
-    # ---- U2-F-02: parse_mode=HTML 文案里的源名/错误摘要必须转义 (否则 400 降级吞掉摘要)
+    # ---- Batch 5 U2-F-02: parse_mode=HTML 文案里的源名/错误摘要必须转义 (否则 400 降级吞掉摘要)
     _real_tg_esc = globals()["tg"]
     _payloads: list[dict] = []
     try:
@@ -3091,7 +3632,7 @@ def selftest() -> int:
     finally:
         globals()["tg"] = _real_tg_esc
 
-    # ---- U2: 单源连续失败告警 / 抑制 / 恢复 / 全源失败不重复 / 发送失败重试
+    # ---- Batch 5 U2: 单源连续失败告警 / 抑制 / 恢复 / 全源失败不重复 / 发送失败重试
     _real_send = globals()["send"]
     _sent: list[str] = []
     try:
@@ -3160,12 +3701,11 @@ def selftest() -> int:
               prune({"k": 1, SRC_FAIL_KEY: {"财联社": {"rounds": 3}}})
               == {"k": 1, SRC_FAIL_KEY: {"财联社": {"rounds": 3}}},
               str(prune({"k": 1, SRC_FAIL_KEY: {"财联社": {"rounds": 3}}})))
-        check("U2 main 每轮调用 source_health",
-              "source_health(seen, outcomes" in inspect.getsource(main))
+        # U2 main 每轮调用 source_health: 断言迁移到 B9-62 (行为级, E-D-03)
     finally:
         globals()["send"] = _real_send
 
-    # ---- U2-F-01/F-03/F-04 + CTO 裁决 D: 恢复不双发 / 失败重试保留轮数 / 同轮多源合并
+    # ---- Batch 5 U2-F-01/F-03/F-04 + CTO 裁决 D: 恢复不双发 / 失败重试保留轮数 / 同轮多源合并
     _real_send2 = globals()["send"]
     _sent2: list[str] = []
     _conf2 = {"chat_id": 1, "src_alert_rounds": 3}
@@ -3232,7 +3772,7 @@ def selftest() -> int:
     finally:
         globals()["send"] = _real_send2
 
-    # ---- U3: err 文件轮转 (原地 ftruncate, 阈值/保留与 .out 一致)
+    # ---- Batch 5 U3: err 文件轮转 (原地 ftruncate, 阈值/保留与 .out 一致)
     with tempfile.TemporaryDirectory() as _td:
         _ep = Path(_td) / "err.log"
         _ep.write_bytes(b"")
@@ -3292,9 +3832,9 @@ def selftest() -> int:
             _fh.close()
         check("U3 ERRLOG 指向 launchd 的 StandardErrorPath",
               ERRLOG == Path("/tmp/futures-news.err"))
-        check("U3 main 每轮调用 rotate_stderr", "rotate_stderr()" in inspect.getsource(main))
+        # U3 main 每轮调用 rotate_stderr: 断言迁移到 B9-63 (行为级, E-D-03)
 
-    # ---- U4: 残缺标签/属性残留清洗 (不碰正文里的 < > 与普通单词)
+    # ---- Batch 5 U4: 残缺标签/属性残留清洗 (不碰正文里的 < > 与普通单词)
     check("U4 残缺 span 标签被清除",
           clean_text("<span style=color:#ff0000 沪铜夜盘上涨1.2%") == "沪铜夜盘上涨1.2%",
           clean_text("<span style=color:#ff0000 沪铜夜盘上涨1.2%"))
@@ -3420,6 +3960,7 @@ def selftest() -> int:
     class _B6R:
         def __init__(self, out):
             self.stdout = out
+            self.returncode = 0                  # R5: http() 对缺 returncode 的桩 fail-closed
 
     try:
         subprocess.run = lambda cmd, **kw: (_b6_argv.append(list(cmd)) or _B6R(b"ok\n200"))
@@ -3427,7 +3968,7 @@ def selftest() -> int:
     finally:
         subprocess.run = _b6_realrun
     check("B6 U2 无代理时 curl 命令行与旧版逐元素一致",
-          _b6_body == b"ok" and _b6_argv == [["curl", "-sS", "--noproxy", "*",
+          _b6_body == b"ok" and _b6_argv == [["curl", "-q", "-sS", "--noproxy", "*",
                                              "--compressed", "--max-time", "12",
                                              "-A", UA, "-w", "\n%{http_code}",
                                              "https://x/y"]],
@@ -3463,8 +4004,15 @@ def selftest() -> int:
           and inspect.signature(http).parameters["cap"].default == 12
           and inspect.signature(http).parameters["ua"].default is None,
           str(inspect.signature(http)))
-    check("B6 U2 --compressed 仍在 http() 源码内 (SMM 强制 gzip 的既有断言)",
-          "--compressed" in inspect.getsource(http))
+    _b6_gz: list = []
+    try:
+        subprocess.run = lambda cmd, **kw: (_b6_gz.append(list(cmd)) or _B6R(b"ok\n200"))
+        http("https://x/y", max_bytes=512)
+    finally:
+        subprocess.run = _b6_realrun
+    check("B6 U2 --compressed 只在非 strict 路径出现 (SMM 强制 gzip / PDF 不解压放大)",
+          _b6_gz and "--compressed" not in _b6_gz[-1]
+          and "--max-filesize" in _b6_gz[-1], str(_b6_gz[-1:]))
     _b6_kw: dict = {}
     _b6_proxy0, _b6_cfg0 = PROXY, dict(CFG)
     try:
@@ -3655,15 +4203,17 @@ def selftest() -> int:
           BUDGET_S == 45 and BUDGET_S + _b6_send_worst <= 120,
           f"{BUDGET_S}+{_b6_send_worst}={BUDGET_S + _b6_send_worst}")
     check("B6 U4 ROUND_SOFT_S 由 send_plan 推导 (120 - send_worst - 6)",
-          ROUND_SOFT_S == 120 - _b6_send_worst - 6,
-          f"阈值={ROUND_SOFT_S} 期望={120 - _b6_send_worst - 6} send_worst={_b6_send_worst}")
-    check("B6 U4 SEND_WORST 由 send_plan 推导 (当前 54)",
-          SEND_WORST == _b6_send_worst == 54
+          round_soft_s() == ROUND_SOFT_S == 120 - _b6_send_worst - 6,
+          f"阈值={round_soft_s()} 快照={ROUND_SOFT_S} send_worst={_b6_send_worst}")
+    check("B6 U4 SEND_WORST 由 send_plan 推导 (无代理 31 / 三腿 54)",
+          send_worst({}) == 31 and _b6_send_worst == 54
+          and SEND_WORST >= send_worst({}) and SEND_GATE_S == 114
           and ROUND_HARD_S == 120 and ROUND_MARGIN_S == 6,
           f"SEND_WORST={SEND_WORST} send_worst={_b6_send_worst}")
     check("B6 U4 逐次闸门阈值 = 120 - SEND_WORST - 余量 = 60",
-          ROUND_HARD_S - SEND_WORST - ROUND_MARGIN_S == ROUND_SOFT_S == 60,
-          f"{ROUND_HARD_S}-{SEND_WORST}-{ROUND_MARGIN_S}={ROUND_HARD_S - SEND_WORST - ROUND_MARGIN_S}")
+          SEND_GATE_S - SEND_WORST == round_soft_s() == 60
+          and ROUND_HARD_S - SEND_WORST - ROUND_MARGIN_S == 60,
+          f"{SEND_GATE_S}-{SEND_WORST}={SEND_GATE_S - SEND_WORST}")
 
     # 断言 5: 8 个英文源都真的把 FEED_HTTP 的 tries/cap 交给 http (运行级, 不只看常量)
     _b6_u6_kw: list = []
@@ -3693,10 +4243,7 @@ def selftest() -> int:
           str(source_health.__doc__)[:80])
 
     # 断言 6: main 预算跳过分支持 SRC_SKIP 哨兵 (字面量检查保留; 运行级见下方 main 全跳过)
-    check("B6 U4 main 预算耗尽分支改用 SRC_SKIP 哨兵",
-          "SRC_SKIP" in inspect.getsource(main)
-          and "全局预算耗尽, 本轮跳过" not in inspect.getsource(main),
-          "main 仍含旧字面量")
+    # B6 U4 main 预算耗尽分支改用 SRC_SKIP 哨兵: 断言迁移到 B9-64 (行为级, E-D-03)
 
     # ---- Batch 6 U4 运行级: 假 SOURCES + 假时钟实跑 main() (全离线)
     class _B6Clock:
@@ -3724,7 +4271,12 @@ def selftest() -> int:
     _b6_never = lambda deadline=None: (_ for _ in ()).throw(
         AssertionError("全跳过路径不应调用源函数"))
 
-    def _b6_run_main(tmp: Path, clock, srcs, conf_extra=None, state=None, tg_hook=None):
+    def _b6_run_main(tmp: Path, clock, srcs, conf_extra=None, state=None, tg_hook=None,
+                     args: list[str] | None = None, rotate_hook=None,
+                     pending: list[str] | None = None,
+                     pending_probe: list[bool] | None = None,
+                     queue_raw: str | None = None,
+                     pending_raw: str | None = None):
         """在 tempdir 内实跑 main(); 用假 tg 捕获 payload, 返回 rc/载荷/state/队列/CFG.
 
         tg_hook(text, clock): 可选, 模拟某类发送的真实耗时 (推进假时钟).
@@ -3733,7 +4285,8 @@ def selftest() -> int:
         st.mkdir(parents=True, exist_ok=True)
         kept = {k: globals()[k] for k in ("STATE", "QUEUE", "PENDING", "LOCK", "CONF",
                                           "LOG", "ERRLOG", "SOURCES", "time", "tg",
-                                          "resolve_token", "rotate_log", "rotate_stderr")}
+                                          "resolve_token", "rotate_log", "rotate_stderr",
+                                          "ROUND_START", "SEND_WORST")}
         payloads: list[str] = []
         try:
             globals()["STATE"] = st / "seen.json"
@@ -3755,19 +4308,28 @@ def selftest() -> int:
 
             globals()["tg"] = _fake_tg
             globals()["rotate_log"] = lambda: None
-            globals()["rotate_stderr"] = lambda: None
+            globals()["rotate_stderr"] = rotate_hook or (lambda: None)
             conf = {"token": "x", "chat_id": 1, "max_age_min": 180,
                     "digest_min": 30, "digest_max_items": 40}
             conf.update(conf_extra or {})
             globals()["CONF"].write_text(json.dumps(conf))
+            if pending_raw is not None:
+                globals()["PENDING"].write_text(pending_raw)
+            elif pending is not None:
+                globals()["PENDING"].write_text(
+                    json.dumps({"keys": list(pending), "ts": int(clock.time())}))
+            if queue_raw is not None:
+                globals()["QUEUE"].write_text(queue_raw)
             if state is not None:
                 globals()["STATE"].write_text(json.dumps(state))
             old_argv = sys.argv
             try:
-                sys.argv = ["monitor.py"]
+                sys.argv = ["monitor.py"] + list(args or [])
                 rc = main()
             finally:
                 sys.argv = old_argv
+            if pending_probe is not None:
+                pending_probe.append(globals()["PENDING"].exists())
             got_state = (json.loads(globals()["STATE"].read_text())
                          if globals()["STATE"].exists() else {})
             got_queue, _, _ = load_queue()
@@ -3871,7 +4433,8 @@ def selftest() -> int:
 
                 _rc, _pay, _stt, _q, _cfg = _b6_run_main(
                     Path(_td), _clk, [("S0", _fail0), ("S1", _ok1)],
-                    conf_extra={"digest_max_items": 1},
+                    conf_extra={"digest_max_items": 1, "proxy": "http://127.0.0.1:8080",
+                                "src_alert_rounds": 3},
                     state={"seedmarker": 1,
                            SRC_FAIL_KEY: {"S0": {"rounds": 2, "since": 1,
                                                  "last_err": "old"}}},
@@ -3926,7 +4489,7 @@ def selftest() -> int:
                                  "last_sent": 1793790000, "last_err": "old"}}}
             _rc, _pay, _stt, _q, _cfg = _b6_run_main(
                 Path(_td), _clk, [("S0", _fail_a), ("S1", _ok_a)],
-                conf_extra={"digest_max_items": 1}, state=_pre_a,
+                conf_extra={"digest_max_items": 1, "src_alert_rounds": 3}, state=_pre_a,
                 tg_hook=_b6_cost_hook(54.0, 54.0))
             _elapsed = _clk.mono - 1000.0
             _alert_n = sum(1 for t in _pay if "连续失败" in t)
@@ -3947,7 +4510,8 @@ def selftest() -> int:
                 raise RuntimeError("boom")
 
             _rc, _pay, _stt, _q, _cfg = _b6_run_main(
-                Path(_td), _clk, [("S0", _fail70)], state={"seedmarker": 1})
+                Path(_td), _clk, [("S0", _fail70)],
+                conf_extra={"proxy": "http://127.0.0.1:8080"}, state={"seedmarker": 1})
             _al1 = _stt.get("_alert") or {}
             check("B6 U4 F-02 全源失败耗时70s: 告警不发送但 rounds 递增",
                   _rc == 1 and not _pay and _al1.get("failing") is True
@@ -4495,7 +5059,7 @@ def selftest() -> int:
             self.stdout = out
             self.returncode = rc
 
-    # ---- A1: 瞬时失败 -> None (下轮重试); 确定性无文本 -> "" (不再重试)
+    # ---- Batch 7 A1: 瞬时失败 -> None (下轮重试); 确定性无文本 -> "" (不再重试)
     _a7_fix_http, _a7_fix_run, _a7_fix_bin = globals()["http"], subprocess.run, globals()["PDFTOTEXT"]
     try:
         globals()["PDFTOTEXT"] = sys.executable
@@ -4552,7 +5116,7 @@ def selftest() -> int:
           and _a7_qknown[0].get("snippet") == "" and _a7_fknown[0].get("snippet") == "",
           f"calls={_a7_known_calls} ec={_a7_ec}/{_a7_ec2}")
 
-    # ---- A2/A4/A5: curl 退出码、--max-filesize、体积兜底、PDF 路径不请求 gzip
+    # ---- Batch 7 A2/A4/A5: curl 退出码、--max-filesize、体积兜底、PDF 路径不请求 gzip
     _a7_hcmd, _a7_hrun = [], subprocess.run
     try:
         subprocess.run = lambda cmd, **kw: (_a7_hcmd.append(list(cmd))
@@ -4603,7 +5167,146 @@ def selftest() -> int:
           _a7_hok200 and not _a7_hok302 and not _a7_hok404 and not _a7_hokexc,
           f"{_a7_hok200}/{_a7_hok302}/{_a7_hok404}/{_a7_hokexc}")
 
-    # ---- A3/A5: PDF 子预算含解析时间; pdftotext 限页 + RLIMIT_AS
+    # ---- Batch 8: http() 失败归因 (全离线: 假时钟 + 假 subprocess.run, 不联网)
+    # 注: 按评审 F-01/F-02 撤回「按剩余次数切分」; 本块只守 rc 归因与「时序与基线一致」.
+    class _B8Clock:
+        """确定性时钟: 让 --max-time 真正推进预算, 用于断言调用次数/每次预算/耗时."""
+
+        def __init__(self, t0: float = 1000.0):
+            self.mono = float(t0)
+            self.t = float(t0)
+            self.sleeps: list = []
+
+        def time(self) -> float:
+            return self.t
+
+        def monotonic(self) -> float:
+            return self.mono
+
+        def sleep(self, s: float) -> None:
+            self.sleeps.append(s)
+            self.mono += s
+            self.t += s
+
+    class _B8R:
+        def __init__(self, out: bytes = b"", rc: int = 0):
+            self.stdout = out
+            self.returncode = rc
+
+    _b8_time0, _b8_run0 = globals()["time"], subprocess.run
+
+    def _b8_http(script, tries, share, cap=8):
+        _c = _B8Clock()
+        _mts: list = []
+
+        def _run(cmd, **kw):
+            _argv = list(cmd)
+            _mt = int(_argv[_argv.index("--max-time") + 1])
+            _mts.append(_mt)
+            _step = script.pop(0) if script else ("rc", 28)
+            if _step[0] == "timeout":       # 模拟 curl 到点: 时钟前进满额后返回 rc=28
+                _c.mono += _mt
+                return _B8R(b"", int(_step[1]))
+            if _step[0] == "ok":
+                return _B8R(bytes(_step[1]) + b"\n200", 0)
+            return _B8R(b"", int(_step[1]))
+
+        globals()["time"] = _c
+        subprocess.run = _run
+        _body = _err = None
+        try:
+            _body = http("https://x/feed", tries=tries, cap=cap,
+                         deadline=_c.mono + share)
+        except RuntimeError as e:
+            _err = str(e)
+        finally:
+            globals()["time"] = _b8_time0
+            subprocess.run = _b8_run0
+        return _body, _err, _mts, _c
+
+    # 既有重试仍然工作: 第一次快速失败后余额够, 第二次成功 (与基线一致)
+    _b8_body, _b8_err, _b8_mts, _b8_c = _b8_http(
+        [("rc", 28), ("ok", b"hello")], tries=2, share=7.0)
+    check("B8-01 快速失败后余额够: 返回数据且子进程被调用 2 次 (既有重试未被破坏)",
+          _b8_body == b"hello" and _b8_err is None and _b8_mts == [7, 6],
+          f"body={_b8_body!r} err={_b8_err!r} mts={_b8_mts}")
+
+    # 首轮吃满份额后二次进入: 报真实原因, 不再误标预算耗尽, 也不再带「尝试 N 次」
+    _b8_body, _b8_err, _b8_mts, _b8_c = _b8_http(
+        [("timeout", 28)], tries=2, share=7.0)
+    check("B8-02 首轮吃满 7s 后报 curl 超时 (rc=28, 7.0s), 不含预算耗尽/尝试次数",
+          _b8_err is not None and "curl 超时" in _b8_err and "rc=28" in _b8_err
+          and "7.0s" in _b8_err and "预算耗尽" not in _b8_err
+          and "尝试" not in _b8_err and _b8_mts == [7],
+          f"{_b8_err!r} mts={_b8_mts}")
+
+    # 只有一次尝试都没发起才允许报预算耗尽
+    _b8_body, _b8_err, _b8_mts, _b8_c = _b8_http([], tries=2, share=1.5)
+    check("B8-03 首次 left<2: 报预算耗尽且注明未发起尝试, 零子进程",
+          _b8_err is not None and "预算耗尽" in _b8_err
+          and "未发起尝试" in _b8_err and not _b8_mts, f"{_b8_err!r} mts={_b8_mts}")
+
+    _, _b8_e35, _, _ = _b8_http([("rc", 35)], tries=1, share=10.0)
+    _, _b8_e7, _, _ = _b8_http([("rc", 7)], tries=1, share=10.0)
+    _, _b8_e16, _, _ = _b8_http([("rc", 16)], tries=1, share=10.0)
+    _, _b8_e63, _, _ = _b8_http([("rc", 63)], tries=1, share=10.0)
+    _, _b8_e99, _, _ = _b8_http([("rc", 99)], tries=1, share=10.0)
+    check("B8-04 rc 映射: 35/7 连接失败(SSL/DNS) / 16 HTTP/2 / 63 体积上限 / 其它 curl rc=N",
+          "连接失败(SSL/DNS)" in (_b8_e35 or "") and "rc=35" in (_b8_e35 or "")
+          and "连接失败(SSL/DNS)" in (_b8_e7 or "")
+          and "HTTP/2 帧错误" in (_b8_e16 or "")
+          and "超过体积上限" in (_b8_e63 or "") and "curl rc=63" in (_b8_e63 or "")
+          and "curl rc=99" in (_b8_e99 or "")
+          and all("预算耗尽" not in (x or "")
+                  for x in (_b8_e35, _b8_e7, _b8_e16, _b8_e63, _b8_e99)),
+          f"35={_b8_e35!r} 7={_b8_e7!r} 16={_b8_e16!r} 63={_b8_e63!r} 99={_b8_e99!r}")
+
+    # 撤回切分的核心证据: 7/8/9/10/12s 五种份额下, 调用次数与每次 --max-time 与基线逐项相同.
+    # 场景 A: 每次 rc=28 但瞬时返回(不推进时钟) -> 余额允许第二次尝试.
+    _b8_a = []
+    for _sh in (7.0, 8.0, 9.0, 10.0, 12.0):
+        _, _, _mt, _ = _b8_http([("rc", 28), ("rc", 28)], tries=2, share=_sh)
+        _b8_a.append((int(_sh), _mt))
+    check("B8-05 7/8/9/10/12s 份额(瞬时失败)调用次数与 --max-time 与基线一致",
+          _b8_a == [(7, [7, 6]), (8, [8, 7]), (9, [8, 8]),
+                    (10, [8, 8]), (12, [8, 8])], f"{_b8_a}")
+
+    # 场景 B: 每次把 --max-time 吃满 (真实超时), 剩余份额决定是否还有第二次.
+    _b8_b = []
+    for _sh in (7.0, 8.0, 9.0, 10.0, 12.0):
+        _, _, _mt, _ = _b8_http([("timeout", 28), ("timeout", 28)],
+                                tries=2, share=_sh)
+        _b8_b.append((int(_sh), _mt))
+    check("B8-06 7/8/9/10/12s 份额(超时吃满)调用次数与 --max-time 与基线一致",
+          _b8_b == [(7, [7]), (8, [8]), (9, [8]), (10, [8]), (12, [8, 3])], f"{_b8_b}")
+
+    # 非 deadline 路径 argv 逐元素不变 (--max-time 12)
+    _b8_cmd: list = []
+
+    def _b8_run_ok(cmd, **kw):
+        _b8_cmd.append(list(cmd))
+        return _B8R(b"x\n200", 0)
+
+    globals()["time"], subprocess.run = _B8Clock(), _b8_run_ok
+    try:
+        _b8_nodl = http("https://x/feed")
+    finally:
+        globals()["time"], subprocess.run = _b8_time0, _b8_run0
+    _b8_expect = ["curl", "-q", "-sS", "--noproxy", "*", "--compressed", "--max-time", "12",
+                  "-A", UA, "-w", "\n%{http_code}", "https://x/feed"]
+    check("B8-07 无 deadline argv 与基线逐元素一致 (--max-time 12)",
+          _b8_nodl == b"x" and _b8_cmd == [_b8_expect],
+          f"body={_b8_nodl!r} argv={_b8_cmd[:1]}")
+
+    # 撤回「尝试 N 次」后, 所有失败消息仍带 rc 与耗时; 63 保留既有断言字样
+    check("B8-08 失败消息统一带 rc 与耗时且不含切分痕迹 (无尝试次数/无 ATTEMPT_FLOOR)",
+          CURL_RC_REASON.get(28) == "curl 超时"
+          and "ATTEMPT_FLOOR" not in globals()
+          and all(("rc=" in (_x or "") and ".0s" in (_x or "") and "尝试" not in (_x or ""))
+                  for _x in (_b8_e35, _b8_e7, _b8_e16, _b8_e63, _b8_e99)),
+          f"{_b8_e35!r} {_b8_e63!r}")
+
+    # ---- Batch 7 A3/A5: PDF 子预算含解析时间; pdftotext 限页 + RLIMIT_AS
     _a7_now2 = time.monotonic()
     _a7_pkw, _a7_prun = {}, []
     _a7_bin3 = globals()["PDFTOTEXT"]
@@ -4617,6 +5320,21 @@ def selftest() -> int:
         globals()["http"] = _a7_fix_http
         globals()["PDFTOTEXT"] = _a7_bin3
         subprocess.run = _a7_fix_run
+    _b9_rl: list = []
+    _b9_res0 = globals().get("resource")
+
+    class _B9Res:
+        RLIMIT_AS = -1
+
+        @staticmethod
+        def setrlimit(res, lim):
+            _b9_rl.append((res, lim))
+
+    try:
+        globals()["resource"] = _B9Res
+        _pdf_child_limits()
+    finally:
+        globals()["resource"] = _b9_res0
     _a7_pentry = next(((c, k) for c, k in _a7_prun if "-f" in c), ([], {}))
     _a7_pargv, _a7_pokw = _a7_pentry
     check("B7-21 PDF 预算=下载8+解析6且给解析预留 PDF_TIMEOUT; pdftotext 限页+RLIMIT_AS (A3/A5)",
@@ -4629,10 +5347,10 @@ def selftest() -> int:
           and "-l" in _a7_pargv and _a7_pargv[_a7_pargv.index("-l") + 1] == str(PDF_MAX_PAGES)
           and PDF_RLIMIT_AS == 256 * 1024 * 1024
           and callable(_a7_pokw.get("preexec_fn"))
-          and "setrlimit" in inspect.getsource(_pdf_child_limits),
+          and _b9_rl == [(_B9Res.RLIMIT_AS, (PDF_RLIMIT_AS, PDF_RLIMIT_AS))],
           f"dl={_a7_pkw.get('deadline')} argv={_a7_pargv}")
 
-    # ---- B1: 未来节流时间戳 -> 按未运行处理 (下一轮必须真跑并改写)
+    # ---- Batch 7 B1: 未来节流时间戳 -> 按未运行处理 (下一轮必须真跑并改写)
     with tempfile.TemporaryDirectory() as _td:
         _b1_clk = _B6Clock(1793800000)
         _b1_calls: list[int] = []
@@ -4651,7 +5369,7 @@ def selftest() -> int:
           and _b1_r[2].get("_research", {}).get("东财研报") == 1793800000,
           f"calls={len(_b1_calls)} ra={_b1_r[2].get('_research')}")
 
-    # ---- B2①: 第二轮 30 分钟节流生效 (main 级)
+    # ---- Batch 7 B2①: 第二轮 30 分钟节流生效 (main 级)
     with tempfile.TemporaryDirectory() as _td:
         _b2_clk = _B6Clock(1793800000)
         _b2_calls: list[int] = []
@@ -4678,7 +5396,7 @@ def selftest() -> int:
           and _b2_r2[2].get("_research", {}).get("东财研报") == 1793800000,
           f"calls={_b2_calls} log={_b2_log[-120:]!r}")
 
-    # ---- B2②: 摘要未取到的研报当轮不入队, 下一研报轮补齐 (main 级)
+    # ---- Batch 7 B2②: 摘要未取到的研报当轮不入队, 下一研报轮补齐 (main 级)
     with tempfile.TemporaryDirectory() as _td:
         _b3_clk = _B6Clock(1793800000)
         _b3_pdf_calls: list[str] = []
@@ -4710,7 +5428,7 @@ def selftest() -> int:
           and all(q.get("snippet") for q in _b3_q2),
           f"q1={len(_b3_q1)} q2={len(_b3_q2)} calls={len(_b3_pdf_calls)}")
 
-    # ---- B2③: 研报条目走 research_reason, 非研报 filter_reason (main 级)
+    # ---- Batch 7 B2③: 研报条目走 research_reason, 非研报 filter_reason (main 级)
     with tempfile.TemporaryDirectory() as _td:
         _b4_clk = _B6Clock(1793800000)
 
@@ -4726,7 +5444,7 @@ def selftest() -> int:
           len(_b4_r[3]) == 1 and _b4_r[3][0]["key"] == "研究:中金所:m202610",
           f"queue={_b4_r[3]}")
 
-    # ---- B2④: 主流程用 it["key"] (稳定研报键), 不用 dedupe_key(text) (main 级)
+    # ---- Batch 7 B2④: 主流程用 it["key"] (稳定研报键), 不用 dedupe_key(text) (main 级)
     with tempfile.TemporaryDirectory() as _td:
         _b5_clk = _B6Clock(1793800000)
 
@@ -4741,7 +5459,7 @@ def selftest() -> int:
           len(_b5_r[3]) == 1 and _b5_r[3][0]["key"] == "研究:东财研报:AP999",
           str(_b5_r[3])[:160])
 
-    # ---- B3: 中金所日/周报是 CSV, 绝不能进 pdf_text; 月报才解析
+    # ---- Batch 7 B3: 中金所日/周报是 CSV, 绝不能进 pdf_text; 月报才解析
     _b6_ok_urls: list[str] = []
     _b6_hok = globals()["http_ok"]
     globals()["http_ok"] = lambda url, deadline=None, timeout=6: (
@@ -4785,7 +5503,7 @@ def selftest() -> int:
           _b7_qtypes == ["1", "2"] and "qType=0" not in " ".join(_b7_em_urls)
           and len(_b7_em) == 1, f"qtypes={_b7_qtypes} got={len(_b7_em)}")
 
-    # ---- C1: 协议白名单 (渲染 + 入队)
+    # ---- Batch 7 C1: 协议白名单 (渲染 + 入队)
     _c1_js = research_item("东财研报", "AP1", "沪铜周报：库存去化",
                            "javascript:alert(document.cookie)", _a7_ts,
                            "某证券 · 2026-11-06", "摘要")
@@ -4802,7 +5520,7 @@ def selftest() -> int:
           and len(_c1_q) == 2 and all("url" not in q for q in _c1_q),
           f"msg={_c1_msg[:80]!r} q={_c1_q}")
 
-    # ---- C2: 研报标题/元信息/摘要的 HTML 实体化
+    # ---- Batch 7 C2: 研报标题/元信息/摘要的 HTML 实体化
     _c2_it = research_item("东财研报", "AP3", "沪铜<b>深度</b>", "https://x/3.pdf",
                            _a7_ts, "某证券 & <i>2026</i>",
                            '摘要 "研报" <script>alert(1)</script>')
@@ -4815,7 +5533,7 @@ def selftest() -> int:
           and "<b>深度" not in _c2_line,
           _c2_line[:160])
 
-    # ---- C3: 超长 URL/元信息 -> 单条 u16 <= MSG_MAX (可正常拆批)
+    # ---- Batch 7 C3: 超长 URL/元信息 -> 单条 u16 <= MSG_MAX (可正常拆批)
     _c3_url = "https://x.example/" + "a" * 4500
     _c3_it = research_item("东财研报", "AP4", "沪铜周报：库存去化", _c3_url,
                            _a7_ts, "某证券 · 2026-11-06", "摘要")
@@ -4830,7 +5548,7 @@ def selftest() -> int:
           and u16(_c3_line2) <= MSG_MAX,
           f"url_line={u16(_c3_line)} meta_line={u16(_c3_line2)}")
 
-    # ---- C 轻微: queue_upsert 字段语义 + 非字符串 url 容错
+    # ---- Batch 7 C 轻微: queue_upsert 字段语义 + 非字符串 url 容错
     _c4_items = [
         {"src": "财联社", "ts": _a7_ts, "text": "沪铜夜盘上涨1.2%", "key": "k1"},
         {"src": "中期协", "ts": _a7_ts, "text": "简报｜协会", "key": "研究:中期协:1",
@@ -4860,6 +5578,1386 @@ def selftest() -> int:
           "<a href" not in _c5_msg and "<a href" not in _c5_line
           and "沪铜周报" in _c5_msg,
           _c5_msg[:80])
+
+    # ==== Batch 9 U1: 发送路径 (B9-01..13) ====
+    # B9-01/02/03: 主聚合循环逐条闸门 (RA-F-01)
+    with tempfile.TemporaryDirectory() as _td:
+        _clk = _B6Clock(1793800000)
+        _b9_items = [{"src": "S0", "ts": int(_clk.time()) - 60,
+                      "text": f"沪铜{i}号" + "🚨" * 690} for i in range(10)]
+
+        def _b9_long(deadline=None):
+            return [dict(it) for it in _b9_items]
+
+        def _b9_hook(text, clk):
+            if "沪铜" in text:                # 聚合消息: 第一条花 62s, 之后闸门必红
+                clk.mono += 62.0
+                clk.t += 62.0
+
+        _rc, _pay, _stt, _q, _cfg = _b6_run_main(
+            Path(_td), _clk, [("S0", _b9_long)],
+            conf_extra={"digest_max_items": 10, "proxy": "http://127.0.0.1:8080"},
+            state={"seedmarker": 1}, tg_hook=_b9_hook)
+        _b9_seen = {k for k in _stt if not k.startswith("_") and k != "seedmarker"}
+        _b9_qkeys = {it["key"] for it in _q}
+        _b9_first_keys = {dedupe_key(it["text"]) for it in _b9_items[:2]}
+        check("B9-01 聚合循环逐条闸门: 第 2 批起被推迟 (只发 1 条)",
+              _rc == 0 and len(_pay) == 1, f"rc={_rc} sends={len(_pay)}")
+        check("B9-02 闸门推迟: 剩余条目留队且未标 seen (按 key 身份, U1-F-04)",
+              len(_q) == 8 and _b9_seen == _b9_first_keys
+              and not (_b9_qkeys & _b9_seen),
+              f"queue={len(_q)} seen={sorted(_b9_seen)} first={sorted(_b9_first_keys)}")
+        check("B9-03 闸门推迟不算发送失败 (fails 不增 / next_try 无)",
+              not (_stt.get("_digest") or {}).get("fails")
+              and "next_try" not in (_stt.get("_digest") or {}),
+              str(_stt.get("_digest")))
+
+    # B9-04: SEND_WORST 按 conf 重算 (A-F-02)
+    _b9_sw: list[int] = []
+
+    def _b9_sw_hook(text, clk):
+        _b9_sw.append(globals()["SEND_WORST"])
+
+    _b9_proxy0 = PROXY
+    globals()["PROXY"] = ""                   # 排掉宿主环境代理, 让 31/54 两档可判定
+    try:
+        for _b9_proxy, _b9_want in (("", 31), ("http://127.0.0.1:8080", 54)):
+            with tempfile.TemporaryDirectory() as _td:
+                _clk = _B6Clock(1793800000)
+
+                def _b9_one(deadline=None):
+                    return [{"src": "S0", "ts": int(_clk.time()) - 60,
+                             "text": "沪铜库存变化1吨环比1%"}]
+
+                _b6_run_main(Path(_td), _clk, [("S0", _b9_one)],
+                             conf_extra={"digest_max_items": 1, "proxy": _b9_proxy},
+                             state={"seedmarker": 1}, args=["--flush-now"],
+                             tg_hook=_b9_sw_hook)
+    finally:
+        globals()["PROXY"] = _b9_proxy0
+    check("B9-04 SEND_WORST 按实际腿数重算 (无代理 31 / 三腿 54)",
+          _b9_sw == [31, 54], str(_b9_sw))
+
+    # B9-05: 阈值单点派生 (A-D-03)
+    check("B9-05 阈值单点派生: SEND_GATE_S=114 且 round_soft_s()=硬顶-SEND_WORST",
+          SEND_GATE_S == ROUND_HARD_S - ROUND_MARGIN_S == 114
+          and round_soft_s() == SEND_GATE_S - SEND_WORST,
+          f"gate={SEND_GATE_S} soft={round_soft_s()} worst={SEND_WORST}")
+
+    # B9-06: if not dry 死条件已移除 (A-F-03, AST 结构断言而非源码字面量)
+    # R2: main 的 dry 局部名收敛为 opts.dry, 断言只重定向 token 名 (Name -> Attribute), 语义不变.
+    _b9_main_ast = next(n for n in ast.parse(Path(__file__).read_text()).body
+                        if isinstance(n, ast.FunctionDef) and n.name == "main")
+    _b9_dead = [n for n in ast.walk(_b9_main_ast)
+                if isinstance(n, ast.If) and isinstance(n.test, ast.UnaryOp)
+                and isinstance(n.test.op, ast.Not)
+                and isinstance(n.test.operand, ast.Attribute)
+                and n.test.operand.attr == "dry"]
+    check("B9-06 main 的 if not dry 只剩 pending 合并 1 处 (尾部死条件已删, AST)",
+          len(_b9_dead) == 1, f"count={len(_b9_dead)}")
+
+    # B9-07/08: SEND_ERR 复位 (A-F-04 / R-E-F-02); U1-F-01: 两条断言须能各自隔离一处复位
+    _b9_tg0 = globals()["tg"]
+    _b9_entry_err: list[str] = []
+    try:
+        def _b9_tg7(method, payload, tk, proxy, timeout=25):
+            _b9_entry_err.append(SEND_ERR)      # 入口复位之后、真正发请求之前捕获
+            return {}
+
+        globals()["tg"] = _b9_tg7
+        globals()["SEND_ERR"] = "stale-entry"
+        _b9_ok7 = send("probe", {"chat_id": 1}, "tk")
+        _b9_err7 = SEND_ERR
+        _b9_calls8: list[int] = []
+
+        def _b9_tg8(method, payload, tk, proxy, timeout=25):
+            _b9_calls8.append(1)
+            if len(_b9_calls8) == 1:
+                globals()["SEND_ERR"] = "inside-error"   # 首次腿内写失败原因, 再抛 400 parse
+                raise urllib.error.HTTPError(
+                    "https://api.telegram.org", 400, "Bad Request",
+                    {}, io.BytesIO(b'{"ok":false,"description":"can\'t parse entities"}'))
+            return {}
+
+        globals()["tg"] = _b9_tg8
+        globals()["SEND_ERR"] = "stale-fallback"
+        _b9_ok8 = send("probe", {"chat_id": 1}, "tk")
+        _b9_err8 = SEND_ERR
+    finally:
+        globals()["tg"] = _b9_tg0
+        globals()["SEND_ERR"] = ""
+    check("B9-07 send() 入口清零 SEND_ERR (tg 入口捕获为空, U1-F-01)",
+          _b9_ok7 and _b9_err7 == "" and _b9_entry_err == [""],
+          f"{_b9_err7!r} entry={_b9_entry_err!r}")
+    check("B9-08 纯文本降级成功也清零 SEND_ERR (腿内错误被清, U1-F-01)",
+          _b9_ok8 and len(_b9_calls8) == 2 and _b9_err8 == "", repr(_b9_err8))
+
+    # B9-09: errno 常量白名单 + IncompleteRead (R-E-F-03 / E-D-01)
+    check("B9-09 is_transient 用 errno 常量 (跨平台) 且含 IncompleteRead",
+          is_transient(urllib.error.URLError(OSError(errno.ENETDOWN, "down")))
+          and is_transient(urllib.error.URLError(OSError(errno.EADDRNOTAVAIL, "na")))
+          and is_transient(IncompleteRead(b"x"))
+          and not is_transient(urllib.error.HTTPError("u", 400, "Bad", None, None)),
+          f"{errno.ENETDOWN}/{errno.EADDRNOTAVAIL}")
+
+    # B9-10: is_http_url 大小写 (R-E-F-05)
+    check("B9-10 is_http_url scheme 大小写不敏感 (RFC 3986)",
+          is_http_url("HTTPS://X/") and is_http_url("Http://x") and not is_http_url("ftp://x"),
+          f"{is_http_url('HTTPS://X/')} {is_http_url('Http://x')}")
+
+    # B9-11/12/13: 研报行转义后 u16 (R-E-F-01)
+    _b9_dt = datetime.now(TZ_CN)
+    _b9_title = research_item("东财研报", "B9T", '"' * 700, "https://x/1.pdf",
+                              1000, "机构 · 2026-11-06", "摘要")
+    _b9_line_t = research_line(_b9_title, _b9_dt)
+    _b9_url = "https://x/?" + "&" * 989
+    _b9_item_u = research_item("东财研报", "B9U", "沪铜周报", _b9_url,
+                               1000, "机构 · 2026-11-06", "摘要")
+    _b9_line_u = research_line(_b9_item_u, _b9_dt)
+    _b9_mm0 = RESEARCH_META_MAX
+    try:
+        globals()["RESEARCH_META_MAX"] = MSG_MAX
+        _b9_item_m = research_item("东财研报", "B9M", "沪铜周报", "https://x/3.pdf",
+                                   1000, "机" * 4000, "摘要")
+        _b9_line_m = research_line(_b9_item_m, _b9_dt)
+    finally:
+        globals()["RESEARCH_META_MAX"] = _b9_mm0
+    check("B9-11 研报标题按转义后 u16 截断 (700 引号不再 4279)",
+          u16(_b9_line_t) <= MSG_MAX, f"u16={u16(_b9_line_t)}")
+    # U1-F-03: 699 引号「摘要」会先被 SNIPPET_MAX+20=260 字符截断, 旧码也只有 1641 u16, 红不了;
+    # 真正的旧码红点是标题/URL, 故 red 用例改用 699 引号标题, 摘要仅保留为边界绿例.
+    _b9_t699 = research_item("东财研报", "B9T699", '"' * 699, "https://x/699.pdf",
+                             1000, "机构 · 2026-11-06", "摘要")
+    _b9_s699 = research_item("东财研报", "B9S699", "沪铜周报", "https://x/699s.pdf",
+                             1000, "机构 · 2026-11-06", '"' * 699)
+    _b9_line_t699 = research_line(_b9_t699, _b9_dt)
+    _b9_line_s699 = research_line(_b9_s699, _b9_dt)
+    check("B9-11B 699 引号标题/URL 按转义后 u16 截断 (旧码 4273, U1-F-03)",
+          u16(_b9_line_t699) <= MSG_MAX and u16(_b9_line_s699) <= MSG_MAX
+          and "<a href" in _b9_line_t699,
+          f"title={u16(_b9_line_t699)} snip={u16(_b9_line_s699)}")
+    check("B9-12 & 密集 URL 按转义后 u16 降级为「链接过长」",
+          u16(_b9_line_u) <= MSG_MAX and "<a href" not in _b9_line_u
+          and "链接过长" in _b9_line_u, f"u16={u16(_b9_line_u)}")
+    check("B9-13 研报行仍超 MSG_MAX 时整行降级纯文本",
+          u16(_b9_line_m) <= MSG_MAX and "<a href" not in _b9_line_m,
+          f"u16={u16(_b9_line_m)}")
+
+    # ==== Batch 9 U2: 抓取层 (B9-20..27) ====
+    _b9_http0 = globals()["http"]
+    _b9_ok0 = globals()["http_ok"]
+    _b9_run0 = subprocess.run
+
+    class _B9R:
+        def __init__(self, out, rc=0):
+            self.stdout = out
+            self.returncode = rc
+
+    # B9-20: 5 个快讯源空列表哨兵 (RB-F-01)
+    _b9_empty = [
+        (src_cls, {"data": {"roll_data": []}}, "财联社"),
+        (src_em, {"data": {"fastNewsList": []}}, "东财"),
+        (src_ths, {"data": {"list": []}}, "同花顺"),
+        (src_sina, {"result": {"data": {"feed": {"list": []}}}}, "新浪"),
+        (src_wscn_commodity, {"data": {"items": []}}, "见闻商品"),
+    ]
+    _b9_hits: list[str] = []
+    try:
+        for _fn, _payload, _name in _b9_empty:
+            globals()["http"] = (lambda *a, _p=_payload, **k: json.dumps(_p).encode())
+            try:
+                _fn(None)
+                _b9_hits.append("no-raise")
+            except RuntimeError as e:
+                _b9_hits.append(_name if _name in str(e) else f"wrong:{e}")
+    finally:
+        globals()["http"] = _b9_http0
+    check("B9-20 5 个中文快讯源空列表抛错 (不静默记成功)",
+          _b9_hits == ["财联社", "东财", "同花顺", "新浪", "见闻商品"], str(_b9_hits))
+
+    # B9-21: 研报源空列表豁免 (反向守住: 不得误加哨兵)
+    _b9_em_empty = _b9_cfa_empty = _b9_cffex_empty = None
+    try:
+        globals()["http"] = lambda *a, **k: b'{"data": []}'
+        _b9_em_empty = src_em_report(None)
+        globals()["http"] = lambda *a, **k: b'{"data": {"dataList": []}}'
+        _b9_cfa_empty = src_cfa(None)
+        globals()["http_ok"] = lambda *a, **k: False
+        _b9_cffex_empty = src_cffex(None)
+    finally:
+        globals()["http"] = _b9_http0
+        globals()["http_ok"] = _b9_ok0
+    check("B9-21 研报源空列表豁免 (不得误加哨兵)",
+          _b9_em_empty == [] and _b9_cfa_empty == [] and _b9_cffex_empty == [],
+          f"{_b9_em_empty} {_b9_cfa_empty} {_b9_cffex_empty}")
+
+    # B9-22: strict 体积超限原因不被吞 (RB-F-02)
+    _b9_over = None
+    try:
+        subprocess.run = lambda cmd, **kw: _B9R(b"x" * 2048 + b"\n200")
+        try:
+            http("https://x/a.pdf", tries=1, max_bytes=1024,
+                 deadline=time.monotonic() + 10)
+        except RuntimeError as e:
+            _b9_over = str(e)
+    finally:
+        subprocess.run = _b9_run0
+    check("B9-22 strict 体积超限原因透传 (保留 body 超上限 字样)",
+          _b9_over is not None and "body 超上限 2048>1024" in _b9_over
+          and "http failed" in _b9_over, repr(_b9_over))
+
+    # B9-23: 末次尝试后不再 sleep (RB-F-03)
+    _b9_sleeps: list[float] = []
+    _b9_sleep0 = time.sleep
+    try:
+        time.sleep = lambda s: _b9_sleeps.append(s)
+        subprocess.run = lambda cmd, **kw: _B9R(b"x\n500")
+        try:
+            http("https://x/y", tries=3)
+        except RuntimeError:
+            pass
+    finally:
+        time.sleep = _b9_sleep0
+        subprocess.run = _b9_run0
+    check("B9-23 末次尝试后不再 sleep (3 次尝试只剩 2 次间隔)",
+          _b9_sleeps == [1.0, 2.0], str(_b9_sleeps))
+
+    # B9-24: curl argv 带 -q (B-D-01, http + http_ok 两处)
+    _b9_qargv: list = []
+    try:
+        subprocess.run = lambda cmd, **kw: (_b9_qargv.append(list(cmd)) or _B9R(b"x\n200"))
+        http("https://x/y")
+        http_ok("https://x/y")
+    finally:
+        subprocess.run = _b9_run0
+    check("B9-24 curl argv 首位 -q (http 与 http_ok 都隔离 ~/.curlrc)",
+          len(_b9_qargv) == 2 and _b9_qargv[0][:2] == ["curl", "-q"]
+          and _b9_qargv[1][:2] == ["curl", "-q"], str([a[:3] for a in _b9_qargv]))
+
+    # B9-25: deadline=0.0 视为预算已耗尽 (B-D-03)
+    _b9_calls25: list[int] = []
+    _b9_e25 = ""
+    try:
+        subprocess.run = lambda cmd, **kw: (_b9_calls25.append(1) or _B9R(b"x\n200"))
+        try:
+            http("https://x/y", deadline=0.0)
+        except RuntimeError as e:
+            _b9_e25 = str(e)
+        _b9_ok25 = http_ok("https://x/y", deadline=0.0)
+    finally:
+        subprocess.run = _b9_run0
+    check("B9-25 deadline=0.0 视为耗尽 (不发起子进程, http_ok 直接 False)",
+          not _b9_calls25 and "预算耗尽" in _b9_e25 and _b9_ok25 is False,
+          f"calls={len(_b9_calls25)} err={_b9_e25!r} ok={_b9_ok25}")
+
+    # B9-26: 小写 https_proxy 生效 (B-D-05)
+    _b9_pfe = globals().get("proxy_from_env")
+    _b9_env_val = "missing"
+    _b9_up0 = os.environ.pop("HTTPS_PROXY", None)
+    _b9_lo0 = os.environ.get("https_proxy")
+    try:
+        os.environ["https_proxy"] = "http://127.0.0.1:9"
+        _b9_env_val = _b9_pfe() if callable(_b9_pfe) else "missing"
+    finally:
+        if _b9_up0 is None:
+            os.environ.pop("HTTPS_PROXY", None)
+        else:
+            os.environ["HTTPS_PROXY"] = _b9_up0
+        if _b9_lo0 is None:
+            os.environ.pop("https_proxy", None)
+        else:
+            os.environ["https_proxy"] = _b9_lo0
+    check("B9-26 小写 https_proxy 被识别 (与大写同口径)",
+          _b9_env_val == "http://127.0.0.1:9", repr(_b9_env_val))
+
+    # B9-27: 非空列表仍正常返回 (哨兵不误伤; 旧码也绿的不变式)
+    _b9_rows = {"data": {"roll_data": [
+        {"title": "沪铜夜盘上涨1.2%", "ctime": int(time.time()) - 60}]}}
+    try:
+        globals()["http"] = lambda *a, **k: json.dumps(_b9_rows).encode()
+        _b9_got_cls = src_cls(None)
+    finally:
+        globals()["http"] = _b9_http0
+    check("B9-27 非空列表仍正常解析 (哨兵不误伤)",
+          len(_b9_got_cls) == 1 and _b9_got_cls[0]["src"] == "财联社",
+          str(_b9_got_cls))
+
+    # ==== Batch 9 U3: 判定与合并 (B9-30..39) ====
+    def _b9_merge(a, b):
+        return merge_near([{"src": "x", "ts": 1000, "text": a, "key": a},
+                           {"src": "y", "ts": 1300, "text": b, "key": b}])[0]
+
+    # B9-30/31: 方向否决 (RC-F-01)
+    _b9_dir_tokens = ("涨", "跌", "增", "减", "升", "降", "上调", "下调",
+                      "扩张", "收缩", "累库", "去库")
+    check("B9-30 方向词否决: 增产50万桶 vs 减产50万桶 不再合并",
+          len(_b9_merge("沙特增产50万桶/日以平衡市场",
+                        "沙特减产50万桶/日以平衡市场")) == 2
+          and all(tok in DIR_UP or tok in DIR_DOWN for tok in _b9_dir_tokens),
+          f"{len(_b9_merge('沙特增产50万桶/日以平衡市场', '沙特减产50万桶/日以平衡市场'))}")
+    check("B9-31 方向词否决: 大涨5% vs 大跌5% 不再合并",
+          len(_b9_merge("沪铜主力合约日内大涨5%现报73000元",
+                        "沪铜主力合约日内大跌5%现报73000元")) == 2,
+          str(len(_b9_merge("沪铜主力合约日内大涨5%现报73000元",
+                            "沪铜主力合约日内大跌5%现报73000元"))))
+
+    # B9-32: 「涨跌互现」同句不误伤 (不变式)
+    check("B9-32 涨跌互现同句不参与否决 (仍可近似合并)",
+          len(_b9_merge("沪铜涨跌互现市场情绪谨慎",
+                        "沪铜涨跌互现市场情绪谨慎观望")) == 1,
+          str(len(_b9_merge("沪铜涨跌互现市场情绪谨慎",
+                            "沪铜涨跌互现市场情绪谨慎观望"))))
+
+    # B9-33/34: 中文数字不设防 -> 设防 (RC-F-02)
+    check("B9-33 中文数字量词不同不合并 (一万二千吨 vs 一万吨)",
+          len(_b9_merge("上期所铜库存减少一万二千吨",
+                        "上期所铜库存减少一万吨")) == 2,
+          str(len(_b9_merge("上期所铜库存减少一万二千吨",
+                            "上期所铜库存减少一万吨"))))
+    check("B9-34 阿拉伯数字护栏不变 (12000 vs 10000 仍不合并)",
+          len(_b9_merge("上期所铜库存减少12000吨",
+                        "上期所铜库存减少10000吨")) == 2,
+          str(len(_b9_merge("上期所铜库存减少12000吨",
+                            "上期所铜库存减少10000吨"))))
+
+    # B9-35/36/37: clean_text (RC-F-03/04/06)
+    check("B9-35 clean_text 保留比较符夹住的正文 (升贴水/涨跌幅)",
+          clean_text("沪铜升水<150元/吨，贴水>50元/吨") == "沪铜升水<150元/吨，贴水>50元/吨"
+          and clean_text("涨幅<5%且库存>30万吨") == "涨幅<5%且库存>30万吨"
+          and clean_text("<b>沪铜夜盘上涨1.2%</b>") == "沪铜夜盘上涨1.2%",
+          clean_text("沪铜升水<150元/吨，贴水>50元/吨"))
+    _b9_t0 = time.perf_counter()
+    _b9_lt = clean_text("<" * 100000)
+    _b9_dt_cost = time.perf_counter() - _b9_t0
+    check("B9-36 clean_text '<' 密集输入线性 (100k < 1.5s, 旧码 ~5.9s)",
+          _b9_dt_cost < 1.5 and len(_b9_lt) == 100000, f"{_b9_dt_cost:.3f}s")
+    check("B9-37 clean_text 双重编码归一且幂等 (RC-F-06)",
+          clean_text("&amp;lt;span&amp;gt;双重编码") == "双重编码"
+          and clean_text(clean_text("&amp;lt;span&amp;gt;双重编码")) == "双重编码",
+          clean_text("&amp;lt;span&amp;gt;双重编码"))
+
+    # B9-38: docstring 同步 (RC-F-05)
+    check("B9-38 research_reason docstring 已同步为「顺序不同/锚点前置」",
+          "顺序与 filter_reason **不同**" in (research_reason.__doc__ or "")
+          and "顺序与 filter_reason 一致" not in (research_reason.__doc__ or ""),
+          (research_reason.__doc__ or "")[:60])
+
+    # B9-39: NOISE_HARD 无重复 (C-D-03)
+    check("B9-39 NOISE_HARD 无重复词条 (150 -> 145)",
+          len(NOISE_HARD) == len(set(NOISE_HARD)) and len(NOISE_HARD) == 145,
+          f"len={len(NOISE_HARD)}")
+
+    # ==== batch9-fix U3: 方向否决补强 (U3-F-01..F-04) ====
+    # B9-70: 评审 8 组最小反例逐组 kept=2 (U3-F-01)
+    _b9_fx_gap = [
+        ("美联储 降息/加息", "美联储宣布降息25个基点", "美联储宣布加息25个基点"),
+        ("央行 降息/加息", "央行宣布降息25个基点", "央行宣布加息25个基点"),
+        ("沪铜 上涨/下滑", "沪铜主力合约日内上涨5%现报73000元/吨",
+         "沪铜主力合约日内下滑5%现报73000元/吨"),
+        ("沪铜 上涨/走弱", "沪铜主力合约日内上涨5%现报73000元/吨",
+         "沪铜主力合约日内走弱5%现报73000元/吨"),
+        ("扩产/减产", "国内铜冶炼厂扩产10万吨项目正式投产运行",
+         "国内铜冶炼厂减产10万吨项目正式投产运行"),
+        ("复产/停产", "吕梁地区煤矿复产10万吨产能恢复运行",
+         "吕梁地区煤矿停产10万吨产能恢复运行"),
+        ("新增产能 扩张/收缩", "国内铜冶炼新增产能扩张10万吨项目正式投产运行",
+         "国内铜冶炼新增产能收缩10万吨项目正式投产运行"),
+        ("新增产量 增长/下降", "国内铜冶炼新增产量增长5%至10万吨创年内新高",
+         "国内铜冶炼新增产量下降5%至10万吨创年内新高"),
+    ]
+    _b9_fx_gap_kept = [(name, len(_b9_merge(a, b))) for name, a, b in _b9_fx_gap]
+    check("B9-70 方向否决: 评审 8 组最小反例全部 kept=2 (U3-F-01)",
+          len(_b9_fx_gap) == 8 and all(k == 2 for _n, k in _b9_fx_gap_kept),
+          str(_b9_fx_gap_kept))
+
+    # B9-71: 「新增」等中性复合词不得伪造方向 (U3-F-01)
+    check("B9-71 中性复合词不产生伪方向: 新增/增速/增量 为空集, 新增产量+增长/下降 仍否决 (U3-F-01)",
+          dir_axes("新增") == frozenset() and dir_axes("增速") == frozenset()
+          and dir_axes("增量") == frozenset()
+          and dir_sign("国内铜冶炼新增产量增长5%至10万吨创年内新高") == 1
+          and dir_sign("国内铜冶炼新增产量下降5%至10万吨创年内新高") == -1
+          and len(_b9_merge("国内铜冶炼新增产量增长5%至10万吨创年内新高",
+                            "国内铜冶炼新增产量下降5%至10万吨创年内新高")) == 2,
+          f"新增={dir_axes('新增')} 增速={dir_axes('增速')}")
+
+    # B9-72: 涨跌互现同句双向 + 普通条目 4/4 不误伤 (U3-F-01)
+    _b9_fx_keep = [
+        ("涨跌互现", "沪铜涨跌互现市场情绪谨慎", "沪铜涨跌互现市场情绪谨慎观望", 1),
+        ("同向 上涨/上涨", "沪铜主力合约日内上涨1.2%现报73000元",
+         "沪铜主力合约日内上涨1.2%报73000元", 1),
+        ("单向词 vs 无词", "铜价上涨带动市场情绪回暖", "铜价带动市场情绪回暖", 1),
+        ("无方向词近邻", "国内现货铜报价小幅波动", "国内现货铜报价小幅波动中", 1),
+        ("增减持同现", "产业资本增减持公告集中披露", "产业资本增减持公告集中披露后", 1),
+    ]
+    _b9_fx_keep_kept = [(n, len(_b9_merge(a, b))) for n, a, b, _w in _b9_fx_keep]
+    check("B9-72 涨跌互现同句双向不误伤 + 普通条目 4/4 仍合并 (U3-F-01)",
+          dir_sign("沪铜涨跌互现市场情绪谨慎") == 0
+          and all(k == 1 for _n, k in _b9_fx_keep_kept),
+          str(_b9_fx_keep_kept))
+
+    # B9-73: 同花顺/新浪源级清洗保留比较符 (U3-F-02)
+    _b9_fx_http0 = globals()["http"]
+    _b9_fx_ts0 = globals()["parse_ts"]
+    _b9_fx_cmp = "升水<150元/吨，贴水>50元"
+    try:
+        globals()["parse_ts"] = lambda _v: 1793800000
+        globals()["http"] = lambda *a, **k: json.dumps(
+            {"data": {"list": [{"title": _b9_fx_cmp, "digest": "", "ctime": "x"}]}},
+            ensure_ascii=False).encode()
+        _b9_fx_ths = src_ths()
+        globals()["http"] = lambda *a, **k: json.dumps(
+            {"result": {"data": {"feed": {"list": [
+                {"rich_text": _b9_fx_cmp, "create_time": "x"}]}}}},
+            ensure_ascii=False).encode()
+        _b9_fx_sina = src_sina()
+    finally:
+        globals()["http"] = _b9_fx_http0
+        globals()["parse_ts"] = _b9_fx_ts0
+    check("B9-73 同花顺/新浪源级清洗保留比较符 (升水<150…贴水>50, U3-F-02)",
+          [it["text"] for it in _b9_fx_ths] == [_b9_fx_cmp]
+          and [it["text"] for it in _b9_fx_sina] == [_b9_fx_cmp],
+          f"ths={_b9_fx_ths} sina={_b9_fx_sina}")
+
+    # B9-74: clean_text 剥除注释/处理指令, 且不破坏比较符 (U3-F-03)
+    check("B9-74 clean_text 剥除 <!-- --> 与 <?xml ?> 且保留比较符 (U3-F-03)",
+          clean_text("<!-- <b>x</b> -->text") == "text"
+          and clean_text('<?xml version="1.0"?>text') == "text"
+          and clean_text("升水<150元/吨，贴水>50元") == "升水<150元/吨，贴水>50元",
+          repr(clean_text("<!-- <b>x</b> -->text")))
+
+    # B9-75: 13 对逐对否决 (每对 1 例). 准确口径: 11 条中文轴 + 2 对扩展
+    # (累增/回落、升水/贴水); 补 8 对反义缺口后 DIR_AXES 共覆盖 21 对.
+    _b9_fx_pairs13 = [
+        ("涨/跌", "沪铜主力合约日内大涨5%现报73000元",
+         "沪铜主力合约日内大跌5%现报73000元"),
+        ("增/减", "上海期货交易所指定交割仓库铜库存增加12万吨",
+         "上海期货交易所指定交割仓库铜库存减少12万吨"),
+        ("升/降", "上海有色网现货铜价格今日上升2%报73000元",
+         "上海有色网现货铜价格今日下降2%报73000元"),
+        ("上调/下调", "高盛上调铜目标价至9000美元", "高盛下调铜目标价至9000美元"),
+        ("扩张/收缩", "国内铜冶炼产能扩张10万吨项目正式投产运行",
+         "国内铜冶炼产能收缩10万吨项目正式投产运行"),
+        ("累库/去库", "上期所铜库存累库2万吨", "上期所铜库存去库2万吨"),
+        ("增产/减产", "OPEC+增产50万桶/日", "OPEC+减产50万桶/日"),
+        ("增加/减少", "上海期货交易所铜库存增加1万吨至10万吨",
+         "上海期货交易所铜库存减少1万吨至10万吨"),
+        ("上涨/下跌", "沪铜主力合约日内上涨1.2%现报73000元/吨",
+         "沪铜主力合约日内下跌1.2%现报73000元/吨"),
+        ("上升/下降", "中钢协钢材库存上升3%当前处于近四年以来高位",
+         "中钢协钢材库存下降3%当前处于近四年以来高位"),
+        ("走高/走低", "螺纹钢期货主力合约走高2%现报3500元/吨",
+         "螺纹钢期货主力合约走低2%现报3500元/吨"),
+        ("累增/回落", "上期所铜库存累增2万吨至10万吨创近期新高",
+         "上期所铜库存回落2万吨至10万吨创近期新高"),
+        ("升水/贴水", "沪铜现货升水150元/吨", "沪铜现货贴水150元/吨"),
+    ]
+    _b9_fx_pairs_kept = [(name, len(_b9_merge(a, b))) for name, a, b in _b9_fx_pairs13]
+    check("B9-75 方向否决: 13 对逐对断言 (11 轴 + 2 扩展, 每对 1 例, U3-F-04)",
+          len(_b9_fx_pairs13) == 13 and all(k == 2 for _n, k in _b9_fx_pairs_kept),
+          str([n for n, k in _b9_fx_pairs_kept if k != 2]))
+
+    # ==== Batch 9 U4: 状态机与落盘 (B9-40..53) ====
+    # B9-40: 健康空轮 (D-F-01)
+    with tempfile.TemporaryDirectory() as _td:
+        _clk = _B6Clock(1793800000)
+        _b9_none = lambda deadline=None: []
+        _rc, _pay, _stt, _q, _cfg = _b6_run_main(
+            Path(_td), _clk, [("S0", _b9_none), ("S1", _b9_none)],
+            state={"seedmarker": 1})
+    check("B9-40 全源健康但 0 条: rc=0 / 零发送 / 不置 _alert (D-F-01)",
+          _rc == 0 and not _pay and "_alert" not in _stt,
+          f"rc={_rc} sends={_pay} state={_stt}")
+
+    # B9-41: 部分失败 + 健康 0 条文案 (D-F-01)
+    with tempfile.TemporaryDirectory() as _td:
+        _clk = _B6Clock(1793800000)
+
+        def _b9_boom(deadline=None):
+            raise RuntimeError("boom")
+
+        _rc, _pay, _stt, _q, _cfg = _b6_run_main(
+            Path(_td), _clk, [("S0", _b9_boom), ("S1", _b9_none)],
+            state={"seedmarker": 1})
+    _b9_txt = _pay[0] if _pay else ""
+    check("B9-41 部分失败+健康0条: 文案降级为「部分失败」而非「全部」",
+          _rc == 1 and len(_pay) == 1 and "部分失败且无可用条目" in _b9_txt
+          and "全部抓取失败" not in _b9_txt, f"rc={_rc} txt={_b9_txt!r}")
+
+    # B9-42/43: next_try 护栏 (D-F-02)
+    def _b9_run_nt(next_try):
+        with tempfile.TemporaryDirectory() as _td:
+            _clk = _B6Clock(1793800000)
+
+            def _one(deadline=None):
+                return [{"src": "S0", "ts": int(_clk.time()) - 60,
+                         "text": "沪铜库存变化1吨环比1%"}]
+
+            return _b6_run_main(
+                Path(_td), _clk, [("S0", _one)],
+                conf_extra={"digest_max_items": 1},
+                state={"seedmarker": 1,
+                       "_digest": {"last_flush": 1793800000 - 60, "fails": 1,
+                                   "next_try": next_try}})
+
+    _rc, _pay, _stt, _q, _cfg = _b9_run_nt(1793800000 + 7200)
+    check("B9-42 next_try 超出 RA_MAX+60 的未来值: 按无退避, 本轮即恢复发送 (D-F-02)",
+          _rc == 0 and len(_pay) == 1
+          and not (_stt.get("_digest") or {}).get("next_try"),
+          f"rc={_rc} sends={_pay} meta={_stt.get('_digest')}")
+    _rc, _pay, _stt, _q, _cfg = _b9_run_nt(1793800000 + 600)
+    check("B9-43 合法退避 (600s <= RA_MAX) 不被护栏重置 (不变式)",
+          _rc == 0 and not _pay and len(_q) == 1,
+          f"rc={_rc} sends={_pay} queue={len(_q)}")
+
+    # B9-44: 恢复通知失败保留 _alert (D-F-03)
+    _b9_clock = _B6Clock(1793800000)
+    _b9_time0 = globals()["time"]
+    _b9_send_r = globals()["send"]
+    _b9_rs_r = ROUND_START
+    _b9_sent_r: list[int] = []
+    try:
+        globals()["time"] = _b9_clock
+        globals()["ROUND_START"] = _b9_clock.mono
+        globals()["send"] = lambda text, conf, tk, depth=0: False
+        _b9_st_r = {"_alert": {"failing": True, "since": 1793790000, "rounds": 3,
+                               "last_sent": 1793790000, "alerts": 1}}
+        _b9_ret1 = note_recovered(_b9_st_r, {"chat_id": 1}, "tk", False)
+        _b9_al1 = dict(_b9_st_r.get("_alert") or {})
+        globals()["send"] = lambda text, conf, tk, depth=0: (_b9_sent_r.append(1) or True)
+        _b9_ret2 = note_recovered(_b9_st_r, {"chat_id": 1}, "tk", False)
+        _b9_al2 = dict(_b9_st_r.get("_alert") or {})
+    finally:
+        globals()["time"] = _b9_time0
+        globals()["send"] = _b9_send_r
+        globals()["ROUND_START"] = _b9_rs_r
+    check("B9-44 恢复通知发送失败: 保留 failing/rounds, 下轮重试成功才复位 (D-F-03)",
+          _b9_ret1 is False and _b9_al1.get("failing") is True
+          and _b9_al1.get("rounds") == 3
+          and _b9_ret2 is True and _b9_al2.get("failing") is False,
+          f"{_b9_ret1} {_b9_al1} {_b9_ret2} {_b9_al2}")
+
+    # B9-45: --seed 落盘失败保留 pending (D-F-04)
+    _b9_pend_probe: list[bool] = []
+    _b9_save0 = globals()["save_json"]
+    with tempfile.TemporaryDirectory() as _td:
+        _clk = _B6Clock(1793800000)
+
+        def _b9_seed_src(deadline=None):
+            return [{"src": "S0", "ts": int(_clk.time()) - 60,
+                     "text": "沪铜库存变化1吨环比1%"}]
+
+        def _b9_save_fail(path, data, tries=3):
+            if path == globals()["STATE"]:
+                return False
+            return _b9_save0(path, data, tries)
+
+        try:
+            globals()["save_json"] = _b9_save_fail
+            _b6_run_main(Path(_td), _clk, [("S0", _b9_seed_src)],
+                         state={}, args=["--seed"], pending=["k-old"],
+                         pending_probe=_b9_pend_probe)
+        finally:
+            globals()["save_json"] = _b9_save0
+    check("B9-45 --seed 落盘失败: pending 文件保留 (D-F-04)",
+          _b9_pend_probe == [True], str(_b9_pend_probe))
+
+    # B9-46: rc=5 前补 stale 记账 (D-F-05)
+    _b9_stale_calls: list[int] = []
+    _b9_rs0 = globals()["record_stale"]
+    _b9_ps0 = globals()["persist_state"]
+    with tempfile.TemporaryDirectory() as _td:
+        _clk = _B6Clock(1793800000)
+
+        def _b9_one46(deadline=None):
+            return [{"src": "S0", "ts": int(_clk.time()) - 60,
+                     "text": "沪铜库存变化1吨环比1%"}]
+
+        try:
+            globals()["record_stale"] = lambda *a, **k: _b9_stale_calls.append(1)
+            globals()["persist_state"] = lambda seen: False
+            _rc, _pay, _stt, _q, _cfg = _b6_run_main(
+                Path(_td), _clk, [("S0", _b9_one46)],
+                conf_extra={"digest_max_items": 1}, state={"seedmarker": 1},
+                args=["--flush-now"])
+        finally:
+            globals()["record_stale"] = _b9_rs0
+            globals()["persist_state"] = _b9_ps0
+    check("B9-46 rc=5 前补 stale 记账 (D-F-05)",
+          _rc == 5 and _b9_stale_calls == [1] and len(_pay) == 1,
+          f"rc={_rc} stale={_b9_stale_calls} sends={len(_pay)}")
+
+    # B9-47: --flush-now 空队列 state 落盘失败返回 5 (D-F-06)
+    with tempfile.TemporaryDirectory() as _td:
+        _clk = _B6Clock(1793800000)
+
+        def _b9_filtered(deadline=None):
+            return [{"src": "S0", "ts": int(_clk.time()) - 60,
+                     "text": "英伟达美股盘前涨超2%"}]
+
+        try:
+            globals()["persist_state"] = lambda seen: False
+            _rc, _pay, _stt, _q, _cfg = _b6_run_main(
+                Path(_td), _clk, [("S0", _b9_filtered)],
+                state={"seedmarker": 1}, args=["--flush-now"])
+        finally:
+            globals()["persist_state"] = _b9_ps0
+    check("B9-47 --flush-now 空队列 state 落盘失败: rc=5 (D-F-06)",
+          _rc == 5 and not _pay, f"rc={_rc} sends={_pay}")
+
+    # B9-48: prune 白名单 (A-D-08①)
+    check("B9-48 prune 只保留显式 META_KEYS (未知 '_' 键被当数据)",
+          prune({"_alert": 1, "_digest": 2, "_day": 3, "_src_fail": 4,
+                 "_research": 5, "_rogue": 6, "k": 7})
+          == {"k": 7, "_alert": 1, "_digest": 2, "_day": 3, "_src_fail": 4, "_research": 5},
+          str(prune({"_rogue": 6, "k": 7})))
+
+    # B9-49: pending 损坏 .bad- 备份 (D-D-01)
+    _b9_p0 = globals()["PENDING"]
+    with tempfile.TemporaryDirectory() as _td:
+        try:
+            globals()["PENDING"] = Path(_td) / "pending.json"
+            globals()["PENDING"].write_text("{bad json")
+            _b9_keys = take_pending()
+            _b9_bad = list(Path(_td).glob("pending.json.bad-*"))
+        finally:
+            globals()["PENDING"] = _b9_p0
+    check("B9-49 pending 损坏对齐 .bad- 备份取证 (D-D-01)",
+          _b9_keys == [] and len(_b9_bad) == 1,
+          f"{_b9_keys} {[p.name for p in _b9_bad]}")
+
+    # B9-50: _src_fail 下线源清理 (D-D-02)
+    _b9_psf = globals().get("prune_src_fail")
+    _b9_sf = {SRC_FAIL_KEY: {"财联社": {"rounds": 1}, "已下线源": {"rounds": 9}}}
+    _b9_psf_ret = _b9_psf(_b9_sf) if callable(_b9_psf) else "missing"
+    check("B9-50 已下线/改名源的 _src_fail 残留被清理 (D-D-02)",
+          _b9_psf_ret is True and set(src_fail_state(_b9_sf)) == {"财联社"},
+          f"{_b9_psf_ret} {_b9_sf}")
+
+    # B9-51: 检视模式不发送 (D-D-03)
+    _b9_insp: list[str] = []
+    _b9_send_i = globals()["send"]
+    with tempfile.TemporaryDirectory() as _td:
+        _clk = _B6Clock(1793800000)
+
+        def _b9_one51(deadline=None):
+            return [{"src": "S0", "ts": int(_clk.time()) - 60,
+                     "text": "沪铜库存变化1吨环比1%"}]
+
+        def _b9_boom51(deadline=None):
+            raise RuntimeError("boom")
+
+        try:
+            globals()["send"] = lambda text, conf, tk, depth=0: (_b9_insp.append(text) or True)
+            _b6_run_main(Path(_td), _clk, [("S0", _b9_one51)],
+                         conf_extra={"digest_max_items": 1},
+                         state={"seedmarker": 1,
+                                "_digest": {"last_flush": 1793800000 - 3600, "fails": 1}},
+                         args=["--stats"])
+            _b9_n_stats = len(_b9_insp)
+            _b9_insp.clear()
+            _b6_run_main(Path(_td), _clk, [("S0", _b9_boom51), ("S1", _b9_one51)],
+                         conf_extra={"digest_max_items": 1, "src_alert_rounds": 3},
+                         state={"seedmarker": 1,
+                                SRC_FAIL_KEY: {"S0": {"rounds": 2, "since": 1,
+                                                      "last_err": "old"}}},
+                         args=["--queue"])
+            _b9_n_queue = len(_b9_insp)
+        finally:
+            globals()["send"] = _b9_send_i
+    check("B9-51 --stats/--queue 检视模式零发送 (D-D-03)",
+          _b9_n_stats == 0 and _b9_n_queue == 0,
+          f"stats={_b9_n_stats} queue={_b9_n_queue}")
+
+    # B9-52: day_counter bool (RA-F-06)
+    _b9_bd = {"_day": {"date": "2026-11-09", "msgs": True}}
+    _b9_d = day_counter(_b9_bd, "2026-11-09")
+    check("B9-52 day_counter 把 bool 归一为 int (RA-F-06)",
+          _b9_d["msgs"] == 1 and not isinstance(_b9_d["msgs"], bool),
+          repr(_b9_d["msgs"]))
+
+    # B9-53: batch8.1 阈值 (SRC_ALERT_ROUNDS = 6)
+    check("B9-53 SRC_ALERT_ROUNDS=6 且默认/显式覆盖都正确 (batch8.1)",
+          SRC_ALERT_ROUNDS == 6 and src_alert_rounds({}) == 6
+          and src_alert_rounds({"src_alert_rounds": 3}) == 3,
+          f"{SRC_ALERT_ROUNDS}/{src_alert_rounds({})}")
+
+    # ==== batch9-fix U4: 检视模式零落盘 / rc=0 / 备份冲突 (U4-F-01..F-03) ====
+    # B9-76: --stats/--queue 遇损坏 pending/queue: 只读, 不改名、不写 state (U4-F-01)
+    _b9_fx_badjson = "{bad json"
+    _b9_fx_st = {"seedmarker": 1}
+    with tempfile.TemporaryDirectory() as _td:
+        _clk = _B6Clock(1793800000)
+
+        def _b9_fx_one(deadline=None):
+            return [{"src": "S0", "ts": int(_clk.time()) - 60,
+                     "text": "沪铜库存变化1吨环比1%"}]
+
+        _rcq, _payq, _stq, _qq, _cfgq = _b6_run_main(
+            Path(_td), _clk, [("S0", _b9_fx_one)],
+            conf_extra={"digest_max_items": 1}, state=_b9_fx_st,
+            args=["--queue"], queue_raw=_b9_fx_badjson)
+        _fx_qp = Path(_td) / "state" / "queue.json"
+        _fx_qbad = list((Path(_td) / "state").glob("queue.json.bad-*"))
+        _fx_qraw_ok = _fx_qp.exists() and _fx_qp.read_text() == _b9_fx_badjson
+        _fx_state_q_ok = _stq == _b9_fx_st
+    with tempfile.TemporaryDirectory() as _td:
+        _clk = _B6Clock(1793800000)
+
+        def _b9_fx_one2(deadline=None):
+            return [{"src": "S0", "ts": int(_clk.time()) - 60,
+                     "text": "沪铜库存变化1吨环比1%"}]
+
+        _rcs, _pays, _sts, _qs, _cfgs = _b6_run_main(
+            Path(_td), _clk, [("S0", _b9_fx_one2)],
+            conf_extra={"digest_max_items": 1}, state=_b9_fx_st,
+            args=["--stats"], pending_raw=_b9_fx_badjson)
+        _fx_pp = Path(_td) / "state" / "pending.json"
+        _fx_pbad = list((Path(_td) / "state").glob("pending.json.bad-*"))
+        _fx_praw_ok = _fx_pp.exists() and _fx_pp.read_text() == _b9_fx_badjson
+        _fx_state_p_ok = _sts == _b9_fx_st
+    check("B9-76 --stats/--queue 遇损坏 queue/pending 零落盘: 不改名/不写 state (U4-F-01)",
+          _rcq == 0 and not _payq and _fx_qraw_ok and not _fx_qbad and _fx_state_q_ok
+          and _rcs == 0 and not _pays and _fx_praw_ok and not _fx_pbad and _fx_state_p_ok,
+          f"rcq={_rcq} qbad={[p.name for p in _fx_qbad]} "
+          f"rcs={_rcs} pbad={[p.name for p in _fx_pbad]}")
+
+    # B9-77: 检视模式遇到全源失败 rc 仍为 0 (U4-F-02)
+    _b9_fx_rc_inspect: list[tuple[str, int, int]] = []
+    for _b9_fx_flag in ("--stats", "--queue"):
+        with tempfile.TemporaryDirectory() as _td:
+            _clk = _B6Clock(1793800000)
+
+            def _b9_fx_boom(deadline=None):
+                raise RuntimeError("boom")
+
+            _rc, _pay, _stt, _q, _cfg = _b6_run_main(
+                Path(_td), _clk, [("S0", _b9_fx_boom), ("S1", _b9_fx_boom)],
+                state=_b9_fx_st, args=[_b9_fx_flag])
+            _b9_fx_rc_inspect.append((_b9_fx_flag, _rc, len(_pay)))
+    check("B9-77 检视模式全源失败仍 rc=0 且零发送/零落盘 (U4-F-02)",
+          [(f, rc, n) for f, rc, n in _b9_fx_rc_inspect]
+          == [("--stats", 0, 0), ("--queue", 0, 0)],
+          str(_b9_fx_rc_inspect))
+
+    # B9-78: 同一秒两次损坏 -> 两份 .bad- 备份都保留 (U4-F-03)
+    _b9_p0 = globals()["PENDING"]
+    _b9_time0 = globals()["time"]
+    with tempfile.TemporaryDirectory() as _td:
+        try:
+            globals()["PENDING"] = Path(_td) / "pending.json"
+            globals()["time"] = _B6Clock(1793800000)
+            globals()["PENDING"].write_text("{bad-1")
+            take_pending()
+            globals()["PENDING"].write_text("{bad-2")
+            take_pending()
+            _b9_fx_bads = sorted(p.name for p in Path(_td).glob("pending.json.bad-*"))
+        finally:
+            globals()["PENDING"] = _b9_p0
+            globals()["time"] = _b9_time0
+    check("B9-78 同一秒两次损坏: 备份名冲突加序号, 两份都留 (U4-F-03)",
+          len(_b9_fx_bads) == 2 and len(set(_b9_fx_bads)) == 2,
+          str(_b9_fx_bads))
+
+    # B9-79 (R8 重写): 旧版读全文比对自己写进 check 的源码字面量 -> 自指恒真 (R7 F-02);
+    # 改为行为断言: 发送成功后 state 落盘失败必须写 pending 标记并返回 rc=5 (U1-3 块 + U4-9).
+    _b9_k79 = dedupe_key("沪铜库存变化1吨环比1%")
+    _b9_wp79: list[list[str]] = []
+    _b9_wp0 = globals()["write_pending"]
+    _b9_ps79 = globals()["persist_state"]
+    with tempfile.TemporaryDirectory() as _td:
+        _clk = _B6Clock(1793800000)
+
+        def _b9_one79(deadline=None):
+            return [{"src": "S0", "ts": int(_clk.time()) - 60,
+                     "text": "沪铜库存变化1吨环比1%"}]
+
+        try:
+            globals()["write_pending"] = lambda keys: (_b9_wp79.append(list(keys)) or True)
+            globals()["persist_state"] = lambda seen: False
+            _rc79, _pay79, _stt79, _q79, _cfg79 = _b6_run_main(
+                Path(_td), _clk, [("S0", _b9_one79)],
+                conf_extra={"digest_max_items": 1}, state={"seedmarker": 1},
+                args=["--flush-now"])
+        finally:
+            globals()["write_pending"] = _b9_wp0
+            globals()["persist_state"] = _b9_ps79
+    check("B9-79 发送成功后 state 落盘失败: 写 pending 标记且 rc=5 (U1-F-02 行为断言)",
+          _rc79 == 5 and len(_pay79) == 1 and _b9_wp79 == [[_b9_k79]],
+          f"rc={_rc79} sends={len(_pay79)} pending={_b9_wp79} key={_b9_k79!r}")
+
+    # ==== Batch 9 U5: 测试与卫生 (B9-60..64) ====
+    # B9-60: ROUND_START 不泄漏 (RA-F-05)
+    _b9_rs_sentinel = 4242.0
+    _b9_rs_keep = ROUND_START
+    with tempfile.TemporaryDirectory() as _td:
+        _clk = _B6Clock(1793800000)
+
+        def _b9_rs_src(deadline=None):
+            return [{"src": "S0", "ts": int(_clk.time()) - 60,
+                     "text": "沪铜库存变化1吨环比1%"}]
+
+        try:
+            globals()["ROUND_START"] = _b9_rs_sentinel
+            _b6_run_main(Path(_td), _clk, [("S0", _b9_rs_src)], state={"seedmarker": 1})
+            _b9_rs_after = ROUND_START
+        finally:
+            globals()["ROUND_START"] = _b9_rs_keep
+    check("B9-60 _b6_run_main 还原 ROUND_START (RA-F-05)",
+          _b9_rs_after == _b9_rs_sentinel, repr(_b9_rs_after))
+
+    # B9-61: send 探针不泄漏 SEND_ERR / SEND_RETRY_AFTER (RA-F-05)
+    _b9_e0, _b9_ra0 = SEND_ERR, SEND_RETRY_AFTER
+    try:
+        globals()["SEND_ERR"] = "sentinel-e"
+        globals()["SEND_RETRY_AFTER"] = 777.0
+        _send_retry_ok()
+        _b9_e1, _b9_ra1 = SEND_ERR, SEND_RETRY_AFTER
+        globals()["SEND_ERR"] = "sentinel-e2"
+        globals()["SEND_RETRY_AFTER"] = 778.0
+        _send_429("120")
+        _b9_e2, _b9_ra2 = SEND_ERR, SEND_RETRY_AFTER
+    finally:
+        globals()["SEND_ERR"], globals()["SEND_RETRY_AFTER"] = _b9_e0, _b9_ra0
+    check("B9-61 send 探针还原 SEND_ERR / SEND_RETRY_AFTER (RA-F-05)",
+          (_b9_e1, _b9_ra1) == ("sentinel-e", 777.0)
+          and (_b9_e2, _b9_ra2) == ("sentinel-e2", 778.0),
+          f"{_b9_e1}/{_b9_ra1} {_b9_e2}/{_b9_ra2}")
+
+    # B9-62: main 每轮调用 source_health (迁移自 Q9)
+    _b9_sh_calls: list[int] = []
+    _b9_sh0 = globals()["source_health"]
+    with tempfile.TemporaryDirectory() as _td:
+        _clk = _B6Clock(1793800000)
+
+        def _b9_sh_src(deadline=None):
+            return [{"src": "S0", "ts": int(_clk.time()) - 60,
+                     "text": "沪铜库存变化1吨环比1%"}]
+
+        try:
+            globals()["source_health"] = lambda *a, **k: (_b9_sh_calls.append(1) or False)
+            _b6_run_main(Path(_td), _clk, [("S0", _b9_sh_src)], state={"seedmarker": 1})
+        finally:
+            globals()["source_health"] = _b9_sh0
+    check("U2 main 每轮调用 source_health", _b9_sh_calls == [1], str(_b9_sh_calls))
+
+    # B9-63: main 每轮调用 rotate_stderr (迁移自 Q10)
+    _b9_rot: list[int] = []
+    with tempfile.TemporaryDirectory() as _td:
+        _clk = _B6Clock(1793800000)
+
+        def _b9_rot_src(deadline=None):
+            return [{"src": "S0", "ts": int(_clk.time()) - 60,
+                     "text": "沪铜库存变化1吨环比1%"}]
+
+        _b6_run_main(Path(_td), _clk, [("S0", _b9_rot_src)], state={"seedmarker": 1},
+                     rotate_hook=lambda: _b9_rot.append(1))
+    check("U3 main 每轮调用 rotate_stderr", _b9_rot == [1], str(_b9_rot))
+
+    # B9-64: main 预算耗尽走 SRC_SKIP 且不当失败 (迁移自 Q12)
+    _b9_skip_calls: list[int] = []
+    with tempfile.TemporaryDirectory() as _td:
+        _clk = _B6Clock(1793800000)
+
+        def _b9_slow64(deadline=None):
+            _clk.mono += 44.0
+            return [{"src": "S0", "ts": int(_clk.time()) - 60,
+                     "text": "沪铜库存变化1吨环比1%"}]
+
+        def _b9_never64(deadline=None):
+            _b9_skip_calls.append(1)
+            return []
+
+        _rc, _pay, _stt, _q, _cfg = _b6_run_main(
+            Path(_td), _clk, [("S0", _b9_slow64), ("S1", _b9_never64)],
+            conf_extra={"timeout_s": 45}, state={"seedmarker": 1})
+    check("B6 U4 main 预算耗尽分支改用 SRC_SKIP 哨兵",
+          _rc == 0 and not _b9_skip_calls and not _stt.get("_alert"),
+          f"rc={_rc} skipped_calls={_b9_skip_calls} state={_stt}")
+
+    # ==== Batch 10 R8: 断言体系收口 (F-01 R5/R6 / D-2 / D-4 / B9-79 行为化) ====
+    # 只加/换断言, 不改生产行为; 全部离线 (打桩 subprocess/tg/假时钟; 不写真实 state/queue).
+
+    # ---- R8 F-01(R5): http() 缺 returncode/stdout 的 fail-closed 契约 (仓内行为断言) ----
+    class _R8NoRc:
+        def __init__(self, out):
+            self.stdout = out
+
+    class _R8NoOut:
+        def __init__(self, rc):
+            self.returncode = rc
+
+    class _R8Ok:
+        def __init__(self, out, rc):
+            self.stdout = out
+            self.returncode = rc
+
+    _r8_run0 = subprocess.run
+    _r8_calls: list[int] = []
+    _r8_exc = ""
+    try:
+        subprocess.run = lambda cmd, **kw: (_r8_calls.append(1) or _R8NoRc(b"ok\n200"))
+        try:
+            http("https://x/y")
+        except Exception as _e:
+            _r8_exc = type(_e).__name__
+    finally:
+        subprocess.run = _r8_run0
+    check("R8-F01a http 结果缺 returncode: HttpContractError 且只调用 1 次 (R5 fail-closed)",
+          _r8_exc == "HttpContractError" and len(_r8_calls) == 1,
+          f"exc={_r8_exc} calls={len(_r8_calls)}")
+    _r8_calls.clear()
+    _r8_exc = ""
+    try:
+        subprocess.run = lambda cmd, **kw: (_r8_calls.append(1) or _R8NoOut(0))
+        try:
+            http("https://x/y")
+        except Exception as _e:
+            _r8_exc = type(_e).__name__
+    finally:
+        subprocess.run = _r8_run0
+    check("R8-F01b http 结果缺 stdout: HttpContractError 且只调用 1 次 (不重试)",
+          _r8_exc == "HttpContractError" and len(_r8_calls) == 1,
+          f"exc={_r8_exc} calls={len(_r8_calls)}")
+    _r8_calls.clear()
+    _r8_body = None
+    _r8_msg = ""
+    try:
+        subprocess.run = lambda cmd, **kw: (_r8_calls.append(1) or _R8Ok(b"ok\n200", 0))
+        _r8_body = http("https://x/y")
+        subprocess.run = lambda cmd, **kw: (_r8_calls.append(1) or _R8Ok(b"", 63))
+        try:
+            http("https://x/y", tries=1)
+        except RuntimeError as _e:
+            _r8_msg = str(_e)
+    finally:
+        subprocess.run = _r8_run0
+    check("R8-F01c 正常桩返回体不变 + 非 0 rc 仍按失败映射 (rc 语义)",
+          _r8_body == b"ok" and "curl rc=63" in _r8_msg,
+          f"body={_r8_body!r} msg={_r8_msg!r}")
+
+    # ---- R8 D-2: flush_round 依赖默认 SendContext 的同一存储 (行为) ----
+    _r8_sc = SendContext()
+    _r8_e0, _r8_ra0 = SEND_ERR, SEND_RETRY_AFTER
+    try:
+        globals()["SEND_ERR"] = "A"
+        _r8_d2a = _r8_sc.err
+        _r8_sc.err = "B"
+        _r8_d2b = SEND_ERR
+        globals()["SEND_RETRY_AFTER"] = 12.5
+        _r8_d2c = _r8_sc.retry_after
+        _r8_d2d = _DEFAULT_SEND.err == "B" and _DEFAULT_SEND.retry_after == 12.5
+    finally:
+        globals()["SEND_ERR"], globals()["SEND_RETRY_AFTER"] = _r8_e0, _r8_ra0
+    check("R8-D2a 新建 SendContext 与 _DEFAULT_SEND 同存储 (双向写穿)",
+          _r8_d2a == "A" and _r8_d2b == "B" and _r8_d2c == 12.5 and _r8_d2d,
+          f"{_r8_d2a!r}/{_r8_d2b!r}/{_r8_d2c!r}/{_r8_d2d}")
+
+    _r8_now = int(time.time())
+    _r8_plan = DigestPlan(
+        rc=None,
+        queue=[{"key": "r8d2key", "src": "S0", "ts": _r8_now - 60,
+                "text": "沪铜库存变化1吨环比1%"}],
+        meta={}, day={}, due=True, now_f=float(_r8_now), now_ts=_r8_now,
+        max_age=10800, digest_items=40, digest_min_items=3, max_hold=2700,
+        waited=2000.0, interval=1800, oldest_age=60.0, next_try=0.0)
+    _r8_opts = RunOpts(
+        dry=False, seed=False, stats=False, explain=False, force_flush=False,
+        show_queue=False, inspect=False, digest_items=40, digest_min_items=3,
+        max_hold=2700, digest_min=30, keywords=DEFAULT_KEYWORDS,
+        use_filter=True, budget=45)
+    _r8_seen = {"seedmarker": 1}
+    _r8_send0 = globals()["send"]
+    _r8_ps0 = globals()["persist_state"]
+    _r8_sq0 = globals()["save_queue"]
+    _r8_cp0 = globals()["clear_pending"]
+    _r8_wp0 = globals()["write_pending"]
+    _r8_rs0 = globals()["record_stale"]
+    _r8_stderr0 = sys.stderr
+    _r8_rs_start = ROUND_START
+    _r8_buf = io.StringIO()
+    _r8_d2_rc = None
+    try:
+        def _r8_send_boom(text, conf, tk, depth=0):
+            _DEFAULT_SEND.err = "boom-D2"
+            return False
+
+        globals()["send"] = _r8_send_boom
+        globals()["persist_state"] = lambda seen: True
+        globals()["save_queue"] = lambda items: True
+        globals()["clear_pending"] = lambda: None
+        globals()["write_pending"] = lambda keys: True
+        globals()["record_stale"] = lambda *a, **k: None
+        globals()["ROUND_START"] = time.monotonic()
+        sys.stderr = _r8_buf
+        _r8_d2_rc = flush_round({"chat_id": 1}, _r8_opts, _r8_seen, _r8_plan,
+                                "tk", [], _DEFAULT_ROUND, SendContext())
+    finally:
+        sys.stderr = _r8_stderr0
+        globals()["send"] = _r8_send0
+        globals()["persist_state"] = _r8_ps0
+        globals()["save_queue"] = _r8_sq0
+        globals()["clear_pending"] = _r8_cp0
+        globals()["write_pending"] = _r8_wp0
+        globals()["record_stale"] = _r8_rs0
+        globals()["ROUND_START"] = _r8_rs_start
+    _r8_errline = _r8_buf.getvalue()
+    check("R8-D2b 未显式传 ctx 的 send 失败原因经 send_ctx 可读 (默认 _DEFAULT_SEND 同存储)",
+          _r8_d2_rc == 2 and "boom-D2" in _r8_errline,
+          f"rc={_r8_d2_rc} stderr={_r8_errline!r}")
+
+    # ---- R8 F-01(R6): 12 个命名常量的行为型钉子 (改值 -> 对应场景结果变) ----
+    check("R8-C01 send_backoff_s 序列 120/240/480/960/1800 封顶 (RETRY_BASE/MAX/EXP)",
+          [send_backoff_s(n) for n in range(7)] == [120, 240, 480, 960, 1800, 1800, 1800]
+          and RETRY_MAX_S == RA_MAX == 1800,
+          str([send_backoff_s(n) for n in range(7)]))
+
+    def _r8_backoff_delta(fails0):
+        _ra_keep = SEND_RETRY_AFTER
+        _send0 = globals()["send"]
+        with tempfile.TemporaryDirectory() as _td:
+            _clk = _B6Clock(1793800000)
+
+            def _one(deadline=None):
+                return [{"src": "S0", "ts": int(_clk.time()) - 60,
+                         "text": "沪铜库存变化1吨环比1%"}]
+
+            try:
+                globals()["SEND_RETRY_AFTER"] = None
+                globals()["send"] = lambda text, conf, tk, depth=0: False
+                _rc, _pay, _stt, _q, _cfg = _b6_run_main(
+                    Path(_td), _clk, [("S0", _one)],
+                    conf_extra={"digest_max_items": 1},
+                    state={"seedmarker": 1,
+                           "_digest": {"last_flush": 1793800000 - 3600,
+                                       "fails": fails0}})
+            finally:
+                globals()["send"] = _send0
+                globals()["SEND_RETRY_AFTER"] = _ra_keep
+        return to_float((_stt.get("_digest") or {}).get("next_try")) - 1793800000.0
+
+    _r8_d1 = _r8_backoff_delta(0)
+    _r8_d4 = _r8_backoff_delta(3)
+    check("R8-C02 flush_round 首败退避 240s / 第 4 败封顶 1800s (调用点行为)",
+          _r8_d1 == 240.0 and _r8_d4 == 1800.0,
+          f"fails1={_r8_d1} fails4={_r8_d4}")
+
+    def _r8_research_ran(offset):
+        _calls: list[int] = []
+        with tempfile.TemporaryDirectory() as _td:
+            _clk = _B6Clock(1793800000)
+
+            def _rep(deadline=None):
+                _calls.append(1)
+                return []
+
+            _b6_run_main(Path(_td), _clk, [("东财研报", _rep)],
+                         state={"seedmarker": 1,
+                                "_research": {"东财研报": 1793800000 + offset}})
+        return len(_calls)
+
+    _r8_re61, _r8_re60 = _r8_research_ran(61), _r8_research_ran(60)
+    check("R8-C03 研报节流时间戳 +61s 视为未来重跑 / +60s 按合法节流跳过 (ROLLBACK_TOL_S 边界)",
+          _r8_re61 == 1 and _r8_re60 == 0, f"+61={_r8_re61} +60={_r8_re60}")
+
+    def _r8_last_flush(offset):
+        with tempfile.TemporaryDirectory() as _td:
+            _clk = _B6Clock(1793800000)
+
+            def _one(deadline=None):
+                return [{"src": "S0", "ts": int(_clk.time()) - 60,
+                         "text": "沪铜库存变化1吨环比1%"}]
+
+            _rc, _pay, _stt, _q, _cfg = _b6_run_main(
+                Path(_td), _clk, [("S0", _one)],
+                state={"seedmarker": 1,
+                       "_digest": {"last_flush": 1793800000 + offset}})
+        return to_float((_stt.get("_digest") or {}).get("last_flush"))
+
+    _r8_lf61, _r8_lf60 = _r8_last_flush(61), _r8_last_flush(60)
+    check("R8-C04 last_flush 未来 +61s 重置为当前 / +60s 保留 (ROLLBACK_TOL_S 边界)",
+          _r8_lf61 == 1793800000.0 and _r8_lf60 == 1793800060.0,
+          f"+61={_r8_lf61} +60={_r8_lf60}")
+
+    def _r8_block_acc(offset):
+        with tempfile.TemporaryDirectory() as _td:
+            _clk = _B6Clock(1793800000)
+
+            def _one(deadline=None):
+                return [{"src": "S0", "ts": int(_clk.time()) - 60,
+                         "text": "沪铜库存变化1吨环比1%"}]
+
+            _rc, _pay, _stt, _q, _cfg = _b6_run_main(
+                Path(_td), _clk, [("S0", _one)],
+                state={"seedmarker": 1,
+                       "_digest": {"last_round": 1793800000 + offset,
+                                   "last_flush": 1793800000 - 1800,
+                                   "block_acc": 0.0, "next_try": 0}})
+        return to_float((_stt.get("_digest") or {}).get("block_acc"))
+
+    _r8_ba61, _r8_ba60 = _r8_block_acc(61), _r8_block_acc(60)
+    check("R8-C05 last_round 未来 +61s 记 block_acc / +60s 不记 (ROLLBACK_TOL_S 边界)",
+          _r8_ba61 > 0.0 and _r8_ba60 == 0.0,
+          f"+61={_r8_ba61} +60={_r8_ba60}")
+
+    def _r8_left_pending(waited):
+        with tempfile.TemporaryDirectory() as _td:
+            _clk = _B6Clock(1793800000)
+
+            def _one(deadline=None):
+                return [{"src": "S0", "ts": int(_clk.time()) - 60,
+                         "text": "沪铜库存变化1吨环比1%"}]
+
+            _rc, _pay, _stt, _q, _cfg = _b6_run_main(
+                Path(_td), _clk, [("S0", _one)],
+                state={"seedmarker": 1,
+                       "_digest": {"last_flush": 1793800000 - waited,
+                                   "left_pending": True}})
+        return len(_pay), len(_q)
+
+    _r8_lp60, _r8_lp59 = _r8_left_pending(60), _r8_left_pending(59)
+    check("R8-C06 left_pending 剩余待发: 60s 立即补发 / 59s 未到最短间隔 (LEFT_PENDING_RETRY_S)",
+          _r8_lp60 == (1, 0) and _r8_lp59 == (0, 1),
+          f"+60={_r8_lp60} +59={_r8_lp59}")
+
+    _r8_today = datetime.now(TZ_CN).strftime("%Y-%m-%d")
+    _r8_send_keep = globals()["send"]
+    try:
+        with tempfile.TemporaryDirectory() as _td:
+            _clk = _B6Clock(1793800000)
+
+            def _one(deadline=None):
+                return [{"src": "S0", "ts": int(_clk.time()) - 60,
+                         "text": "沪铜库存变化1吨环比1%"}]
+
+            try:
+                globals()["send"] = lambda text, conf, tk, depth=0: False
+                _rc, _pay, _stt, _q, _cfg = _b6_run_main(
+                    Path(_td), _clk, [("S0", _one)],
+                    state={"seedmarker": 1,
+                           "_day": {"date": _r8_today, "msgs": DAILY_MSG_CAP},
+                           "_digest": {"last_flush": 1793800000 - 60}})
+            finally:
+                globals()["send"] = _r8_send_keep
+    finally:
+        globals()["send"] = _r8_send_keep
+    _r8_cap_delta = to_float((_stt.get("_digest") or {}).get("next_try")) - 1793800000.0
+    check("R8-C07 触顶提示发送失败: next_try = now + 600s (CAP_NOTICE_RETRY_S 行为)",
+          _rc == 0 and _r8_cap_delta == 600.0
+          and (_stt.get("_day") or {}).get("cap_notified") is False,
+          f"rc={_rc} delta={_r8_cap_delta} day={_stt.get('_day')}")
+
+    _r8_conf0 = globals()["CONF"]
+    try:
+        with tempfile.TemporaryDirectory() as _td:
+            _r8_cp = Path(_td) / "c.json"
+            _r8_cp.write_text(json.dumps({"max_hold_min": 1, "timeout_s": 1}))
+            globals()["CONF"] = _r8_cp
+            _r8_cfg, _r8_opts2 = load_conf([])
+    finally:
+        globals()["CONF"] = _r8_conf0
+    check("R8-C08 max_hold_min=1 被 MAX_HOLD_FLOOR_S 夹到 300s (下限行为)",
+          _r8_opts2.max_hold == 300, repr(_r8_opts2.max_hold))
+    check("R8-C09 timeout_s=1 被 BUDGET_FLOOR_S 夹到 15s (下限行为)",
+          _r8_opts2.budget == 15, repr(_r8_opts2.budget))
+
+    def _r8_digest_state(digest):
+        with tempfile.TemporaryDirectory() as _td:
+            _clk = _B6Clock(1793800000)
+
+            def _one(deadline=None):
+                return [{"src": "S0", "ts": int(_clk.time()) - 60,
+                         "text": "沪铜库存变化1吨环比1%"}]
+
+            _rc, _pay, _stt, _q, _cfg = _b6_run_main(
+                Path(_td), _clk, [("S0", _one)],
+                state={"seedmarker": 1, "_digest": digest})
+        return _stt.get("_digest") or {}
+
+    _r8_bs = _r8_digest_state({"next_try": 1793800000 + 1000,
+                               "last_flush": 1793800000 - 60, "block_acc": 0.0})
+    check("R8-C10 阻塞一轮 block_acc 至少累加 120s (BLOCK_ACC_STEP_MIN_S)",
+          to_float(_r8_bs.get("block_acc")) == 120.0, repr(_r8_bs.get("block_acc")))
+
+    _r8_bc = _r8_digest_state({"next_try": 1793800000 + 1000,
+                               "last_flush": 1793800000 - 60,
+                               "block_acc": 604799.0})
+    check("R8-C11 block_acc 被 7*86400s 封顶 (BLOCK_ACC_CAP_S 行为)",
+          to_float(_r8_bc.get("block_acc")) == 604800.0, repr(_r8_bc.get("block_acc")))
+
+    _r8_lg = _r8_digest_state({"last_round": 1793800000 - 3600,
+                               "last_flush": 1793800000 - 60, "block_acc": 0.0})
+    _r8_lg2 = _r8_digest_state({"last_round": 1793800000 - 3599,
+                                "last_flush": 1793800000 - 60, "block_acc": 0.0})
+    check("R8-C12 gap 恰为 3600s 即按长间隔记 block_acc / 3599s 不记 (LONG_GAP_S 边界)",
+          to_float(_r8_lg.get("block_acc")) == 3600.0
+          and to_float(_r8_lg2.get("block_acc")) == 0.0,
+          f"3600={_r8_lg.get('block_acc')} 3599={_r8_lg2.get('block_acc')}")
+
+    with tempfile.TemporaryDirectory() as _td:
+        _clk = _B6Clock(1793800000)
+
+        def _r8_research_boom(deadline=None):
+            raise RuntimeError("research boom")
+
+        _rc, _pay, _stt, _q, _cfg = _b6_run_main(
+            Path(_td), _clk, [("东财研报", _r8_research_boom)],
+            state={"seedmarker": 1,
+                   "_research": {"东财研报": 1793800000 - 1800}})
+    _r8_rr = to_int((_stt.get("_research") or {}).get("东财研报"))
+    check("R8-C13 研报失败后 5 分钟重试: 记 now-(1800-300) (RESEARCH_RETRY_S 行为)",
+          _r8_rr == 1793800000 - 1500, repr(_r8_rr))
+
+    check("R8-C14 SEND_GATE_S 单点派生: 硬顶-本地余量 == 114, round_soft_s 再减最坏发送 == 60",
+          SEND_GATE_S == ROUND_HARD_S - ROUND_MARGIN_S
+          and SEND_GATE_S == 114 and round_soft_s() == SEND_GATE_S - SEND_WORST == 60,
+          f"gate={SEND_GATE_S} worst={SEND_WORST} soft={round_soft_s()}")
+
+    # ---- R8 D-4: B10-07..B10-10 并入 selftest (原 evidence/R3/b10-asserts.py 带外) ----
+    _b10_rs0, _b10_e0, _b10_ra0 = ROUND_START, SEND_ERR, SEND_RETRY_AFTER
+    _b10_sw0 = SEND_WORST
+    _b10_cfg0 = dict(CFG)
+    _b10_ts0 = dict(TS_BAD)
+    _b10_rc = RoundContext()
+    _b10_sc = SendContext()
+    try:
+        # B10-10a-f: 无影子状态 (__slots__ 空 + 未知属性必须 AttributeError)
+        check("B10-10a RoundContext 无 __dict__ (__slots__=())",
+              not hasattr(_b10_rc, "__dict__"),
+              repr(getattr(_b10_rc, "__dict__", None)))
+        check("B10-10b SendContext 无 __dict__ (__slots__=())",
+              not hasattr(_b10_sc, "__dict__"),
+              repr(getattr(_b10_sc, "__dict__", None)))
+        check("B10-10c RoundContext.__slots__ 为空元组", RoundContext.__slots__ == (),
+              repr(RoundContext.__slots__))
+        check("B10-10d SendContext.__slots__ 为空元组", SendContext.__slots__ == (),
+              repr(SendContext.__slots__))
+        try:
+            _b10_rc.start = 1.0
+            _b10_set_ok = True
+        except Exception:
+            _b10_set_ok = False
+        check("B10-10e 属性 setter 可用 (不是只读视图)", _b10_set_ok)
+        try:
+            _b10_rc.unknown_field = 1
+            _b10_slot_ok = False
+        except AttributeError:
+            _b10_slot_ok = True
+        check("B10-10f 禁止新增实例字段 (写未知属性 AttributeError)", _b10_slot_ok)
+
+        # B10-08a-g: RoundContext 同一存储
+        globals()["ROUND_START"] = 1.5
+        check("B10-08a 全局写 -> rc.start 读到 (写穿)", _b10_rc.start == 1.5,
+              repr(_b10_rc.start))
+        _b10_rc.start = 2.5
+        check("B10-08b rc.start 写 -> 全局变化 (写穿)", ROUND_START == 2.5,
+              repr(ROUND_START))
+        check("B10-08c rc.cfg is CFG (同对象身份, 非 copy)", _b10_rc.cfg is CFG,
+              f"{id(_b10_rc.cfg)} != {id(CFG)}")
+        check("B10-08d rc.ts_bad is TS_BAD (同对象身份, 非 copy)", _b10_rc.ts_bad is TS_BAD,
+              f"{id(_b10_rc.ts_bad)} != {id(TS_BAD)}")
+        check("B10-08e 默认视图 _DEFAULT_ROUND 也指向同一存储",
+              _DEFAULT_ROUND.cfg is CFG and _DEFAULT_ROUND.ts_bad is TS_BAD
+              and _DEFAULT_ROUND.start == ROUND_START)
+        CFG.clear()
+        _b10_rc.cfg["proxy"] = "http://alias-proof:1"
+        check("B10-08f ctx.cfg 写入 -> CFG 同步 (容器别名)",
+              CFG.get("proxy") == "http://alias-proof:1", repr(dict(CFG)))
+        TS_BAD.clear()
+        _b10_rc.ts_bad["S"] = 7
+        check("B10-08g ctx.ts_bad 写入 -> TS_BAD 同步 (容器别名)", TS_BAD.get("S") == 7,
+              repr(TS_BAD))
+
+        # B10-07a-f: SendContext 同一存储
+        globals()["SEND_ERR"] = "A"
+        check("B10-07a 全局 SEND_ERR -> sc.err", _b10_sc.err == "A", repr(_b10_sc.err))
+        _b10_sc.err = "B"
+        check("B10-07b sc.err 写 -> 全局 SEND_ERR", SEND_ERR == "B", repr(SEND_ERR))
+        globals()["SEND_RETRY_AFTER"] = 12.5
+        check("B10-07c 全局 SEND_RETRY_AFTER -> sc.retry_after",
+              _b10_sc.retry_after == 12.5, repr(_b10_sc.retry_after))
+        _b10_sc.retry_after = 30.0
+        check("B10-07d sc.retry_after 写 -> 全局", SEND_RETRY_AFTER == 30.0,
+              repr(SEND_RETRY_AFTER))
+        _b10_sc.retry_after = None
+        check("B10-07e None 可写穿", SEND_RETRY_AFTER is None, repr(SEND_RETRY_AFTER))
+        check("B10-07f 默认视图 _DEFAULT_SEND 指向同一存储",
+              _DEFAULT_SEND.err == SEND_ERR
+              and _DEFAULT_SEND.retry_after is SEND_RETRY_AFTER)
+
+        # B10-09a-c: 无参 send_time_ok() 仍读全局同一存储
+        globals()["SEND_WORST"] = 54
+        globals()["ROUND_START"] = time.monotonic() - 70.0
+        check("B10-09a ROUND_START=now-70s -> send_time_ok() is False",
+              send_time_ok() is False, f"gate={SEND_GATE_S} worst={SEND_WORST}")
+        globals()["ROUND_START"] = time.monotonic()
+        check("B10-09b ROUND_START=now -> send_time_ok() is True",
+              send_time_ok() is True, f"gate={SEND_GATE_S} worst={SEND_WORST}")
+        globals()["ROUND_START"] = time.monotonic() - 70.0
+        check("B10-09c 显式传 ctx 与无参默认视图同结果 (同一存储)",
+              send_time_ok(_b10_rc) is False and send_time_ok() is False,
+              f"explicit={send_time_ok(_b10_rc)} default={send_time_ok()}")
+    finally:
+        globals()["ROUND_START"] = _b10_rs0
+        globals()["SEND_ERR"], globals()["SEND_RETRY_AFTER"] = _b10_e0, _b10_ra0
+        globals()["SEND_WORST"] = _b10_sw0
+        CFG.clear()
+        CFG.update(_b10_cfg0)
+        TS_BAD.clear()
+        TS_BAD.update(_b10_ts0)
+
+    # B10-10g-k + B10-L01: 单一写入点结构审计 (AST, 只统计生产区, 不读 selftest 自身文本)
+    import ast as _b10_ast
+    _b10_tree = _b10_ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    _b10_globs: dict[str, list[tuple[str, ...]]] = {}
+
+    def _b10_walk(node, chain=()):
+        if isinstance(node, (_b10_ast.FunctionDef, _b10_ast.AsyncFunctionDef,
+                             _b10_ast.ClassDef)):
+            chain = chain + (node.name,)
+        if isinstance(node, _b10_ast.Global):
+            for _n in node.names:
+                _b10_globs.setdefault(_n, []).append(chain)
+        for _ch in _b10_ast.iter_child_nodes(node):
+            _b10_walk(_ch, chain)
+
+    _b10_walk(_b10_tree)
+
+    def _b10_prod(name):
+        return [c for c in _b10_globs.get(name, []) if "selftest" not in c]
+
+    for _b10_g, _b10_setter, _b10_cls in (
+            ("ROUND_START", "start", "RoundContext"),
+            ("SEND_ERR", "err", "SendContext"),
+            ("SEND_RETRY_AFTER", "retry_after", "SendContext")):
+        _b10_occ = _b10_prod(_b10_g)
+        check(f"B10-10g `global {_b10_g}` 在生产区恰好 1 处", len(_b10_occ) == 1,
+              f"{_b10_occ}")
+        check(f"B10-10h `global {_b10_g}` 落在 {_b10_cls}.{_b10_setter} 内",
+              _b10_occ == [(_b10_cls, _b10_setter)], f"{_b10_occ}")
+    _b10_defs: dict[str, list[int]] = {}
+    for _b10_node in _b10_tree.body:
+        if (isinstance(_b10_node, _b10_ast.Assign)
+                and len(_b10_node.targets) == 1
+                and isinstance(_b10_node.targets[0], _b10_ast.Name)):
+            _b10_defs.setdefault(_b10_node.targets[0].id, []).append(_b10_node.lineno)
+        if (isinstance(_b10_node, _b10_ast.AnnAssign)
+                and isinstance(_b10_node.target, _b10_ast.Name)):
+            _b10_defs.setdefault(_b10_node.target.id, []).append(_b10_node.lineno)
+    check("B10-10i 生产区模块级 ROUND_START 赋值恰好 1 处 (定义行)",
+          len(_b10_defs.get("ROUND_START", [])) == 1,
+          f"{_b10_defs.get('ROUND_START')}")
+    check("B10-10j main 内无 `global ROUND_START`",
+          all("main" not in _c for _c in _b10_prod("ROUND_START")),
+          f"{_b10_prod('ROUND_START')}")
+    check("B10-10k 生产区 `global SEND_ERR`/`global SEND_RETRY_AFTER` 各只有 setter 1 处",
+          len(_b10_prod("SEND_ERR")) == 1 and len(_b10_prod("SEND_RETRY_AFTER")) == 1,
+          f"{_b10_prod('SEND_ERR')} {_b10_prod('SEND_RETRY_AFTER')}")
+    for _b10_g in ("ROUND_START", "CFG", "TS_BAD", "SEND_ERR", "SEND_RETRY_AFTER"):
+        check(f"B10-L01 `^{_b10_g}` 模块级定义恰好 1 行",
+              len(_b10_defs.get(_b10_g, [])) == 1, f"{_b10_defs.get(_b10_g)}")
+
+    # B9-65/66: tests/probe2.py / tests/probe4.py 去重自检 (RE-F-04)
+    # 本批 CTO 约束「不改 tests/」, 故这两条 probe 内断言留待 CTO 裁决; 见实施报告未解决项.
 
     print(f"selftest: {'PASS' if not fails else str(len(fails)) + ' FAILED: ' + ', '.join(fails)}")
     return 0 if not fails else 1
