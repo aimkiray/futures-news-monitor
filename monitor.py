@@ -636,10 +636,14 @@ def queue_upsert(queue: list[dict], items: list[dict]) -> tuple[int, int]:
 
 # ------------------------------------------------------- items 存档 (spec §3.11)
 def atomic_write_text(path: Path, text: str) -> bool:
-    """同目录 temp + replace 原子写文本 + fsync (存档轮转 / dump 导出共用)."""
+    """同目录 temp + replace 原子写文本 + fsync (存档轮转 / dump 导出共用).
+
+    失败径 best-effort 清扫自己那只 name.tmp.<pid> 孤儿 (W3-P3: 写穿/replace
+    失败留下的半截 tmp 不随下次调用自动消失, 只能在失败现场回收)。
+    """
+    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")   # pid 后缀: 无锁并发 dump/轮转同 PATH 不互撕
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")   # pid 后缀: 无锁并发 dump/轮转同 PATH 不互撕
         with open(tmp, "w", encoding="utf-8", newline="") as fh:   # newline="" -> 恒 LF, 不做 CRLF 翻译
             fh.write(text)
             fh.flush()
@@ -655,12 +659,21 @@ def atomic_write_text(path: Path, text: str) -> bool:
             pass
         return True
     except OSError as e:
+        try:
+            tmp.unlink()                 # 孤儿 tmp 清扫: replace 失败/写中断残留
+        except OSError:
+            pass                         # best-effort: tmp 未落盘/不可删都不掩盖原始错误
         err(f"atomic_write_text 失败 {path.name}: {type(e).__name__}: {e}")
         return False
 
 
 def read_items_archive() -> list[dict]:
-    """读 JSONL 存档 -> 条目列表; 文件不存在=空, 坏行跳过 (dump / 去重共用)."""
+    """读 JSONL 存档 -> 条目列表; 文件不存在=空 (dump / 去重共用).
+
+    容错口径: 单行 JSON 解析失败的坏行跳过; 非法 UTF-8/IO 错在迭代中途抛出时
+    返回「已读前缀」 (prefix-return, 不是整文件判废)——完整行保留, 撕裂/腐化
+    后缀留给 items_archive_append 的自愈截断收拾。
+    """
     out: list[dict] = []
     try:
         with open(ITEMS_ARCHIVE, "r", encoding="utf-8") as fh:
@@ -681,41 +694,90 @@ def read_items_archive() -> list[dict]:
     return out
 
 
+def _archive_truncate(size: int) -> bool:
+    """items 存档自愈截断: 原地砍到 size 字节 (弃除撕裂残尾/非法字节尾).
+
+    读径遇非法 UTF-8 或追加前发现撕裂残行时调用——O_APPEND 无条件接在旧尾
+    后面写, 残行不除则新首行被并进残行成不可解析行 (永久缺档 + 报数造假 +
+    合并行被 old_lines 带入轮转长期留存)。ftruncate 同 inode 生效, 不改
+    目录项, 无需父目录 fsync。
+    """
+    try:
+        with open(ITEMS_ARCHIVE, "r+b") as fh:
+            fh.truncate(size)
+            fh.flush()
+            os.fsync(fh.fileno())                  # 截断也要 fsync: 崩溃后不接受「截了又复活」
+        return True
+    except OSError as e:
+        err(f"items 存档自愈截断失败 {ITEMS_ARCHIVE.name}: {type(e).__name__}: {e}")
+        return False
+
+
 def items_archive_append(new_items: list[dict]) -> int:
     """items 存档真追加 + key 去重 + 行数轮转; 返回实际落档行数.
 
     契约 (spec §3.11 / T-31 / T-32 / R-9):
       - 行形 {"src","ts","text","key","url"?,"snippet"?,"schema":1}, JSONL 真追加 (非 JSON 数组)
       - 存档侧 key 集合去重: 已归档 key 跳过 (重复命中不重复落档); 调用方只传「本轮新进队列」的条目
-      - 追加用 O_APPEND 单批 write + close 前 fsync; 追加后行数 > ITEMS_ARCHIVE_MAX 则原子重写保留最近 ITEMS_ARCHIVE_KEEP 行
+      - 追加用 O_APPEND + view 循环 write (部分写只续写剩余 view, 整批重写会重复落档)
+        + close 前 fsync; 追加后行数 > ITEMS_ARCHIVE_MAX 则原子重写保留最近 ITEMS_ARCHIVE_KEEP 行
       - 存档读不出 -> 去重无据, 宁可不追加也不重复落档; 写失败只记 err, 不影响主流程退码 (队列才是真源)
-      - meta schema 闸自愈每次调用即执行 (读存档之前), 不被全 dup 轮/读失败闸住
+      - 撕裂自愈双闸 (W3-P2): 读径逐行验 UTF-8, 首个不可解码行起连同其后整尾
+        ftruncate 弃除 (UTF-8 中切碎片的旧径 ValueError abort 会冻结追加); 追加前
+        查末字节非 \\n 的残尾——能解出完整 JSON 对象的补 \\n 隔离保留 (部分写恰停在
+        记录边界的记录不丢), 否则截除, 再写 payload (新旧首行永不并线)
+      - meta schema 闸自愈每次调用即执行 (读存档与空批次判之前), 不被全 dup 轮/读失败闸住
     """
-    if not new_items:
-        return 0
     meta = load_json(ITEMS_META, None)                # §3.9 schema 闸: 缺失/版本不符时自愈重写
     if not (isinstance(meta, dict) and meta.get("schema") == ITEMS_SCHEMA):
         save_json(ITEMS_META, {"schema": ITEMS_SCHEMA})
+    if not new_items:
+        return 0
     keys: set[str] = set()
     old_lines: list[str] = []
     try:
-        with open(ITEMS_ARCHIVE, "r", encoding="utf-8") as fh:
-            for line in fh:
-                s = line.strip()
-                if not s:
-                    continue
-                old_lines.append(s)
-                try:
-                    k = json.loads(s).get("key")
-                except (json.JSONDecodeError, AttributeError):
-                    continue                            # 坏行照原样保留, 仅不参与 key 集合
-                if k:
-                    keys.add(str(k))
+        blob = ITEMS_ARCHIVE.read_bytes()
     except FileNotFoundError:
-        pass                                          # 首轮: 无存档 = 空 key 集合
-    except (OSError, ValueError) as e:
+        blob = b""                                    # 首轮: 无存档 = 空 key 集合
+    except OSError as e:
         err(f"items 存档读取失败, 本轮跳过追加 {ITEMS_ARCHIVE.name}: {type(e).__name__}: {e}")
         return 0
+    # ---- 自愈闸①: 首个非法 UTF-8 行 / 撕裂残尾 -> 截到上一完整行尾 (W3-P2)
+    # 完整行 = 有 \n 终止且可解码; 无 \n 残尾单独判 (完整 JSON 对象才留)
+    cut = len(blob)
+    pos = 0
+    while pos < len(blob):
+        nl = blob.find(b"\n", pos)
+        if nl < 0:                                    # 残尾段 (EOF 前无 \n)
+            try:
+                keep_tail = isinstance(json.loads(blob[pos:].decode("utf-8")), dict)
+            except (UnicodeDecodeError, ValueError, RecursionError):
+                keep_tail = False                     # 撕裂残片/非对象/病态嵌套 JSON -> 截除
+            if not keep_tail:
+                cut = pos
+            break
+        try:
+            blob[pos:nl].decode("utf-8")
+        except UnicodeDecodeError:
+            cut = pos                                 # 非法字节行连同其后整尾弃除
+            break
+        pos = nl + 1
+    if cut < len(blob):
+        if not _archive_truncate(cut):
+            return 0                                  # 愈不了 -> 去重无据, 宁可不追加
+        log(f"items 存档自愈: 截除尾部 {len(blob) - cut} 字节撕裂/非法残片")
+        blob = blob[:cut]
+    for raw in blob.split(b"\n"):                     # 键集/轮转底账: 愈合后全部可解码
+        s = raw.decode("utf-8").strip()
+        if not s:
+            continue
+        old_lines.append(s)
+        try:
+            k = json.loads(s).get("key")
+        except (json.JSONDecodeError, AttributeError, RecursionError):
+            continue                                  # 坏行照原样保留, 仅不参与 key 集合
+        if k:
+            keys.add(str(k))
     rows: list[dict] = []
     for it in new_items:
         if not isinstance(it, dict):
@@ -745,12 +807,16 @@ def items_archive_append(new_items: list[dict]) -> int:
         err(f"items 存档目录不可建 {ITEMS_ARCHIVE.parent}: {type(e).__name__}: {e}")
         return 0
     payload = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows).encode("utf-8")
+    if blob and not blob.endswith(b"\n"):
+        # 自愈闸①后半: 保留的完整残尾记录缺 \n 终止 -> payload 前置 \n 隔离,
+        # 否则 O_APPEND 把新首行并进残行成不可解析行 (W3-P2)
+        payload = b"\n" + payload
     view = memoryview(payload)                        # 重试只续写剩余 view: 部分写后整批重写会重复落档
     last = ""
     for i in range(3):                                # 与 save_json 同口径的轻量重试
         try:
             fd = os.open(ITEMS_ARCHIVE, os.O_WRONLY | os.O_CREAT | os.O_APPEND
-                         | getattr(os, "O_BINARY", 0))   # O_APPEND 单批 write; Windows 需 O_BINARY 保 LF
+                         | getattr(os, "O_BINARY", 0))   # O_APPEND 单次 open + view 循环 write; Windows 需 O_BINARY 保 LF
             try:
                 while view:
                     n = os.write(fd, view)
@@ -787,9 +853,13 @@ def items_archive_append(new_items: list[dict]) -> int:
     return len(rows)
 
 
-# --dump-items 目标守卫 (P3-8): resolve 归一后命中任一 state/conf 件即拒——
+# --dump-items 目标守卫 (P3-8 + W3): resolve 归一后命中任一 state/conf/log 件即拒——
 # JSON 快照覆盖 JSONL 存档/seen/queue/pending/meta/conf 会毁形真源;
-# 覆盖 LOCK 会把锁文件换成新 inode, 持旧 inode 锁者与后继 flock 者可并发进入。
+# 覆盖 LOCK 会把锁文件换成新 inode, 持旧 inode 锁者与后继 flock 者可并发进入;
+# 覆盖 LOG/ERRLOG 是 launchd 原地轮转件, 换 inode 后日志流写进死 inode (U3 同形自伤)。
+# resolve 比对之外补 samefile inode 判据 (W3-P2): POSIX resolve 不归一大小写,
+# APFS/NTFS 大小写不敏感下 FUTURES-NEWS-SEEN.JSON 变体可绕 resolve 比对覆盖真源;
+# samefile 顺带覆盖 NFC/NFD 归一差与硬链接同 inode 绕法。
 # 清单在函数体内逐次取模块全局 (非 import 期绑死)——测试经 setattr
 # 重定向路径后守卫仍生效, 与旧 ITEMS_ARCHIVE 单件守卫同口径。
 def dump_items(path: Path) -> int:
@@ -800,9 +870,14 @@ def dump_items(path: Path) -> int:
     out = Path(path)
     resolved = out.resolve()
     for guarded in (ITEMS_ARCHIVE, ITEMS_META, STATE, QUEUE, PENDING,
-                    LOCK, CONF):                      # 任一 state/conf 件命中即拒
-        if resolved == guarded.resolve():
-            err(f"--dump-items 目标不能覆盖 state/conf 件 {guarded}")
+                    LOCK, CONF, LOG, ERRLOG):         # 任一 state/conf/log 件命中即拒
+        same = False
+        try:
+            same = os.path.samefile(out, guarded)     # inode 判据: 大小写变体/硬链接/NFC-NFD
+        except OSError:
+            pass                                      # 任一方不存在 -> 无同件, 只看 resolve 比对
+        if resolved == guarded.resolve() or same:
+            err(f"--dump-items 目标不能覆盖 state/conf/log 件 {guarded}")
             return 1
     items = read_items_archive()
     payload = {"schema": ITEMS_SCHEMA, "ts": int(time.time()), "items": items}

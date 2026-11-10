@@ -157,13 +157,13 @@ class TestItemsArchiveRobust(_ArchiveCase):
     """容错/耐久/自愈口径钉: 评审 findings 回归。"""
 
     def test_read_invalid_utf8_no_crash(self):
-        """非法 UTF-8 存档: 读侧捕 (OSError, ValueError) 含 UnicodeDecodeError, 与 append 径口径一致。"""
+        """非法 UTF-8 存档: 读侧 prefix-return 不崩栈 (首行即坏 -> 空);
+        append 径自愈截到上一完整行 (行首即坏 -> 截空) 后续写, 不再 ValueError 冻结。"""
         self.arch.write_bytes(b"\xff\xfe\x00garbage\n" + json.dumps(_item("k1")).encode() + b"\n")
-        self.assertEqual(monitor.read_items_archive(), [])       # 首行即解码失败 -> 空, 不崩栈
-        before = self.arch.read_bytes()
-        # append 径: 存档读不出 -> 宁可不追加也不毁档
-        self.assertEqual(monitor.items_archive_append([_item("k9")]), 0)
-        self.assertEqual(self.arch.read_bytes(), before)
+        self.assertEqual(monitor.read_items_archive(), [])       # 首行即解码失败 -> 空前缀, 不崩栈
+        # W3-P2: 旧径 ValueError abort 冻结追加; 新径截除非法字节行及其后整尾再落档
+        self.assertEqual(monitor.items_archive_append([_item("k9")]), 1)
+        self.assertEqual(self._keys(), ["k9"])                   # 新行独立可解析, 无合并残行
 
     def test_meta_self_heal_all_dup_round(self):
         """meta 缺/形不符 + 全 dup 轮也要自愈 (原 `if not rows` 闸 -> adapter schema 闸永久 INPUT(3))。"""
@@ -264,6 +264,59 @@ class TestItemsArchiveRobust(_ArchiveCase):
         self.assertIn(f"snap.json.tmp.{os.getpid()}", seen)
         self.assertEqual(out.read_text(encoding="utf-8"), "{}\n")
 
+    def test_atomic_write_tmp_orphan_swept(self):
+        """W3-P3: replace 失败径 name.tmp.<pid> 孤儿被清扫 (best-effort 不残留)。"""
+        out = Path(self._td.name) / "snap.json"
+        with mock.patch.object(monitor.os, "replace",
+                               side_effect=OSError("模拟 replace 失败")):
+            self.assertFalse(monitor.atomic_write_text(out, "{}\n"))
+        self.assertFalse(out.exists())
+        self.assertEqual(list(out.parent.glob("snap.json.tmp.*")), [])
+
+    def test_meta_self_heal_empty_call(self):
+        """W3-P2: meta 自愈在 `if not new_items` 闸之前——空调用也兑现
+        「每次调用即执行」文档承诺 (调用方 if added 闸下本无此径, 契约仍钉死)。"""
+        self.assertFalse(self.meta.exists())
+        self.assertEqual(monitor.items_archive_append([]), 0)
+        self.assertEqual(json.loads(self.meta.read_text(encoding="utf-8"))["schema"], 1)
+
+    def test_append_heals_torn_tail(self):
+        """W3-P2: 存档尾为无 \\n 撕裂残行 (kill/写中断) -> 追加前截除残尾,
+        新行独立可解析、报数不造假、残行不随轮转留存。"""
+        monitor.items_archive_append([_item("k1")])
+        with open(self.arch, "ab") as fh:
+            fh.write(b'{"src":"s","ts":17938')        # 半行 JSON 残尾
+        n = monitor.items_archive_append([_item("k2"), _item("k3")])
+        self.assertEqual(n, 2)                          # 真实落档数 (非 2+合并1 造假)
+        recs = [json.loads(ln) for ln in self._lines()]  # 每行独立可解析
+        self.assertEqual([r["key"] for r in recs], ["k1", "k2", "k3"])
+        self.assertTrue(self.arch.read_bytes().endswith(b"\n"))
+        # 再撞旧 key 仍去重: 残尾截除后键集无损
+        self.assertEqual(monitor.items_archive_append([_item("k2")]), 0)
+
+    def test_append_heals_utf8_fragment_tail(self):
+        """W3-P2: UTF-8 中切残片 (多字节字符被截半) -> 读径自愈截除再落档,
+        不再 ValueError abort 冻结。"""
+        monitor.items_archive_append([_item("k1")])
+        frag = '{"src":"s","ts":1,"text":"铜价涨'.encode("utf-8")[:-2]  # 末字符中切
+        with open(self.arch, "ab") as fh:
+            fh.write(frag)
+        self.assertEqual(monitor.items_archive_append([_item("k2")]), 1)
+        recs = [json.loads(ln) for ln in self._lines()]
+        self.assertEqual([r["key"] for r in recs], ["k1", "k2"])
+
+    def test_append_separates_complete_tail_record(self):
+        """W3-P2: 残尾恰为完整 JSON 记录缺 \\n (部分写恰停记录边界) -> 补 \\n
+        隔离保留该记录 (不截除丢数据), 其 key 进键集照常去重。"""
+        monitor.items_archive_append([_item("k1")])
+        with open(self.arch, "ab") as fh:
+            fh.write(json.dumps(_item("k2"), ensure_ascii=False).encode("utf-8"))
+        n = monitor.items_archive_append([_item("k3"), _item("k2")])
+        self.assertEqual(n, 1)                          # 残尾 k2 已归档 -> 撞 key 只落 k3
+        recs = [json.loads(ln) for ln in self._lines()]
+        self.assertEqual([r["key"] for r in recs], ["k1", "k2", "k3"])
+        self.assertTrue(self.arch.read_bytes().endswith(b"\n"))
+
 
 class TestDumpItems(_ArchiveCase):
     def test_dump_schema_and_parseable(self):
@@ -316,9 +369,9 @@ class TestDumpItems(_ArchiveCase):
         self.assertEqual(self.arch.read_bytes(), before)
 
     def test_dump_to_other_state_files_refused(self):
-        """P3-8: --dump-items 命中 CONF/QUEUE/STATE/PENDING/LOCK/META 等
-        其它 state/conf 件 resolve 路径同拒 (与 ITEMS_ARCHIVE 同守卫清单);
-        全部守卫路径先指到 tempdir——绝不碰真实 ~/.pi 件。"""
+        """P3-8/W3-P3: --dump-items 命中 CONF/QUEUE/STATE/PENDING/LOCK/META/
+        LOG/ERRLOG 等其它 state/conf/log 件 resolve 路径同拒 (与 ITEMS_ARCHIVE
+        同守卫清单); 全部守卫路径先指到 tempdir——绝不碰真实 ~/.pi 件。"""
         d = Path(self._td.name)
         guarded = {
             "CONF": d / "etc" / "futures-news.json",
@@ -327,6 +380,8 @@ class TestDumpItems(_ArchiveCase):
             "PENDING": d / "pending.json",
             "LOCK": d / "monitor.lock",
             "ITEMS_META": self.meta,
+            "LOG": d / "monitor.out",
+            "ERRLOG": d / "monitor.err",
         }
         saved = {k: getattr(monitor, k) for k in guarded}
         try:
@@ -350,6 +405,27 @@ class TestDumpItems(_ArchiveCase):
         finally:
             for k, v in saved.items():
                 setattr(monitor, k, v)
+
+    def test_dump_case_variant_samefile_refused(self):
+        """W3-P2: APFS/NTFS 大小写不敏感下 FUTURES-NEWS-SEEN.JSON 变体绕
+        resolve 比对 -> samefile inode 判据同拒 (另钉硬链接同 inode 绕法)。"""
+        monitor.items_archive_append([_item("k1")])
+        before = self.arch.read_bytes()
+        variant = self.arch.with_name(self.arch.name.upper())
+        try:
+            same = os.path.samefile(variant, self.arch)
+        except OSError:
+            self.skipTest("大小写敏感文件系统: 变体即异件, 无绕守面")
+        self.assertTrue(same)
+        self.assertEqual(monitor.dump_items(variant), 1)   # 变体名命中同 inode -> 拒
+        self.assertEqual(self.arch.read_bytes(), before)
+        link = self.arch.with_name("hardlink.jsonl")
+        try:
+            os.link(self.arch, link)
+        except OSError:
+            return                                         # FS 不支持硬链接 -> 只钉变体径
+        self.assertEqual(monitor.dump_items(link), 1)      # 硬链接同 inode -> 同拒
+        self.assertEqual(self.arch.read_bytes(), before)
 
     def test_main_dump_items_equals_form(self):
         """CLI 面: --dump-items=PATH 等号形兼容。"""
