@@ -156,12 +156,23 @@ PDF_DL_BUDGET_S = PDF_BUDGET_S - PDF_TIMEOUT   # 单篇下载子预算(8s): 必�
 PDF_MAX_BYTES = 8 * 1024 * 1024      # 单个 PDF 上限 8MB (实测最大为中金所月报 2.17MB)
 PDF_CAP = 10                         # curl 最长秒数上限; 生产路径被 PDF_DL_BUDGET_S 夹到 <=8s
 PDF_RLIMIT_AS = 256 * 1024 * 1024    # pdftotext 子进程内存上限: 391KB PDF 炸弹实测 926MB RSS; 真实 PDF 仅 ~10MB
-PDF_MAX_PAGES = 8                    # 只解析前 N 页: 8 页保住中金所月报 240 字摘要, 后半是表格/附录
+PDF_MAX_PAGES = 32                   # 只解析前 N 页 (Batch 11: 8->32); 依据: 实测 3 份真实 PDF 4/5/9 页,
+                                     # 32 页 = 3.6x 余量, 且 32x~722 字/页 <= SNIPPET_MAX(24000)
 RESEARCH_URL_MAX = 1000              # 研报链接上限; 超长 URL 会让单条 u16>4096 且 split_msg 无法拆
 RESEARCH_URL_U16_MAX = 1000          # 研报链接**转义后**的 u16 预算 (& -> &amp; 放大 5 倍); 超了退纯文本
 RESEARCH_META_MAX = 200              # 研报元信息(text 的「机构 · 日期」段)上限
 PDF_MIN_CHARS = 40                   # 清洗后正文短于此数 -> 判「无文本层」, 摘要留空
-SNIPPET_MAX = 240                    # 摘要取前 N 字 (需求区间 200-300)
+SNIPPET_MAX = 24000                  # 正文存储上限(字符): 240 -> 24000 (Batch 11 全文推送, 不再截断)
+SNIPPET_FULL_MAX = 40000             # 清洗后正文的解析侧硬上限(字符): 高于 SNIPPET_MAX, 让截断可被检出并标记
+RESEARCH_TRUNC_MARK = "\n…（正文共 {n} 字，超过存储上限 {limit} 字，已截断）"
+RESEARCH_PART_MAX = 2400             # 单片正文的 esc u16 预算: 头行+标题+链接后仍 <= MSG_MAX(3800)
+RESEARCH_PART_MIN_FILL = 2000        # 句末切分的最小填充: 已用 u16 >= 此值才按句末切, 否则硬切(防碎片)
+RESEARCH_PARTS_PER_ROUND = 12        # 每轮最多发出的研报分片数: 约 6 msg/min, 低于单聊经验限流
+RESEARCH_TITLE_PART_MAX = 80         # 带链接末片的标题 esc u16 上限(其余片沿用 ITEM_MAX)
+RESEARCH_PART_MARK = "({i}/{n})"     # 分片标记: 每片头行追加, i 从 1 起, n 为总片数
+RESEARCH_SENT_END = "。！？；!?;…"    # 句子/分句边界: 分片优先在这些字符之后切
+RESEARCH_PARTIAL_AGE_FACTOR = 4      # 分片连载条目的老化豁免倍数: 超过 4*max_age 才允许老化
+RESEARCH_PART_FAIL_MAX = 3           # [CTO] 同一片连续失败上限: 达 3 次判毒丸, 出队+seen+err
 RESEARCH_TAG = "研究"                # 研报 key 前缀 (含 ':' -> 与 dedupe_key 输出天然不相交)
 RESEARCH_SRCS = ("东财研报", "中金所", "中期协")
 # pdftotext 为 poppler CLI (非 Python 依赖); 不存在时 pdf_text 直接降级为「无摘要」
@@ -728,6 +739,17 @@ def load_queue() -> tuple[list[dict], str, int]:
             snip = it.get("snippet")
             if isinstance(snip, str):
                 out[-1]["snippet"] = snip
+            # Batch 11: 分片续发进度 (只有 0 < sent < total 的连载条目才保留, 其余自愈丢弃)
+            ps, pt = it.get("parts_sent"), it.get("parts_total")
+            if (isinstance(ps, int) and not isinstance(ps, bool)
+                    and isinstance(pt, int) and not isinstance(pt, bool)
+                    and 0 < ps < pt):
+                out[-1]["parts_sent"] = ps
+                out[-1]["parts_total"] = pt
+            # Batch 11 (CTO): 毒丸计数也随队列持久化 (失败片跨轮累计, 老条目无此字段)
+            pf = it.get("part_fails")
+            if isinstance(pf, int) and not isinstance(pf, bool) and pf > 0:
+                out[-1]["part_fails"] = pf
     if bad:
         if out:
             log(f"队列有 {bad} 条结构/时间戳异常, 已跳过 (保留其余 {len(out)} 条)")
@@ -912,7 +934,7 @@ class HttpContractError(RuntimeError):
 def http(url: str, referer: str | None = None, tries: int = 3,
          deadline: float | None = None, cap: int = 12,
          proxy: str | None = None, ua: str | None = None,
-         max_bytes: int = 0) -> bytes:
+         max_bytes: int = 0, location: bool = False) -> bytes:
     """curl 取数据; 非 2xx 视作失败并重试; deadline 为本次调用的预算截止 (time.monotonic).
 
     Batch 6 新增三个**默认等于旧行为**的关键字参数:
@@ -957,6 +979,8 @@ def http(url: str, referer: str | None = None, tries: int = 3,
             break
         max_time = max(2, min(cap, int(left)))    # 与基线逐字节同款: 一次用满剩余份额
         cmd = ["curl", "-q", "-sS"]      # -q: 忽略 ~/.curlrc, 防止用户级配置改写抓取语义 (Batch 9 B-D-01)
+        if location:                        # Batch 13: 东财详情 302 到 finance.eastmoney.com
+            cmd += ["-L"]                   # 默认 False -> 既有源的 argv 逐元素不变
         cmd += ["--proxy", proxy] if proxy else ["--noproxy", "*"]
         if not strict:                       # PDF 路径不请求压缩, 见 docstring A5
             cmd += ["--compressed"]
@@ -1059,6 +1083,19 @@ def pdf_clean(text: str, limit: int = SNIPPET_MAX) -> str:
     body = re.sub(r"\s+", " ", " ".join(good or lines)).strip()
     body = re.sub(r"[\ue000-\uf8ff\ufffd\x0c]", "", body)   # Wingdings 项目符号/换页符
     return body[:limit].strip()
+
+
+def snip_truncate(body: str, limit: int = SNIPPET_MAX) -> str:
+    """按字符截到存储上限, 被截断时补一行显式标记 (Batch 11).
+
+    只在正文真的超过 SNIPPET_MAX 时才会走到 (正常研报 32 页约 23k 字, 不会触发);
+    标记写进 snippet 本身, 让「被截断」这件事对人和对断言都可见, 而不是静默丢字。
+    """
+    body = str(body or "")
+    if len(body) <= limit:
+        return body
+    mark = RESEARCH_TRUNC_MARK.format(n=len(body), limit=limit)
+    return body[:max(0, limit - len(mark))].rstrip() + mark
 
 
 def _pdf_child_limits() -> None:
@@ -1172,11 +1209,11 @@ def pdf_text(url: str, deadline: float | None = None,
     if r.returncode != 0:
         log(f"pdftotext 退出码 {r.returncode}, 无摘要")
         return ""
-    body = pdf_clean(r.stdout.decode("utf-8", "ignore"))
+    body = pdf_clean(r.stdout.decode("utf-8", "ignore"), limit=SNIPPET_FULL_MAX)
     if len(body) < PDF_MIN_CHARS:
         log(f"pdf 无文本层 (清洗后仅 {len(body)} 字), 无摘要")
         return ""
-    return body
+    return snip_truncate(body)            # Batch 11: 全文入库, 超存储上限才截断并留标记
 
 
 # ---------------------------------------------------------------- 研报管线 (Batch 7)
@@ -1839,6 +1876,718 @@ def src_hellenic(deadline: float | None = None) -> list[dict]:
     return rss_items(_feed_via_proxy(FEED_HELLENIC, deadline, "Hellenic"), "Hellenic")
 
 
+# ------------------------------------------------------------------ Batch 12 化工现货源
+# 化销网 (甲醇频道 catid=22) + 隆众 (资讯列 /1/9/): 「甲醇下游装置停车/减产/合同取消」这类
+# 产业链动向现有 17 源完全没有; 两站都是服务端渲染的静态 HTML, 走「列表 -> 候选 -> 详情 ->
+# feed_items」既有骨架, 零第三方依赖, tries/deadline 与既有源同一套 http().
+# 准入两级: 列表级「标题含品种词 且 (事件词 或 提示/前瞻栏目词)」-> 才值得拉详情;
+#           详情级「标题 ∪ 正文 同时含事件词与品种词」-> 才入队.
+# 设计覆盖 §4.4: 单提甲醇下游 (MTBE/甲醛/二甲醚/醋酸/MTO/MTP) 的产业链消息
+#   必须放行 —— 这些品种不在全局 PRODUCT_ALIASES 里, 会命中 NOISE/无品种而丢. 做法: 命中
+#   源内下游词而**未**命中全局品种词时, 文本前加 SPOT_PREFIX 让全局过滤看到「甲醇」;
+#   全局词表一字不改, 前缀幂等, 且不影响已命中甲醇 (或任何全局品种) 的条目.
+CHEM_SRCS = ("化销网", "隆众", "我的钢铁", "东财甲醇")
+SPOT_DOWNSTREAM = ("MTBE", "甲醛", "二甲醚", "醋酸", "MTO", "MTP")   # 甲醇下游主力 (非期货品种)
+SPOT_PREFIX = "甲醇下游·"
+HXW_BASE = "https://www.huaxiaowang.com"
+HXW_LIST_URL = HXW_BASE + "/index/quote/infolist?catid=22"
+LZ_LIST_URL = "https://list.oilchem.net/1/9/"
+CHEM_DETAIL_MAX = 4            # 每源每轮最多拉取的详情页数 (列表 20 条, 每轮新增一般 0-3 条)
+CHEM_DETAIL_AGE_S = 4 * 3600   # 候选超过 4h 不再拉详情: 超过 max_age(默认 180min) 必判 stale
+CHEM_DETAIL_MIN_S = 2.5        # 详情页剩余切片预算低于此值 -> 剩余候选下轮再看
+CHEM_TEXT_MAX = ITEM_MAX       # 条目文本上限 (700), 与渲染截断同口径
+CHEM_TITLE_MAX = 120           # 标题上限 (站方标题 <= 40 字, 留余量)
+CHEM_LEAD = 80                 # 长正文按事件词截取时, 事件词前保留的字数
+CHEM_TITLE_DENY = ("二乙二醇", "三乙二醇", "四乙二醇")   # 含「乙二醇」子串但非期货品种
+# 供给侧事件词 (不是行情涨跌词): 标题命中即候选, 正文命中才准入
+CHEM_EVENT = ("装置", "停车", "停工", "停产", "检修", "开工", "投产", "减产", "复产",
+              "限产", "降负", "提负", "重启", "扩产", "扩建", "新增产能", "试车", "开车",
+              "跳车", "故障", "事故", "爆炸", "火灾", "泄漏", "不可抗力", "断供", "缺货",
+              "合同", "技改", "环保", "限电", "错峰")
+# 「开工」是唯一的统计量歧义词: 后随「率/负荷/水平」或「数字+% / 数字+成」
+# (开工83.8%) 时是产能统计, 不是装置事件 (F-02: PX 一周前瞻的「PX开工83.8%」曾被子串
+# 误判为事件); 「开工装置/开工时间/开工2套」等装置动作仍算事件.
+CHEM_EVENT_RATE = ("率", "负荷", "水平")
+CHEM_EVENT_RATE_RE = re.compile(r"\s*\d+(?:\.\d+)?\s*[%％成]")
+# Batch 13: 强事件词 = 去掉无方向的「装置」(「XX 装置动态/快讯」标题与「企业简介」
+# 样板文都只命中「装置」, 用作事件会天天误推; 调研报告 §2.2/§8.3 实测)
+CHEM_EVENT_STRONG = tuple(w for w in CHEM_EVENT if w != "装置")
+
+
+def chem_event_pos(text: str, words: tuple = CHEM_EVENT) -> int:
+    """首个真事件词的位置; 跳过「开工率/开工负荷/开工水平/开工83.8%」类统计量, 无则 -1.
+
+    words 默认 CHEM_EVENT (调用方不传时行为与 Batch 12 逐字节相同); Batch 13 的
+    我的钢铁/东财源传 CHEM_EVENT_STRONG 以排除无方向的「装置」。
+    """
+    s = str(text or "")
+    best = -1
+    for w in words:
+        start = 0
+        while True:
+            i = s.find(w, start)
+            if i < 0:
+                break
+            if w == "开工":
+                rest = s[i + len(w):]
+                if rest.startswith(CHEM_EVENT_RATE) or CHEM_EVENT_RATE_RE.match(rest):
+                    start = i + len(w)
+                    continue
+            if best < 0 or i < best:
+                best = i
+            break
+    return best
+
+
+def chem_event_hit(text: str, words: tuple = CHEM_EVENT) -> bool:
+    """事件词命中 (排除开工率统计量); 列表级与正文级准入共用同一口径."""
+    return chem_event_pos(text, words) >= 0
+# 定期提示/前瞻类栏目词: 事件常写在正文而不是标题 (目标事实即此形态)
+CHEM_TIP = ("早间提示", "午间提示", "晚间提示", "晨报", "晚报", "周报", "月报",
+            "前瞻", "综述", "盘点", "日报", "周度", "月度")
+
+
+def html_inner(raw: str, marker: str) -> str:
+    """取 marker 所在 <div> 的平衡内层 HTML; 找不到或不闭合返回 ''.
+
+    marker 必须含开标签的 '>' (如 '<div class="content">'): 两个站点的正文都含嵌套
+    div, 首个 </div> 不是正文边界, 只按 <div>/</div> 计深度才能取全。
+    """
+    i = raw.find(marker)
+    if i < 0:
+        return ""
+    start = i + len(marker)
+    depth = 1
+    for m in re.finditer(r"<div\b[^>]*>|</div\s*>", raw[start:], re.I):
+        if m.group(0).lower().startswith("</"):
+            depth -= 1
+            if depth == 0:
+                return raw[start:start + m.start()]
+        else:
+            depth += 1
+    return ""
+
+
+def strip_embed(raw: str) -> str:
+    """剥 <script>/<style> 整块 (隆众正文里内嵌表格脚本), 再交 clean_text."""
+    return re.sub(r"<(script|style)\b.*?</\1>", "", raw or "", flags=re.S | re.I)
+
+
+HXW_ITEM_RE = re.compile(
+    r'<li>\s*<a href="(/index/quote/infoshow\?id=(\d+))"[^>]*>(.*?)</a>\s*'
+    r'<span[^>]*>([^<]*)</span>', re.S)
+
+
+def hxw_rows(page: str) -> list[dict]:
+    """化销网甲醇频道列表 -> [{id,title,ts,url}]; 结构变化抛 RuntimeError (不静默当 0 条)."""
+    i = page.find('<div class="info-list">')
+    if i < 0:
+        raise RuntimeError("化销网: 未找到 info-list (疑似结构变化)")
+    rows = []
+    for m in HXW_ITEM_RE.finditer(page[i:]):
+        rows.append({"id": m.group(2),
+                     "title": clean_text(m.group(3)),
+                     "ts": parse_ts(clean_text(m.group(4))),
+                     "url": HXW_BASE + m.group(1)})
+    if not rows:
+        raise RuntimeError("化销网: info-list 0 条 (疑似结构变化)")
+    if all(not r["ts"] for r in rows):
+        raise RuntimeError("化销网: 列表时间全不可解析 (疑似结构变化)")
+    if not any(CJK_RE.search(r["title"]) for r in rows):
+        raise RuntimeError("化销网: 列表标题无中文 (疑似编码变化)")
+    return rows
+
+
+def cn_date_ts(raw: str) -> int:
+    """中文日期 (2026年11月09日) -> 当日 00:00 (Asia/Shanghai); 不可解析返回 0."""
+    m = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日", str(raw or ""))
+    if not m:
+        return 0
+    try:
+        return sane_ts(int(datetime(int(m.group(1)), int(m.group(2)),
+                                    int(m.group(3)), tzinfo=TZ_CN).timestamp()))
+    except ValueError:
+        return 0
+
+
+def hxw_detail(page: str) -> dict | None:
+    """化销网详情 -> {title, body, date_ts}; 结构不符返回 None (该条跳过, 下轮再看)."""
+    m = re.search(r"<h3[^>]*>(.*?)</h3>", page, re.S)
+    title = clean_text(m.group(1)) if m else ""
+    body = clean_text(strip_embed(html_inner(page, '<div class="content">')))
+    if not title or not body:
+        return None
+    dm = re.search(r"发布时间[:：]\s*([^<]+)", page)
+    return {"title": title, "body": body,
+            "date_ts": cn_date_ts(dm.group(1) if dm else "")}
+
+
+LZ_LI_RE = re.compile(r'<li[^>]*class="clearfix"[^>]*>.*?</li>', re.S)
+LZ_A_RE = re.compile(r'<a href="(https://www\.oilchem\.net/[^"]+\.html)"[^>]*>(.*?)</a>', re.S)
+LZ_T_RE = re.compile(r"<span[^>]*>\s*\[([^\]]+)\]\s*</span>", re.S)
+
+
+def lz_rows(page: str) -> list[dict]:
+    """隆众列表 -> [{id,title,ts,url}]; 跳过服务端渲染的隐藏模板 li (标题是 JS 拼接串)."""
+    rows = []
+    for block in LZ_LI_RE.findall(page):
+        if "display: none" in block or "display:none" in block:
+            continue
+        am = LZ_A_RE.search(block)
+        tm = LZ_T_RE.search(block)
+        if not am or not tm:
+            continue
+        url = am.group(1)
+        rows.append({"id": url.rsplit("/", 1)[-1][:-len(".html")],
+                     "title": clean_text(am.group(2)),
+                     "ts": parse_ts(re.sub(r"\s+", " ", tm.group(1)).strip()),
+                     "url": url})
+    if not rows:
+        raise RuntimeError("隆众: 列表 0 条 (疑似结构变化)")
+    if all(not r["ts"] for r in rows):
+        raise RuntimeError("隆众: 列表时间全不可解析 (疑似结构变化)")
+    if not any(CJK_RE.search(r["title"]) for r in rows):
+        raise RuntimeError("隆众: 列表标题无中文 (疑似编码变化)")
+    return rows
+
+
+def lz_detail(page: str) -> dict | None:
+    """隆众详情 -> {title, body, ts}; 结构不符返回 None."""
+    m = re.search(r"<h1[^>]*>\s*<strong>(.*?)</strong>", page, re.S)
+    title = clean_text(m.group(1)) if m else ""
+    body = clean_text(strip_embed(html_inner(page, 'id="content">')))
+    if not title or not body:
+        return None
+    dm = re.search(r"发布时间[:：]\s*(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2})", page)
+    return {"title": title, "body": body,
+            "ts": parse_ts(dm.group(1).replace("T", " ")) if dm else 0}
+
+
+def chem_flatten(raw: str) -> str:
+    """正文压成单段: 折叠全部空白 (表格/换行), 保留中文标点."""
+    return re.sub(r"\s+", " ", str(raw or "")).strip()
+
+
+def chem_spot(text: str) -> str:
+    """源内甲醇下游标记: 命中 SPOT_DOWNSTREAM 且未命中全局品种词 -> SPOT_PREFIX (否则 '').
+
+    CTO 覆盖 §4.4: 单提 MTBE/甲醛/二甲醚/醋酸/MTO/MTP 的产业链消息必须放行 —— 全局
+    PRODUCT_ALIASES 里没有这些品种, 不加标记就会被品种门丢掉. 已命中全局品种 (含甲醇
+    本身, 如上游已带前缀的文本) 的条目不标记, 因此前缀不会二次叠加.
+    """
+    if first_hit(text, STRONG):          # 全局品种门 (filter_reason 的第一个保留分支)
+        return ""
+    return SPOT_PREFIX if hit(text, SPOT_DOWNSTREAM) else ""
+
+
+def chem_candidates(rows: list[dict]) -> list[dict]:
+    """列表级准入 (决定是否值得拉详情): 标题含品种词 且 含事件词或提示词."""
+    out = []
+    for r in rows:
+        title = r.get("title") or ""
+        if any(w in title for w in CHEM_TITLE_DENY):
+            continue
+        if not (first_hit(title, STRONG) or hit(title, SPOT_DOWNSTREAM)):
+            continue
+        if not (chem_event_hit(title) or any(w in title for w in CHEM_TIP)):
+            continue
+        out.append(r)
+    return out
+
+
+def chem_admit(title: str, body: str) -> bool:
+    """正文级准入: 供给侧事件词 + 品种词 (全局品种, 或源内甲醇下游 —— CTO 覆盖 §4.4)."""
+    text = f"{title} {body}"
+    return chem_event_hit(text) and (hit(text, STRONG) or hit(text, SPOT_DOWNSTREAM))
+
+
+def chem_text(title: str, body: str) -> str:
+    """条目文本 '标题：正文摘录', 总长 <= CHEM_TEXT_MAX; 长正文从事件词前 CHEM_LEAD 字截起."""
+    t = clean_text(title)[:CHEM_TITLE_MAX]
+    b = chem_flatten(clean_text(body))
+    if not t:
+        return ""
+    if not b:
+        out = t
+    else:
+        head = t + "："
+        if len(head) + len(b) <= CHEM_TEXT_MAX:
+            out = head + b
+        else:
+            pos = chem_event_pos(b)
+            start = max(0, pos - CHEM_LEAD) if pos >= 0 else 0
+            lead = "…" if start else ""
+            room = CHEM_TEXT_MAX - len(head) - len(lead) - 1
+            seg = b[start:start + max(1, room)]
+            tail = "…" if start + len(seg) < len(b) else ""
+            out = head + lead + seg + tail
+    tag = chem_spot(f"{title} {body}")
+    return out if (not tag or out.startswith(tag)) else tag + out
+
+
+def _chem_pick(src: str, cands: list[dict], referer: str, detail_fn, deadline,
+               detail_max: int = CHEM_DETAIL_MAX, admit_fn=chem_admit,
+               location: bool = False, prefer_detail: bool = False,
+               tried: list[str] | None = None) -> list[dict]:
+    """候选 -> 详情(限条数/限时/失败只丢本条) -> 准入; 返回 [{title, body, ts}].
+
+    Batch 13 从 _chem_source 拆出: 化销网 6 类目与我的钢铁/东财三个源的列表形态不同,
+    但「候选 -> 详情 -> 准入 -> 只丢本条」这一段完全相同, 必须共用 (否则三份拷贝
+    的失败语义会漂移). 参数全部有默认值 -> 隆众/化销网单页路径行为不变.
+
+    tried (Batch 13 修复): 传入列表时把**实际发起过详情请求**的 id 追加进去。化销网
+    用它跨阶段累计配额 (B13-F04), 东财用它在轮次间做源内轮转 (B13-F03)。
+    """
+    out: list[dict] = []
+    for r in cands[:detail_max]:
+        if deadline is not None and deadline - time.monotonic() < CHEM_DETAIL_MIN_S:
+            log(f"{src}: 详情预算不足, 剩余候选下轮再看")
+            break
+        if tried is not None:
+            tried.append(r["id"])       # 记录「已取过」: 失败也算, 避免每轮重复下载同一篇
+        try:
+            dpage = http(r["url"], referer, tries=1, deadline=deadline,
+                         location=location).decode("utf-8", "ignore")
+        except Exception as e:                    # 详情失败只丢本条, 不把源判失败
+            log(f"{src}: 详情失败, 跳过 {r['id']}: {type(e).__name__}")
+            continue
+        d = detail_fn(dpage)
+        if not d:
+            log(f"{src}: 详情不可解析, 跳过 {r['id']}")
+            continue
+        body = d.get("body") or ""
+        if not admit_fn(r["title"], body):
+            log(f"{src}: 准入未通过, 跳过 {r['id']}")
+            continue
+        dts = d.get("ts") or d.get("date_ts") or 0
+        ts = (dts or r["ts"]) if prefer_detail else (r["ts"] or dts)
+        out.append({"title": r["title"], "body": body, "ts": ts})
+    return out
+
+
+def _chem_feed(src: str, out: list[dict]) -> list[dict]:
+    """[{title, body, ts}] -> feed_items (文本拼装与 ts 传递; 与 Batch 12 逐字节等价)."""
+    def extract(x: dict) -> tuple[str, int] | None:
+        text = chem_text(x["title"], x["body"])
+        return (text, x["ts"]) if text else None
+
+    return feed_items(lambda: out, src, extract)
+
+
+def _chem_source(src: str, list_url: str, referer: str, rows_fn, detail_fn,
+                 deadline: float | None, detail_max: int = CHEM_DETAIL_MAX,
+                 admit_fn=chem_admit, age_s: int = CHEM_DETAIL_AGE_S) -> list[dict]:
+    """单页列表骨架 (隆众): 列表 -> 候选 -> 详情 -> feed_items."""
+    page = http(list_url, referer, tries=2, deadline=deadline).decode("utf-8", "ignore")
+    rows = rows_fn(page)
+    now = int(time.time())
+    cands = [r for r in chem_candidates(rows) if now - r["ts"] <= age_s]
+    return _chem_feed(src, _chem_pick(src, cands, referer, detail_fn, deadline,
+                                      detail_max, admit_fn))
+
+
+# ------------------------------------------------------------------ Batch 13 化工源扩容
+# 用户裁决的三处扩容: ① 化销网 6 类目合并 ② 我的钢铁能化「甲醇及下游」 ③ 东财甲醇 tag.
+# 三站都是服务端渲染静态 HTML, 走既有「列表 -> 候选 -> 详情 -> feed_items」骨架, 零第三方
+# 依赖. 准入差异 (实测决定, 不是偏好): 化销网/东财有正文 -> 沿用 chem_admit; 我的钢铁只有
+# ~181 字导语、装置类导语为空 -> 用 CHEM_EVENT_STRONG 在标题级兜底 (my_admit).
+MY_BASE = "https://nenghua.mysteel.com"
+MY_LIST_URL = MY_BASE + "/breed/jcjxy/"                    # robots 禁 /*?* -> 不得拼查询串
+EM_MA_LIST_URL = "https://futures.eastmoney.com/qihuo/ma.html"
+# 化销网类目抓取顺序 = 价值/详情优先级 (B13-F04): 13 上游 / 14 下游 是装置动态的实际
+# 来源, 最先抓列表并**立刻取详情**; 其次 22 国内 (既有类目, 保留 tries=2 与结构哨兵硬
+# 失败); 23 国际 / 21 期货 / 20 撮合 实测近乎停更, 预算不足时优先截断。
+# 旧顺序把 22 放最前: 慢轮 6 次列表吃满 4.62s 后 22 的详情先拿, 13/14 的装置动态反而
+# 排到预算之外 —— 慢轮恒 0 条 (评审核查 F-04)。
+HXW_CATS = (13, 14, 22, 23, 21, 20)
+HXW_PRIORITY_CATS = (13, 14)  # 高价值: 列表后立刻取详情, 不与「剩余类目」抢预算
+HXW_LIST_MIN_S = CHEM_DETAIL_MIN_S   # 低于详情阈值 -> 截断后续类目 (发了也拉不动详情)
+HXW_DETAIL_MAX = 6            # 6 类目共用: 每轮最多 6 篇详情 (单类目时 CHEM_DETAIL_MAX=4)
+MY_DETAIL_MAX = 4             # 我的钢铁: 列表 ~287 行, 工作日新增 10-40 条, 候选 2-9 条
+EM_MA_DETAIL_MAX = 1          # 东财 tag: 日增 0.5-1 条甲醇长文, 配额不浪费也不挤别人
+EM_MA_AGE_S = 36 * 3600       # 东财列表只有日期 (无时分) -> 年龄闸门按「今日/昨日」, 精确
+                              # 陈旧判定交给 max_age (详情时间到分钟)
+# 东财 tag 是「甲醇」聚合页 (实测 15 条唯一链接仅 3 条甲醇): 列表级先按标题筛甲醇;
+# 锚点词识别「日评/机构观点」长文 —— 用户裁决里东财承担「日评锚点」, 故除事件门外
+# 另开一道锚点门 (正文 >= 300 字才放行, 快讯类一律丢)
+EM_MA_ANCHOR = ("金联创", "甲醇：", "能化 | 甲醇", "甲醇市场")
+# 「XX 装置快讯」的导语是固定模板的企业简介 (实测 181 字, 末句「投产时间：2014年11月」
+# 会命中强事件词「投产」) -> 命中这些模板标记时正文不算事件材料, 退回标题级判定
+MY_BOILER = ("企业简介", "投产时间：", "原料库容")
+
+
+def src_hxw(deadline: float | None = None) -> list[dict]:
+    """化销网 6 类目合并 (13 上游 / 14 下游 / 22 国内 / 23 国际 / 21 期货 / 20 撮合) + 详情.
+
+    Batch 13: 单类目 (catid=22) 扩为 6 类目, **源数不变**, robots.txt 全开放 (Batch 12 实测).
+    抓取分三阶段 (B13-F04 修复):
+      ① 高价值类目 13/14 列表 -> **立刻取详情** (装置动态的主来源, 不被慢轮牺牲);
+      ② 其余类目 22/23/21/20 列表, 剩余份额 < HXW_LIST_MIN_S 时**截断**后续类目;
+      ③ 其余候选详情, 只吃 ① 之后剩下的详情配额。
+    - 源内按 infoshow id 去重 (实测当日 6×20 条零重叠; 跨类目归属调整时防御);
+    - **不做跨类目时间排序**: 列表自身即站方时间序;
+    - 单类目列表失败 (含 hxw_rows 的结构哨兵) 只跳过该类目并记一行日志; 类目 22 的
+      哨兵保持硬失败 (与 Batch 12 一致); 合并后 0 条才判源失败.
+    """
+    rows: list[dict] = []
+    seen: set[str] = set()
+    failed: list[str] = []
+    attempted: list[int] = []
+
+    def _load(cats: tuple[int, ...]) -> None:
+        for cat in cats:
+            attempted.append(cat)
+            url = f"{HXW_BASE}/index/quote/infolist?catid={cat}"
+            try:
+                page = http(url, url, tries=2 if cat == 22 else 1,
+                            deadline=deadline).decode("utf-8", "ignore")
+            except Exception as e:
+                failed.append(f"{cat}:{type(e).__name__}")
+                continue
+            try:
+                got = hxw_rows(page)      # 自带 4 道哨兵; 图标 <i> 由 clean_text 吸收
+            except RuntimeError as e:
+                if cat == 22:             # 既有类目结构变化 -> 源失败 (Batch 12 语义)
+                    raise
+                failed.append(f"{cat}:{str(e)[:40]}")
+                continue
+            for r in got:
+                if r["id"] in seen:
+                    continue
+                seen.add(r["id"])
+                rows.append(r)
+
+    now = int(time.time())
+
+    def _cands() -> list[dict]:
+        return [r for r in chem_candidates(rows) if now - r["ts"] <= CHEM_DETAIL_AGE_S]
+
+    tried: list[str] = []
+    _load(HXW_PRIORITY_CATS)
+    out = _chem_pick("化销网", _cands(), HXW_LIST_URL, hxw_detail, deadline,
+                     HXW_DETAIL_MAX, tried=tried)
+    rest = tuple(c for c in HXW_CATS if c not in HXW_PRIORITY_CATS)
+    for cat in rest:
+        if deadline is not None and deadline - time.monotonic() < HXW_LIST_MIN_S:
+            skipped = [c for c in rest if c not in attempted]
+            log(f"化销网: 预算不足, 截断后续 {len(skipped)} 类目列表 "
+                f"({', '.join(map(str, skipped))}), 详情优先")
+            break
+        _load((cat,))
+    left = HXW_DETAIL_MAX - len(tried)
+    if left > 0:
+        more = [r for r in _cands() if r["id"] not in tried]
+        out.extend(_chem_pick("化销网", more, HXW_LIST_URL, hxw_detail, deadline,
+                              left, tried=tried))
+    if failed:
+        log(f"化销网: {len(failed)} 类目列表失败, 下轮重试 ({', '.join(failed)})")
+    if not rows:
+        raise RuntimeError(
+            f"化销网: 类目合并后 0 条 (疑似结构变化, 列表失败 {len(failed)} 个 / "
+            f"尝试 {len(attempted)} 个)")
+    return _chem_feed("化销网", out)
+
+
+def my_list_ts(url: str) -> int:
+    """文章 URL 的 /a/YYMMDDHH/ -> 该整点 (Asia/Shanghai) 的 epoch; 不可解析返回 0.
+
+    列表只有 [MM-DD] (无年份/无时分), URL 里的 YYMMDDHH 补全年份并给到小时。用整点
+    作 ts 比真实发布时间**偏早** (最多 59 分钟), 年龄闸门因此偏保守 —— 不会把陈旧
+    条目误放进详情队列。精确到秒的 ts 由详情 meta[name=publish] 提供。
+    """
+    m = re.search(r"/a/(\d{2})(\d{2})(\d{2})(\d{2})/[0-9A-Fa-f]+\.html", str(url or ""))
+    if not m:
+        return 0
+    try:
+        yy, mo, dd, hh = (int(m.group(i)) for i in range(1, 5))
+        return sane_ts(int(datetime(2000 + yy, mo, dd, hh, tzinfo=TZ_CN).timestamp()))
+    except ValueError:
+        return 0
+
+
+MY_ROW_RE = re.compile(
+    # B13-F02: 当日条目用 `<span  class="red" >` (双空格 + 行内样式变体), 旧的
+    # `<span\s*>` 会漏掉当天全部条目 -> 4h 内候选恒 0。放宽为 `<span[^>]*>`,
+    # 但**保持条目级上下文锚定**: 必须 `<li ...>` 紧跟 `<span ...>[MM-DD]</span>`
+    # 且 `<a href="https://nenghua.mysteel.com/a/...">`, 页面其它位置的 `[MM-DD]`
+    # 文本 (面包屑/侧栏/正文日期) 不匹配。
+    r'<li\b[^>]*>\s*<span[^>]*>\[(\d{2}-\d{2})\]</span>\s*'
+    r'<a href="(https://nenghua\.mysteel\.com/a/\d{8}/[0-9A-Fa-f]+\.html)"'
+    r'(?:\s+title="[^"]*")?[^>]*>(.*?)</a>', re.S)
+
+
+def my_rows(page: str) -> list[dict]:
+    """我的钢铁 能化「甲醇及下游」列表 -> [{id,title,ts,url}]; 结构变化抛 RuntimeError.
+
+    实测 (2026-11-10 11:00): 页面 `[MM-DD]` 条目 287 个, 其中 `<span  class="red" >`
+    的当日条目 79 个; 放宽 span 属性后 287/287 全部解析, 按 URL 去重后 285 条 (同一
+    URL 在多个栏目块重复出现), 4h 内候选 4 条。标题属性里可能带 U+200B 零宽空格,
+    clean_text 后仍有残留 -> 统一再剥一次。
+    """
+    rows: list[dict] = []
+    seen: set[str] = set()
+    for m in MY_ROW_RE.finditer(page or ""):
+        url = m.group(2)
+        if url in seen:
+            continue
+        seen.add(url)
+        rows.append({"id": url,
+                     "title": clean_text(m.group(3)).replace("\u200b", "").strip(),
+                     "ts": my_list_ts(url),
+                     "url": url})
+    if not rows:
+        raise RuntimeError("我的钢铁: 列表 0 条 (疑似结构变化)")
+    if all(not r["ts"] for r in rows):
+        raise RuntimeError("我的钢铁: 列表时间全不可解析 (疑似结构变化)")
+    if not any(CJK_RE.search(r["title"]) for r in rows):
+        raise RuntimeError("我的钢铁: 列表标题无中文 (疑似编码变化)")
+    return rows
+
+
+def my_detail(page: str) -> dict | None:
+    """我的钢铁详情 -> {body, ts}; 正文容器缺失返回 None (该条跳过, 下轮再看).
+
+    正文只有 ~181 字导语且**可能为空** (装置动态/损失量类 #article-content 为 0 字符)
+    —— 空正文是已知形态, 必须返回 body='' 交 my_admit 用标题兜底, 不能当结构失败。
+    边界取到 `<div class="editor"` 之前: 导语之后紧跟登录脚本与「资讯编辑」块,
+    取首个 </div> 会把编辑电话拉进正文 (实测)。
+    """
+    marker = '<div class="content-text" id="article-content">'
+    i = (page or "").find(marker)
+    if i < 0:
+        return None
+    start = i + len(marker)
+    j = page.find('<div class="editor"', start)
+    body = clean_text(strip_embed(page[start:j if j > start else start]))
+    pm = re.search(r'name="publish" content="published at '
+                   r'(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})', page)
+    return {"body": body, "ts": parse_ts(pm.group(1)) if pm else 0}
+
+
+def my_candidates(rows: list[dict]) -> list[dict]:
+    """列表级候选 (我的钢铁): 商品种词 且 (强事件词 或 提示/前瞻栏目词).
+
+    比化销网的 chem_candidates 严一档: 「装置」不算。实测 11-09 有 5 条
+    「XX 甲醇装置动态/装置快讯」, 导语为空或企业简介, 见「装置」就拉详情纯属浪费
+    (调研报告 §8.3 同样结论)。
+    """
+    out: list[dict] = []
+    for r in rows:
+        title = r.get("title") or ""
+        if any(w in title for w in CHEM_TITLE_DENY):
+            continue
+        if not (first_hit(title, STRONG) or hit(title, SPOT_DOWNSTREAM)):
+            continue
+        if not (chem_event_hit(title, CHEM_EVENT_STRONG)
+                or any(w in title for w in CHEM_TIP)):
+            continue
+        out.append(r)
+    return out
+
+
+def my_admit(title: str, body: str) -> bool:
+    """正文级准入 (我的钢铁): 强事件词 + 品种词, 标题 ∪ 导语一起判; 导语空则只判标题.
+
+    「导语为空是否放行」的裁决: **放行, 但仅当标题自身同时给出方向与品种**。
+    [损失量]：中国甲醇装置检修数据统计 -> 检修 + 甲醇 -> 放行 (标题即全部信息);
+    内蒙古远兴能源甲醇装置动态 -> 只有「装置」无方向 -> 丢弃 (无信息量且天天重复);
+    联泓MTO装置快讯 (导语=企业简介) -> 正文无强事件词 -> 丢弃 (样板文不是事件)。
+    """
+    if any(w in body for w in MY_BOILER):        # 企业简介样板文不是事件材料
+        body = ""
+    text = f"{title} {body}"
+    return (chem_event_hit(text, CHEM_EVENT_STRONG)
+            and (hit(text, STRONG) or hit(text, SPOT_DOWNSTREAM)))
+
+
+def src_mysteel(deadline: float | None = None) -> list[dict]:
+    """我的钢铁 能化「甲醇及下游」: 列表 (无查询串, robots 禁 /*?*) + 详情导语.
+
+    「事件雷达」源: 只取标题 + 181 字导语 (全文在会员区, 不越界不绕过), 装置/检修
+    事件靠标题级强事件词兜底。时间戳到秒 (详情 meta[name=publish])。
+    """
+    page = http(MY_LIST_URL, MY_LIST_URL, tries=2,
+                deadline=deadline).decode("utf-8", "ignore")
+    rows = my_rows(page)
+    now = int(time.time())
+    cands = [r for r in my_candidates(rows) if now - r["ts"] <= CHEM_DETAIL_AGE_S]
+    return _chem_feed("我的钢铁", _chem_pick("我的钢铁", cands, MY_LIST_URL, my_detail,
+                                            deadline, MY_DETAIL_MAX, my_admit,
+                                            prefer_detail=True))
+
+
+def em_id_ts(aid: str) -> int:
+    """东财稿件 id 形如 202611093926259150 (前 8 位 = YYYYMMDD) -> 当日 00:00 +08; 否则 0."""
+    m = re.match(r"(\d{4})(\d{2})(\d{2})", str(aid or ""))
+    if not m:
+        return 0
+    try:
+        return sane_ts(int(datetime(int(m.group(1)), int(m.group(2)),
+                                    int(m.group(3)), tzinfo=TZ_CN).timestamp()))
+    except ValueError:
+        return 0
+
+
+EM_MA_ROW_RE = re.compile(
+    r'<a href="(https?://[a-z.]*eastmoney\.com/a/(\d{11,})\.html)"[^>]*?'
+    r'title="([^"]*)"', re.S)
+
+
+def em_ma_rows(page: str) -> list[dict]:
+    """东财 甲醇 tag 页 -> [{id,title,ts,url}]; 同一稿件在两个区块重复 -> 按 id 去重.
+
+    锚文标题被截断成「…」, 故取 `title=` 属性 (完整标题) 而不是 <a> 内文。
+    """
+    rows: list[dict] = []
+    seen: set[str] = set()
+    for m in EM_MA_ROW_RE.finditer(page or ""):
+        url, aid, title = m.group(1), m.group(2), clean_text(m.group(3))
+        if aid in seen:
+            continue
+        seen.add(aid)
+        rows.append({"id": aid, "title": title, "ts": em_id_ts(aid), "url": url})
+    if not rows:
+        raise RuntimeError("东财甲醇: 列表 0 条 (疑似结构变化)")
+    if not any(CJK_RE.search(r["title"]) for r in rows):
+        raise RuntimeError("东财甲醇: 列表标题无中文 (疑似编码变化)")
+    return rows
+
+
+# 多品种日报的分节标记: 【原油】【燃料油】【甲醇】… (全角/半角括号, 括号内允许空格)
+EM_SECTION_RE = re.compile(r"[【\[]\s*([^】\]]{1,10}?)\s*[】\]]")
+
+
+def em_methanol_section(body: str) -> str | None:
+    """东财正文 -> 甲醇段; 多品种日报切【甲醇】, 无分节标记的纯甲醇文整篇返回.
+
+    B13-F01: 东财 tag 会混入多品种日报 (实测 202611103926942138: 正文 2605 字、
+    12 个【xx】分节, 【甲醇】在第 1009 字)。旧实现取整个 #ContentBody -> 入队前
+    700 字全是原油/燃料油/沥青/LPG, 甲醇 0 字 = 把别的品种内容挂在甲醇标题下。
+    规则:
+      - 正文有分节标记时, 只保留【甲醇】标记起、到**下一个【xx】之前**的段落;
+        找不到【甲醇】段 -> None (宁缺毋滥, **绝不**回退成整段正文);
+      - 正文没有任何分节标记 -> 整篇返回 (金联创 429 字纯甲醇日评即此形态);
+      - 全角/半角括号、括号内空格均识别。
+    """
+    s = str(body or "")
+    marks = list(EM_SECTION_RE.finditer(s))
+    if not marks:
+        return s.strip() or None
+    for k, m in enumerate(marks):
+        if re.sub(r"\s+", "", m.group(1)) != "甲醇":
+            continue
+        end = marks[k + 1].start() if k + 1 < len(marks) else len(s)
+        seg = s[m.start():end].strip()
+        return seg or None
+    return None
+
+
+def em_detail(page: str) -> dict | None:
+    """东财详情 -> {body, ts}; 正文容器缺失 / 多品种日报无【甲醇】段返回 None.
+
+    正文取 div.txtinfos#ContentBody 到 div.zwothers 之前 (之后是「文章来源/责任编辑」),
+    再按 B13-F01 切【甲醇】段 (多品种日报只留甲醇; 无分节标记的纯甲醇文整篇保留)。
+    ts 取页内「2026年11月09日 16:04」(到分钟) —— 页首 `<!--published at ...-->` 是
+    服务端渲染时刻, 不是发布时间, **不可用** (实测两者相差数小时)。
+    """
+    i = (page or "").find('id="ContentBody"')
+    if i < 0:
+        return None
+    start = page.find(">", i) + 1
+    j = page.find('<div class="zwothers"', start)
+    body = clean_text(strip_embed(page[start:j if j > start else start]))
+    seg = em_methanol_section(body)
+    if seg is None:                 # 多品种日报里没有甲醇段 -> 宁缺毋滥, 不入队
+        return None
+    tm = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日\s*(\d{1,2}):(\d{2})", page)
+    ts = 0
+    if tm:
+        try:
+            ts = sane_ts(int(datetime(int(tm.group(1)), int(tm.group(2)), int(tm.group(3)),
+                                      int(tm.group(4)), int(tm.group(5)),
+                                      tzinfo=TZ_CN).timestamp()))
+        except ValueError:
+            ts = 0
+    return {"body": seg, "ts": ts}
+
+
+def em_ma_candidates(rows: list[dict]) -> list[dict]:
+    """列表级候选 (东财 tag): 标题含甲醇 (聚合页 ~83% 是纯碱/PX/龙虎榜噪声) 且
+    (强事件词 或 提示词 或 日评锚点词)."""
+    out: list[dict] = []
+    for r in rows:
+        title = r.get("title") or ""
+        if "甲醇" not in title:
+            continue
+        if not (chem_event_hit(title, CHEM_EVENT_STRONG)
+                or any(w in title for w in CHEM_TIP)
+                or any(w in title for w in EM_MA_ANCHOR)):
+            continue
+        out.append(r)
+    return out
+
+
+def em_admit(title: str, body: str) -> bool:
+    """正文级准入 (东财): **正文必须含「甲醇」** + 事件门 或 日评锚点门.
+
+    B13-F01 硬条件: 正文不含「甲醇」-> 一律 False。多品种日报切段后正文即【甲醇】段,
+    单品种文整篇保留; 这条同时兜住「切段逻辑失效时回退整篇」的退路 (宁缺毋滥)。
+    事件门拦「甲醇主力合约日内涨幅扩大至 2.00%」这类快讯; 锚点门放行金联创/机构日评
+    (用户裁决里东财的职能就是「日评锚点」), 并用正文长度排除同名快讯。
+    """
+    if "甲醇" not in (body or ""):
+        return False
+    text = f"{title} {body}"
+    if (chem_event_hit(text, CHEM_EVENT_STRONG)
+            and (hit(text, STRONG) or hit(text, SPOT_DOWNSTREAM))):
+        return True
+    return any(w in title for w in EM_MA_ANCHOR) and len(body) >= 300
+
+
+_EM_DETAIL_SEEN: set[str] = set()   # B13-F03 进程内轮转: 已取过详情的东财稿件 id
+
+
+def src_em_ma(deadline: float | None = None) -> list[dict]:
+    """东财 甲醇 tag (qihuo/ma.html): 全文免费, 可读到金联创被 507 挡住的转载稿.
+
+    聚合页噪声大 -> 列表级先按标题含「甲醇」筛; 每轮最多 1 篇详情。详情
+    futures.eastmoney.com/a/<id>.html 会 302 到 finance.eastmoney.com/a/<id>.html,
+    故详情必须 http(..., location=True) (-L); 列表页本身直出 200, 不带 -L。
+
+    源内轮转 (B13-F03): 每轮详情配额只有 1 篇, 旧实现恒取列表第一篇 -> 第二篇永久
+    饿死, 且同一篇每轮被重复下载。改为记住**已取过详情**的稿件 id: 每轮优先取未取过
+    的候选; **全都取过则不再发详情请求**。集合每轮按当前候选裁剪, 不会随进程时长
+    无界增长; 纯进程内变量, 不写 state/queue, 不新增持久化字段或 `_` 元数据键。
+    """
+    global _EM_DETAIL_SEEN
+    page = http(EM_MA_LIST_URL, EM_MA_LIST_URL, tries=2,
+                deadline=deadline).decode("utf-8", "ignore")
+    rows = em_ma_rows(page)
+    now = int(time.time())
+    cands = [r for r in em_ma_candidates(rows) if now - r["ts"] <= EM_MA_AGE_S]
+    if not cands:
+        _EM_DETAIL_SEEN.clear()
+        return []
+    _EM_DETAIL_SEEN &= {r["id"] for r in cands}      # 候选已翻出去的 id 从记忆里裁掉
+    fresh = [r for r in cands if r["id"] not in _EM_DETAIL_SEEN]
+    if not fresh:
+        log("东财甲醇: 候选详情均已取过, 本轮不再下载")
+        return []
+    tried: list[str] = []
+    out = _chem_feed("东财甲醇", _chem_pick("东财甲醇", fresh, EM_MA_LIST_URL, em_detail,
+                                            deadline, EM_MA_DETAIL_MAX, em_admit,
+                                            location=True, prefer_detail=True,
+                                            tried=tried))
+    _EM_DETAIL_SEEN.update(tried)
+    return out
+
+
+def src_lz(deadline: float | None = None) -> list[dict]:
+    """隆众资讯 资讯列 (list.oilchem.net/1/9): 只用无查询串 URL (robots 禁 /*?*)."""
+    return _chem_source("隆众", LZ_LIST_URL, LZ_LIST_URL,
+                        lz_rows, lz_detail, deadline)
+
+
 # ------------------------------------------------------------------ Batch 7 研报源
 def _month_back(now: datetime, back: int) -> str:
     """往前数 back 个自然月的 YYYYMM (back>=1; 2026-11 + back=1 -> '202610')."""
@@ -1982,6 +2731,12 @@ SOURCES = [("财联社", src_cls), ("东财", src_em), ("同花顺", src_ths),
            ("MiningTech", src_miningtech), ("Nasdaq", src_nasdaq),
            ("CNBC", src_cnbc), ("MarketWatch", src_marketwatch),
            ("Investing", src_investing), ("Hellenic", src_hellenic),
+           # Batch 12 化工现货源: 接在 14 个既有抓取源之后、研报源之前 —— 既有 14 源的
+           # 份额分母与研报三源的 (idx,total) 差因此都保持不变 (见 slice_remaining).
+           ("化销网", src_hxw), ("隆众", src_lz),
+           # Batch 13: 化工源扩容 —— 同属 CHEM_SRCS 块, 因此既有 14 源的份额分母
+           # 与研报三源的 (idx,total) 差仍然保持不变 (见 slice_remaining).
+           ("我的钢铁", src_mysteel), ("东财甲醇", src_em_ma),
            # Batch 7 研报源: 排在最后, 前 14 源的先后与 MIN_SLICE 份额不变; 每 30 分钟
            # 才真正跑一次 (见 main 的 _research 节流), PDF 正文在抓取循环之后单独提。
            ("东财研报", src_em_report), ("中金所", src_cffex), ("中期协", src_cfa)]
@@ -2501,31 +3256,152 @@ def research_line(it: dict, dt: datetime) -> str:
     return f"<b>{plain}</b>"                  # 保底: 整行纯文本, 保证 split_msg 一定拆得开
 
 
+def research_partial(it: dict) -> bool:
+    """条目是否处于「分片连载未发完」状态 (Batch 11).
+
+    只有 0 < parts_sent < parts_total 才算连载; 老队列条目没有这两个字段 -> False,
+    行为与 Batch 10 完全一致。
+    """
+    done, total = to_int(it.get("parts_sent")), to_int(it.get("parts_total"))
+    return 0 < done < total
+
+
+def split_research_body(body: str, budget: int = RESEARCH_PART_MAX) -> list[str]:
+    """把清洗后的正文按「转义后 u16 <= budget」切成连续分片 (Batch 11).
+
+    切分顺序: 句末标点 > 分句标点 > 硬切; 句末切分要求已填充 >= RESEARCH_PART_MIN_FILL,
+    否则退到硬切 (避免「一个句号紧跟长句」把分片切成一两个字)。
+    只在分片边界丢弃空白, 不丢任何可见字符: "".join(parts) 去掉空白后与原文去空白逐字符相同。
+    """
+    text = str(body or "")
+    if not text:
+        return []
+    parts: list[str] = []
+    start, n = 0, len(text)
+    while start < n:
+        used, i, cut_at, cut_used = 0, start, -1, 0
+        while i < n:
+            cost = u16(esc_quote(text[i]))
+            if used + cost > budget:
+                break
+            used += cost
+            i += 1
+            if text[i - 1] in RESEARCH_SENT_END:
+                cut_at, cut_used = i, used
+        if i >= n:                                  # 剩余全部装得下
+            parts.append(text[start:].strip())
+            break
+        end = cut_at if (cut_at > start and cut_used >= RESEARCH_PART_MIN_FILL) else i
+        parts.append(text[start:end].strip())
+        start = end
+        while start < n and text[start] == " ":
+            start += 1
+    return [p for p in parts if p]
+
+
+def research_head(it: dict, dt: datetime, i: int, n: int) -> list[str]:
+    """分片头行 (Batch 11): 源/日期 + (i/n) + 标题; 元信息只放首片.
+
+    标题预算按片位取值: 带链接的末片用 RESEARCH_TITLE_PART_MAX, 其余片沿用 ITEM_MAX,
+    这样「700 字标题 + 2400 字正文 + 1000 u16 链接」也不会顶到 MSG_MAX。
+    """
+    title_max = RESEARCH_TITLE_PART_MAX if i >= n else ITEM_MAX
+    head, _, meta = it["text"].partition("｜")
+    lines = [f"<b>{esc(it['src'])} {dt:%m-%d}</b> {RESEARCH_PART_MARK.format(i=i, n=n)}",
+             f"<b>{esc_quote_limited(head, title_max)}</b>"]
+    if meta and i == 1:
+        lines.append(esc_quote_limited(meta, RESEARCH_META_MAX))
+    return lines
+
+
+def research_parts(it: dict, dt: datetime) -> list[str]:
+    """研报条目 -> 全部分片消息文本 (Batch 11). 纯函数: 只依赖条目字段与 dt.
+
+    单片且整条消息 <= MSG_MAX 时**逐字节**沿用 research_line() —— 非分片路径零改动,
+    老条目 (240 字) 与无正文条目因此与 Batch 10 完全一致 (B11-06)。
+    """
+    body = str(it.get("snippet") or "").strip()
+    if not is_http_url(it.get("url")) or not body:
+        return [research_line(it, dt)]
+    parts = split_research_body(body, RESEARCH_PART_MAX)
+    if len(parts) == 1:
+        single = research_line(it, dt)
+        if u16(single) <= MSG_MAX and "\n" in single:
+            # 富文本研报行必然多行; 单行 = research_line 已降级为纯文本 (正文已丢), 必须强制分片
+            return [single]
+        # 正文装得进一片, 但标题/链接太长把整行顶爆: 强制切两片, 别退化成「丢正文的纯文本」
+        parts = split_research_body(body, max(1, u16(esc_quote(body)) // 2 + 1))
+        if len(parts) == 1:
+            return [single]
+    n = len(parts)
+    href = esc_url(it["url"]) if len(it["url"]) <= RESEARCH_URL_MAX else ""
+    if href and u16(href) > RESEARCH_URL_U16_MAX:
+        href = ""
+    out: list[str] = []
+    for i, chunk in enumerate(parts, 1):
+        lines = research_head(it, dt, i, n) + [esc_quote(chunk)]
+        if i == n:
+            lines.append(f'<a href="{href}">查看原文</a>' if href
+                         else f"（原文链接过长 {len(it['url'])} 字符, 已省略）")
+        out.append("\n".join(lines))
+    return out
+
+
 # ------------------------------------------------------------------ main
-def build_messages(batch: list[dict]) -> list[tuple[str, list[dict]]]:
-    """整行拼接, 不切断标签; 按 UTF-16 码元装满一条就开下一条 (F-09 拆批发送)."""
-    msgs: list[tuple[str, list[dict]]] = []
+def build_messages_ex(batch: list[dict], part_budget: int | None = None
+                      ) -> list[tuple[str, list[dict], dict[str, tuple[int, int]]]]:
+    """整行拼接 + 研报全文分片 (Batch 11): 返回 (文本, 本条消息完成投递的条目, 分片进度).
+
+    第三元素 {key: (已发片数, 总片数)} 只对「本条消息发出但条目还没连载完」的分片消息非空:
+    flush_round 据此把续发进度写回队列, 中断后从下一片继续 (不重发已发片)。
+    研报分片**独占消息**: 进入分片前先 flush 已攒的普通条目, 分片之间也不与任何条目同条。
+    part_budget 是每轮分片消息上限 (限流); 用尽时剩余条目本轮不渲染, 由调用方推迟到下一轮。
+    """
+    if part_budget is None:                       # 调用时读常量: 便于单测 patch 与配置覆写
+        part_budget = RESEARCH_PARTS_PER_ROUND
+    msgs: list[tuple[str, list[dict], dict[str, tuple[int, int]]]] = []
     lines, used, budget = [], [], 0
+    emitted = 0                                   # 本轮已渲染的研报分片消息数
     now_date = datetime.now(TZ_CN).date()
     for it in batch:
+        dt = datetime.fromtimestamp(it["ts"], TZ_CN)
+        parts = research_parts(it, dt) if is_http_url(it.get("url")) else []
+        if len(parts) > 1:                        # 研报全文分片: 独占消息
+            if lines:
+                msgs.append(("\n\n".join(lines), used, {}))
+                lines, used, budget = [], [], 0
+            n = len(parts)
+            start = min(max(0, to_int(it.get("parts_sent"))), n - 1)   # 越界夹取: 不丢条目也不死循环
+            for i in range(start, n):
+                if emitted >= part_budget:
+                    return msgs                   # 分片预算用尽: 剩余条目推迟到下一轮
+                done = i + 1
+                msgs.append((parts[i], [] if done < n else [it],
+                             {it["key"]: (done, n)} if done < n else {}))
+                emitted += 1
+            continue
         body = it["text"]
         if len(body) > ITEM_MAX:
             body = body[:ITEM_MAX] + "…"
-        dt = datetime.fromtimestamp(it["ts"], TZ_CN)
         stamp = dt.strftime("%H:%M") if dt.date() == now_date else dt.strftime("%m-%d %H:%M")
-        line = (research_line(it, dt) if is_http_url(it.get("url"))
+        line = (parts[0] if parts
                 else f"<b>{esc(it['src'])} {stamp}</b>\n{esc(body)}")
         add = u16(line) + (2 if lines else 0)
         if lines and budget + add > MSG_MAX:
-            msgs.append(("\n\n".join(lines), used))
+            msgs.append(("\n\n".join(lines), used, {}))
             lines, used, budget = [], [], 0
             add = u16(line)
         lines.append(line)
         used.append(it)
         budget += add
     if lines:
-        msgs.append(("\n\n".join(lines), used))
+        msgs.append(("\n\n".join(lines), used, {}))
     return msgs
+
+
+def build_messages(batch: list[dict]) -> list[tuple[str, list[dict]]]:
+    """兼容旧调用: 丢掉分片进度 (Batch 11 起内部走 build_messages_ex)。"""
+    return [(text, used) for text, used, _prog in build_messages_ex(batch)]
 
 
 def build_message(batch: list[dict]) -> tuple[str, list[dict]]:
@@ -2547,6 +3423,16 @@ def slice_deadline(deadline: float, now: float, remaining: int,
     left = deadline - now
     share = (left / remaining) if remaining > 0 else left
     return min(deadline, now + max(min_slice, share))
+
+
+def slice_remaining(idx: int, total: int) -> int:
+    """单源份额的分母 (Batch 12): 既有源沿用加源前的「剩余源数」口径.
+
+    新接入的 CHEM_SRCS 不占既有源的份额分母, 45s 预算下既有源的 src_dl 与加源前
+    逐秒相同; 新源自己按 total - idx 计 (它们只吃 floor(MIN_SLICE)).
+    """
+    chem_after = sum(1 for n, _ in SOURCES[idx + 1:] if n in CHEM_SRCS)
+    return max(1, total - idx - chem_after)
 
 
 def _resolve_annotations(cls):
@@ -2696,7 +3582,7 @@ def load_conf(args: list[str]) -> tuple[dict, RunOpts]:
 
 def fetch_round(conf: dict, opts: RunOpts, seen: dict, ctx: RoundContext,
                 deadline: float) -> FetchResult:
-    """17 源抓取循环 + 研报节流 + TS_BAD 归因 (R2 阶段 2). 不发告警、不落盘."""
+    """19 源抓取循环 + 研报节流 + TS_BAD 归因 (R2 阶段 2). 不发告警、不落盘."""
     items, errors, outcomes = [], [], []
     # Batch 7: 研报源按源节流 (默认 30 分钟一轮); 跳过记 SRC_SKIP, 不算失败也不告警.
     # 失败源 5 分钟后重试, 避免「一坏就静默半小时」.
@@ -2720,7 +3606,7 @@ def fetch_round(conf: dict, opts: RunOpts, seen: dict, ctx: RoundContext,
             outcomes.append((name, SRC_SKIP))   # 跳过不是失败: 不写 errors (Batch 6 U4-F-05)
             log(f"{name}: 跳过, 全局预算 {opts.budget}s 已耗尽")
             continue
-        src_dl = slice_deadline(deadline, now, total - idx)   # 单源份额: 慢源吃不掉整轮 (6.1 U-B)
+        src_dl = slice_deadline(deadline, now, slice_remaining(idx, total))   # 单源份额: 慢源吃不掉整轮 (6.1 U-B / B12)
         t0 = time.monotonic()
         ok = False
         try:
@@ -3028,12 +3914,24 @@ def flush_round(conf: dict, opts: RunOpts, seen: dict,
     plan.queue.sort(key=lambda x: (x["ts"], x["src"]))
     batch = plan.queue[:plan.digest_items]
     rest_after = plan.queue[plan.digest_items:]
-    msgs = build_messages(batch)
+    msgs = build_messages_ex(batch)
+    # Batch 11: 分片预算用尽时 build_messages_ex 只渲染了一部分条目 -> 本轮不得老化
+    _rendered = {it["key"] for _t, _u, _p in msgs
+                 for it in (_u + [{"key": k} for k in _p])}
+    parts_deferred = len(_rendered) < len(batch)
+    part_progress: dict[str, tuple[int, int]] = {}   # key -> (已发片数, 总片数)
     sent: list[dict] = []
+
+    # ---- Batch 11 (CTO 追加): 毒丸 —— 同一片连续失败 3 次 -> 放弃该篇剩余片 ----
+    def _b11_item(_key: str) -> dict | None:
+        return next((it for it in batch if it["key"] == _key), None)
+
+    failed_it: dict | None = None    # 本轮失败分片所属条目 (None = 失败的不是研报分片)
+    poison: list[dict] = []          # 判毒丸的条目: 出队 + 写 seen + err 留痕
     sent_msgs = 0
     failed = False
     deferred = False
-    for idx, (text, used) in enumerate(msgs, 1):
+    for idx, (text, used, prog) in enumerate(msgs, 1):
         if not send_time_ok(ctx):         # Batch 9 A-F-01: 每条消息发送前都过闸门
             deferred = True
             log(f"第 {idx}/{len(msgs)} 批发送推迟到下一轮 "
@@ -3041,23 +3939,71 @@ def flush_round(conf: dict, opts: RunOpts, seen: dict,
             break
         if not send(text, conf, tk):
             failed = True
+            # [CTO 毒丸] 失败的是哪一篇的哪一片: 非末片看 prog; 末片 used=[it] 且 prog 为空,
+            # 用本轮已累计的进度或队列里的 parts_* 认出来 (普通消息不参与毒丸计数)。
+            _fk = next(iter(prog), "")
+            if not _fk and len(used) == 1:
+                _cand = used[0]
+                _ck = str(_cand.get("key") or "")
+                _prog = part_progress.get(_ck)
+                _pt = to_int(_cand.get("parts_total"))
+                _ps = to_int(_cand.get("parts_sent"))
+                if (_prog and _prog[1] > 1) or (_pt > 1 and _ps >= _pt - 1):
+                    _fk = _ck
+            if _fk:
+                failed_it = _b11_item(_fk)
             err(f"第 {idx}/{len(msgs)} 批发送失败 (u16={u16(text)}, 原因: {send_ctx.err or '未知'}), "
                 f"已送达 {len(sent)} 条")
             break
         sent.extend(used)
+        for _k, _v in prog.items():                # 只记「已送达」的片, 失败片不前进
+            part_progress[_k] = max(part_progress.get(_k, (0, 0)), _v)
+        for _k in prog:                            # [CTO] 成功发出任意新片 -> 毒丸计数清零
+            _it0 = _b11_item(_k)
+            if _it0 is not None:
+                _it0.pop("part_fails", None)
         sent_msgs = idx
-    ok = (sent_msgs > 0 or deferred) and not failed
+    ok = (sent_msgs > 0 or deferred or parts_deferred) and not failed
+    if parts_deferred:                             # 分片预算用尽: 不算失败, 也不得老化
+        deferred = True
+        log(f"研报分片预算 {RESEARCH_PARTS_PER_ROUND} 片用尽, 剩余条目推迟到下一轮")
+    by_key = {it["key"]: it for it in batch}
+    for _k, (_done, _total) in part_progress.items():   # 续发进度写回队列条目
+        _it = by_key.get(_k)
+        if _it is not None:
+            _it["parts_sent"] = _done
+            _it["parts_total"] = _total
+    # [CTO 毒丸] 同一片连续失败 RESEARCH_PART_FAIL_MAX 次 -> 放弃该篇剩余片:
+    # 出队 + 写 seen (不再被源站重推/不再占预算) + err 留痕; 成功发片时计数已在上方清零。
+    if failed_it is not None:
+        _fails = to_int(failed_it.get("part_fails")) + 1
+        if _fails >= RESEARCH_PART_FAIL_MAX:
+            poison.append(failed_it)
+            seen[failed_it["key"]] = plan.now_ts
+            failed_it.pop("part_fails", None)
+            err(f"研报分片连续失败 {RESEARCH_PART_FAIL_MAX} 次, 放弃剩余分片并记账已读: "
+                f"{failed_it['key']}")
+        else:
+            failed_it["part_fails"] = _fails
     sent_keys = {it["key"] for it in sent}
-    left = rest_after + [it for it in batch if it["key"] not in sent_keys]
+    poison_keys = {it["key"] for it in poison}      # [CTO] 毒丸: 出队, 不再重试
+    left = rest_after + [it for it in batch
+                         if it["key"] not in sent_keys and it["key"] not in poison_keys]
     cur_msgs = to_int(plan.day.get("msgs")) + sent_msgs
     if sent and opts.force_flush and cur_msgs > DAILY_MSG_CAP:
         err(f"--flush-now 越限推送: 今日 {cur_msgs}/{DAILY_MSG_CAP} 条")   # 人工覆盖留痕
     if sent:
         for it in sent:                               # 只有真正送达才标记已读
             seen[it["key"]] = plan.now_ts
+    if sent_msgs:                                     # B11-F01: 日计数按实发消息条数, 与条目是否完成解耦
         plan.day["msgs"] = int(plan.day.get("msgs") or 0) + sent_msgs
     if ok and not deferred and plan.aging_on:              # 推迟轮不得触发老化 (Batch 9 A-F-01)
-        aged = [it for it in left if plan.now_ts - it["ts"] > plan.max_age]
+        aged = [it for it in left if plan.now_ts - it["ts"] > plan.max_age
+                and not research_partial(it)]
+        # Batch 11: 连载未发完的研报条目先豁免老化 (否则用户永远看不到后半篇),
+        # 但超过 RESEARCH_PARTIAL_AGE_FACTOR 倍 max_age 仍清掉, 防止队列被永久占位。
+        aged += [it for it in left if research_partial(it)
+                 and plan.now_ts - it["ts"] > plan.max_age * RESEARCH_PARTIAL_AGE_FACTOR]
         if aged:
             akeys = {it["key"] for it in aged}
             left = [it for it in left if it["key"] not in akeys]
@@ -3089,7 +4035,7 @@ def flush_round(conf: dict, opts: RunOpts, seen: dict,
             f"下轮不会重复推送同一批")
     elif sent:
         clear_pending()
-    if (plan.queue_dirty or sent or not ok) and not save_queue(left):
+    if (plan.queue_dirty or sent or part_progress or not ok) and not save_queue(left):
         err("队列落盘失败, 已发条目下轮可能重复推送")
         queue_save_ok = False
     # ==== U4-9 (D-F-05) 独立块: state 落盘失败时 rc=5 前补 stale 记账 ====
@@ -3247,11 +4193,18 @@ def main() -> int:
 
     if not fetched.items:
         skipped = sum(1 for _, _e in fetched.outcomes if _e == SRC_SKIP)
+        # Batch 12: 全源失败判定只算既有源; 新接入的化工现货源不得把「老源健康」误判成全源故障
+        core = [(n, e) for n, e in fetched.outcomes if n not in CHEM_SRCS]
+        core_err = [n for n, e in core if e and e != SRC_SKIP]
+        core_ok = [n for n, e in core if not e]
         if not fetched.errors:                        # 全源健康但 0 条: 不是故障, 不得告警 (Batch 9 D-F-01)
             log(f"本轮全部源健康但无可用条目 (跳过 {skipped} 源), 不发告警")
             return 0
-        # 有源真失败才进入告警状态机; 若同时有源「成功但 0 条」, 文案降级为部分失败
-        partial = len(fetched.errors) < len(fetched.outcomes) - skipped
+        if not core_err:                              # 老源无失败: 只留日志, 不进全源告警状态机
+            log(f"本轮无可用条目 (老源无失败, 新源失败 {len(fetched.errors)} 源 / 跳过 {skipped} 源), 不发告警")
+            return 0
+        # 有老源真失败才进入告警状态机; 若同时有老源「成功但 0 条」, 文案降级为部分失败
+        partial = bool(core_ok)                       # 与旧式 len(errors) < len(outcomes) - skipped 在无新源时等价
         if skipped:
             log(f"本轮无可用条目: 失败 {len(fetched.errors)} 源 / 跳过 {skipped} 源: {fetched.errors}")
         else:
@@ -4881,8 +5834,9 @@ def selftest() -> int:
           and "12.13" not in _a7_clean and "- 3 -" not in _a7_clean
           and "[Table_" not in _a7_clean and "8,000" not in _a7_clean
           and "上期所" in _a7_clean, repr(_a7_clean[:80]))
-    _a7_long = pdf_clean("沪铜" * 500)
-    check("B7-02 pdf_clean 按 SNIPPET_MAX 截断",
+    # B11: 样本加长到 > SNIPPET_MAX (24000): "沪铜" * (SNIPPET_MAX//2 + 1000) = 26000 字
+    _a7_long = pdf_clean("沪铜" * (SNIPPET_MAX // 2 + 1000))
+    check("B7-02 pdf_clean 按 SNIPPET_MAX 截断 (B11: 样本加长到 > SNIPPET_MAX)",
           len(_a7_long) == SNIPPET_MAX and len(pdf_clean("沪铜" * 500, 50)) == 50,
           f"{len(_a7_long)}")
 
@@ -6958,6 +7912,1834 @@ def selftest() -> int:
 
     # B9-65/66: tests/probe2.py / tests/probe4.py 去重自检 (RE-F-04)
     # 本批 CTO 约束「不改 tests/」, 故这两条 probe 内断言留待 CTO 裁决; 见实施报告未解决项.
+
+    # ==== Batch 11: 研报正文全文推送(分片) ====
+    # 本段整体插入 selftest() 末尾 (B7-02 之前无依赖); 同时由 evidence/impl/run_block.py
+    # 原样驱动以取证「旧码必红」。每个断言包在 _b11_case 里: 旧码缺函数/常量时只红该条,
+    # 不让 NameError 中断整段。
+    import contextlib
+    import tempfile
+
+    _B11_NOW = 1793800000
+    _B11_TS = _B11_NOW - 60
+    _B11_REAL_DT = globals()["datetime"]
+    _B11_GUARD_SHA = "41f4b605dffc0f415d8e2e89704f8e6b36e152e21c8138a9002bd12b26267984"
+
+
+    class _B11FrozenDT(_B11_REAL_DT):
+        @classmethod
+        def now(cls, tz=None):
+            return _B11_REAL_DT.fromtimestamp(_B11_NOW, tz)
+
+
+    def _b11_clk(t0: int = _B11_NOW):
+        class _C:
+            def __init__(self):
+                self.t = float(t0)
+                self.mono = 1000.0
+
+            def time(self):
+                return self.t
+
+            def monotonic(self):
+                return self.mono
+
+            def sleep(self, s):
+                self.t += s
+                self.mono += s
+
+        return _C()
+
+
+    def _b11_case(name: str, fn) -> None:
+        try:
+            ok, detail = fn()
+        except Exception as e:                       # noqa: BLE001 - 旧码缺符号 -> 本条红
+            ok, detail = False, f"{type(e).__name__}: {e}"
+        check(name, bool(ok), str(detail))
+
+
+    def _b11_state(seen_extra: dict | None = None, last_flush=None) -> dict:
+        st = {"seedmarker": 1,
+              "_digest": {"last_flush": (_B11_NOW - 31 * 60) if last_flush is None else last_flush}}
+        for k, v in (seen_extra or {}).items():
+            st[k] = v
+        return st
+
+
+    def _b11_src(items: list[dict], name: str = "财联社") -> list:
+        def _f(deadline=None):
+            return [dict(x) for x in items]
+        return [(name, _f)]
+
+
+    def _b11_ping(key: str = "k-b11-seen") -> dict:
+        """已读条目: 源每轮都供它, 只为让 main 走过「无条目早退」, 不产生队列变化."""
+        return {"src": "财联社", "ts": _B11_TS, "text": "沪铜库存变化9吨环比9%", "key": key}
+
+
+    def _b11_ritem(key: str = "研究:东财研报:1", body: str | None = None,
+                   ts: int | None = None, src: str = "东财研报") -> dict:
+        if body is None:
+            body = "沪铜库存下降，下游需求回暖。" * 400          # 5600 字 -> 3 片
+        return {"src": src, "ts": _B11_TS if ts is None else ts,
+                "text": "钨行业三季报点评：钨资源与硬质合金价格企稳反弹｜五矿证券 · 2026-11-04",
+                "url": "https://example.com/research/w.pdf", "snippet": body, "key": key}
+
+
+    def _b11_norm(key: str = "k-b11-n", ts: int | None = None, text: str = "沪铜库存变化1吨环比1%") -> dict:
+        return {"src": "财联社", "ts": _B11_TS if ts is None else ts, "text": text, "key": key}
+
+
+    def _b11_run(tmp, clock, srcs, conf_extra=None, state=None, queue=None,
+                 tg_hook=None, save_probe=None, pending_probe=None):
+        """tempdir 内实跑 main(); 返回 (rc, 载荷, state, 队列). 全程离线、不碰真实目录."""
+        g = globals()
+        keep = {k: g[k] for k in (
+            "STATE", "QUEUE", "PENDING", "LOCK", "CONF", "LOG", "ERRLOG", "SOURCES",
+            "time", "datetime", "tg", "resolve_token", "rotate_log", "rotate_stderr",
+            "ROUND_START", "SEND_WORST", "save_queue", "write_pending", "http",
+            "pdf_text", "PDFTOTEXT")}
+        tmp = Path(tmp)
+        st = tmp / "state"
+        st.mkdir(parents=True, exist_ok=True)
+        payloads: list[str] = []
+        _sq0, _wp0 = g["save_queue"], g["write_pending"]
+
+        def _sq(items):
+            if save_probe is not None:
+                save_probe.append([dict(x) for x in items])
+            return _sq0(items)
+
+        def _wp(keys):
+            if pending_probe is not None:
+                pending_probe.append(list(keys))
+            return _wp0(keys)
+
+        def _tg(method, payload, tk, proxy, timeout=25):
+            text = str((payload or {}).get("text") or "")
+            payloads.append(text)
+            if tg_hook is not None:
+                tg_hook(text, clock)
+            return {"ok": True}
+
+        try:
+            g["STATE"] = st / "seen.json"
+            g["QUEUE"] = st / "queue.json"
+            g["PENDING"] = st / "pending.json"
+            g["LOCK"] = st / "lock"
+            g["CONF"] = st / "conf.json"
+            g["LOG"] = st / "out.log"
+            g["ERRLOG"] = st / "err.log"
+            g["SOURCES"] = srcs
+            g["time"] = clock
+            g["datetime"] = _B11FrozenDT
+            g["tg"] = _tg
+            g["resolve_token"] = lambda conf: "x"
+            g["rotate_log"] = lambda: None
+            g["rotate_stderr"] = lambda: None
+            g["save_queue"] = _sq
+            g["write_pending"] = _wp
+            g["http"] = lambda *a, **k: (_ for _ in ()).throw(AssertionError("no network"))
+            g["pdf_text"] = lambda *a, **k: (_ for _ in ()).throw(AssertionError("unexpected pdf_text"))
+            conf = {"token": "x", "chat_id": 1, "max_age_min": 180,
+                    "digest_min": 30, "digest_max_items": 40}
+            conf.update(conf_extra or {})
+            g["CONF"].write_text(json.dumps(conf), encoding="utf-8")
+            if state is not None:
+                g["STATE"].write_text(json.dumps(state), encoding="utf-8")
+            if queue is not None:
+                g["QUEUE"].write_text(json.dumps({"items": queue, "ts": _B11_NOW}),
+                                      encoding="utf-8")
+            old_argv = sys.argv
+            _so, _se = io.StringIO(), io.StringIO()
+            try:
+                sys.argv = ["monitor.py"]
+                with contextlib.redirect_stdout(_so), contextlib.redirect_stderr(_se):
+                    rc = main()
+            finally:
+                sys.argv = old_argv
+            got_state = (json.loads(g["STATE"].read_text(encoding="utf-8"))
+                         if g["STATE"].exists() else {})
+            got_q, _p, _b = load_queue()
+            return rc, payloads, got_state, got_q
+        finally:
+            g.update(keep)
+
+
+    def _b11_guard_sha() -> str:
+        keep = globals()["datetime"]
+        globals()["datetime"] = _B11FrozenDT
+        try:
+            items = [
+                {"src": "财联社", "ts": _B11_TS, "text": "沪铜库存变化1吨环比1%", "key": "k-b11-g1"},
+                {"src": "东财", "ts": _B11_TS - 60, "text": "螺纹钢库存变化2吨环比2% & <铁矿>",
+                 "key": "k-b11-g2"},
+                {"src": "同花顺", "ts": _B11_TS - 120,
+                 "text": "沪指收盘上涨0.52%，两市成交额1.2万亿元", "key": "k-b11-g3"},
+                {"src": "新浪", "ts": _B11_TS - 86400, "text": "🚨 白银库存变化5吨环比5%",
+                 "key": "k-b11-g4"},
+                {"src": "SMM", "ts": _B11_TS - 90000, "text": "沪铝库存变化6吨环比6%" * 30,
+                 "key": "k-b11-g5"},
+            ]
+            chunks = build_messages(items)
+            payload = json.dumps([[t, [x["key"] for x in u]] for t, u in chunks],
+                                 ensure_ascii=False)
+            return hashlib.sha256(payload.encode()).hexdigest()
+        finally:
+            globals()["datetime"] = keep
+
+
+    def _b11_a01():
+        return (SNIPPET_MAX == 24000 and SNIPPET_FULL_MAX == 40000
+                and SNIPPET_FULL_MAX > SNIPPET_MAX,
+                f"SNIPPET_MAX={SNIPPET_MAX} FULL={SNIPPET_FULL_MAX}")
+
+
+    def _b11_a02():
+        cmds: list[list] = []
+
+        class _R:
+            returncode = 0
+            stdout = ("钨行业三季报点评，钨资源与硬质合金价格企稳反弹。" * 40).encode()
+
+        def _run(cmd, **kw):
+            cmds.append(list(cmd))
+            return _R()
+
+        g = globals()
+        run0, http0, bin0 = subprocess.run, g["http"], g["PDFTOTEXT"]
+        try:
+            g["http"] = lambda *a, **k: b"%PDF-1.4\n"
+            g["PDFTOTEXT"] = sys.executable
+            subprocess.run = _run
+            out = pdf_text("https://example.com/x.pdf")
+        finally:
+            subprocess.run = run0
+            g["http"], g["PDFTOTEXT"] = http0, bin0
+        pdf_cmds = [c for c in cmds if c and c[0] == sys.executable]
+        has32 = bool(pdf_cmds) and "-l" in pdf_cmds[0] and pdf_cmds[0][
+            pdf_cmds[0].index("-l") + 1] == "32"
+        return (PDF_MAX_PAGES == 32 and has32 and PDF_TIMEOUT == 6.0 and PDF_BUDGET_S == 14.0,
+                f"pages={PDF_MAX_PAGES} argv={pdf_cmds[-1] if pdf_cmds else None} len={len(out)}")
+
+
+    def _b11_a03():
+        short = "钨" * 100
+        long_body = "钨" * (SNIPPET_MAX + 500)
+        cut = snip_truncate(long_body)
+        return (snip_truncate(short) == short and len(cut) <= SNIPPET_MAX
+                and "已截断" in cut and cut.startswith("钨"),
+                f"short={len(short)} cut={len(cut)} mark={'已截断' in cut}")
+
+
+    def _b11_a04():
+        g = globals()
+        run0, http0, bin0 = subprocess.run, g["http"], g["PDFTOTEXT"]
+        # 真 PDF 走环境变量 FUTNEWS_SAMPLE_PDF, 未设置则走下方打桩分支 (离线可跑)
+        _pdf_env = os.environ.get("FUTNEWS_SAMPLE_PDF", "")
+        pdf = Path(_pdf_env or "/nonexistent/futures-news-sample.pdf")
+        mode = "real-file"
+        try:
+            if not (pdf.exists() and bin0 and os.path.exists(bin0)):   # 离线兜底: 打桩 pdftotext
+                mode = "stub-text"
+
+                class _R:
+                    returncode = 0
+                    stdout = ("钨行业三季报点评，钨资源与硬质合金价格企稳反弹，"
+                              "硬质合金及刀具公司季度营收环比改善。" * 100).encode()
+
+                def _run(cmd, **kw):
+                    return _R()
+
+                g["http"] = lambda *a, **k: b"%PDF-1.4\n"
+                g["PDFTOTEXT"] = sys.executable
+                subprocess.run = _run
+            else:
+                g["http"] = lambda *a, **k: pdf.read_bytes()
+            out = pdf_text("https://pdf.dfcfw.com/pdf/H3_AP202611091831546847_1.pdf")
+        finally:
+            subprocess.run = run0
+            g["http"], g["PDFTOTEXT"] = http0, bin0
+        ok = isinstance(out, str) and 3000 < len(out) <= SNIPPET_MAX
+        return (ok, f"mode={mode} len={len(out) if isinstance(out, str) else out}")
+
+
+    def _b11_a05():
+        body = "沪铜上涨1.2%。下游需求回暖，库存下降。" * 300
+        parts = split_research_body(body)
+        joined = "".join(parts)
+        same = re.sub(r"\s+", "", joined) == re.sub(r"\s+", "", body)
+        return (same and len(parts) > 1
+                and all(u16(esc_quote(p)) <= RESEARCH_PART_MAX for p in parts),
+                f"n={len(parts)} lossless={same} u16={[u16(esc_quote(p)) for p in parts]}")
+
+
+    def _b11_a06():
+        bad = ("。" + "钨" * 2399) * 3
+        bp = split_research_body(bad)
+        ok1 = (1 < len(bp) <= 4
+               and all(u16(esc_quote(p)) >= RESEARCH_PART_MIN_FILL for p in bp[:-1]))
+        norm = "沪铜上涨1.2%。" * 300
+        np_ = split_research_body(norm)
+        ok2 = len(np_) > 1 and all(p[-1] in RESEARCH_SENT_END for p in np_)
+        return (ok1 and ok2,
+                f"pathological n={len(bp)} u16={[u16(esc_quote(p)) for p in bp[:3]]} "
+                f"normal n={len(np_)} tails={[p[-1] for p in np_]}")
+
+
+    def _b11_a07():
+        dt = datetime.fromtimestamp(_B11_TS, TZ_CN)
+        cases = [
+            {"src": "东财研报", "ts": _B11_TS, "text": "沪铜研报｜某期货研究所 · 2026-11-04",
+             "url": "https://example.com/r1.pdf", "snippet": "沪铜上涨1.2%。" * 30,
+             "key": "研究:东财研报:old"},
+            {"src": "中金所", "ts": _B11_TS, "text": "中金所月度数据统计｜中金所 · 2026-11",
+             "url": "https://example.com/r2.pdf", "snippet": "", "key": "研究:中金所:empty"},
+            {"src": "财联社", "ts": _B11_TS, "text": "沪铜库存变化1吨环比1%", "key": "k-b11-nourl"},
+        ]
+        bad = [it["key"] for it in cases
+               if research_parts(it, dt) != [research_line(it, dt)]]
+        return (not bad, f"mismatch={bad}")
+
+
+    def _b11_a08():
+        dt = datetime.fromtimestamp(_B11_TS, TZ_CN)
+        body = "沪铜上涨1.2%。" * 750
+        it = _b11_ritem(body=body)
+        parts = research_parts(it, dt)
+        n = len(parts)
+        ok = (n > 1
+              and all(f"({i}/{n})" in p for i, p in enumerate(parts, 1))
+              and all("钨行业三季报点评" in p for p in parts)
+              and sum("<a href" in p for p in parts) == 1
+              and "<a href" in parts[-1]
+              and all(u16(p) <= MSG_MAX for p in parts))
+        return (ok, f"n={n} u16={[u16(p) for p in parts]}")
+
+
+    def _b11_a09():
+        dt = datetime.fromtimestamp(_B11_TS, TZ_CN)
+        body = "钨" * 2400
+        it = {"src": "东财研报", "ts": _B11_TS, "text": '"' * 699 + "｜五矿证券 · 2026-11-04",
+              "url": "https://example.com/" + "a" * 980, "snippet": body, "key": "研究:东财研报:long"}
+        parts = research_parts(it, dt)
+        n = len(parts)
+        chunks = []
+        for i, p in enumerate(parts, 1):
+            ls = p.split("\n")
+            chunks.append(ls[-2] if i == n and len(ls) >= 2 else ls[-1])
+        return (n >= 2 and all(u16(p) <= MSG_MAX for p in parts)
+                and "".join(chunks) == body,
+                f"n={n} u16={[u16(p) for p in parts]} body_join={''.join(chunks) == body}")
+
+
+    def _b11_a10():
+        n1 = _b11_norm("k-b11-n1", text="螺纹钢库存变化21吨环比21%")
+        n2 = _b11_norm("k-b11-n2", text="铁矿石库存变化22吨环比22%")
+        r = _b11_ritem()
+        msgs = build_messages_ex([n1, r, n2])
+        texts = [t for t, _u, _p in msgs]
+        marked = [t for t in texts if re.search(r"\(\d+/\d+\)", t)]
+        ok = (len(marked) == len(research_parts(r, datetime.fromtimestamp(_B11_TS, TZ_CN)))
+              and all("\n\n" not in t for t in marked)
+              and all("螺纹钢库存变化21吨环比21%" not in t
+                      and "铁矿石库存变化22吨环比22%" not in t for t in marked)
+              and "螺纹钢库存变化21吨环比21%" in texts[0]
+              and not re.search(r"\(\d+/\d+\)", texts[0])
+              and "铁矿石库存变化22吨环比22%" in texts[-1]
+              and not re.search(r"\(\d+/\d+\)", texts[-1]))
+        return (ok, f"msgs={len(msgs)} marked={len(marked)} u16={[u16(t) for t in texts]}")
+
+
+    def _b11_a11():
+        n1 = _b11_norm("k-b11-n1", text="螺纹钢库存变化21吨环比21%")
+        n2 = _b11_norm("k-b11-n2", text="铁矿石库存变化22吨环比22%")
+        batch = [n1, _b11_ritem(), n2]
+        ex = [(t, u) for t, u, _p in build_messages_ex(batch)]
+        return (build_messages(batch) == ex, f"msgs={len(ex)}")
+
+
+    def _b11_a12():
+        got = _b11_guard_sha()
+        return (got == _B11_GUARD_SHA,
+                got if got == _B11_GUARD_SHA else f"{got} != {_B11_GUARD_SHA}")
+
+
+    def _b11_a13():
+        it = _b11_ritem()
+        dt = datetime.fromtimestamp(_B11_TS, TZ_CN)
+        n = len(research_parts(it, dt))
+        calls: list[int] = []
+
+        def hook(text, clock):
+            calls.append(1)
+            if len(calls) == 2:
+                raise urllib.error.HTTPError(
+                    "https://api.telegram.org", 400, "Bad Request", {},
+                    io.BytesIO(b'{"ok":false}'))
+
+        with tempfile.TemporaryDirectory() as td:
+            clk = _b11_clk()
+            seen_item = _b11_norm("k-b11-seen", text="沪铜库存变化9吨环比9%")
+            pend: list = []
+            rc1, pay1, stt1, q1 = _b11_run(
+                td, clk, _b11_src([seen_item]),
+                conf_extra={"digest_min_items": 1},
+                state=_b11_state({"k-b11-seen": _B11_TS}),
+                queue=[it], tg_hook=hook, pending_probe=pend)
+            # 第 2 轮: 退避到期, 源仍供同一(已读)条目让 main 不走「无条目」早退
+            _next = int((stt1.get("_digest") or {}).get("next_try") or 0)
+            _adv = max(RETRY_BASE_S + 1, _next - int(clk.t) + 1)
+            clk.t += _adv
+            clk.mono += _adv
+            rc2, pay2, stt2, q2 = _b11_run(
+                td, clk, _b11_src([seen_item]),
+                conf_extra={"digest_min_items": 1}, pending_probe=pend)
+            q1r = next((x for x in q1 if x.get("key") == it["key"]), {})
+            ok = (rc1 == 2 and len(pay1) == 2
+                  and q1r.get("parts_sent") == 1 and q1r.get("parts_total") == n
+                  and it["key"] not in stt1
+                  and not pend
+                  and rc2 == 0 and len(pay2) == n - 1
+                  and f"(2/{n})" in pay2[0] and not any("(1/" in p for p in pay2)
+                  and it["key"] in stt2 and not q2)
+            return (ok, f"rc={rc1}/{rc2} n={n} pay={len(pay1)}/{len(pay2)} "
+                        f"q1={q1r.get('parts_sent')}/{q1r.get('parts_total')} pend={pend}")
+
+
+    def _b11_a14():
+        g = globals()
+        old = g["RESEARCH_PARTS_PER_ROUND"]
+        g["RESEARCH_PARTS_PER_ROUND"] = 2
+        try:
+            it = _b11_ritem(ts=_B11_TS - 200 * 60)
+            other = _b11_norm("k-b11-b", ts=_B11_TS - 181 * 60)
+            save_probe: list = []
+            with tempfile.TemporaryDirectory() as td:
+                rc, pay, _stt, q = _b11_run(
+                    td, _b11_clk(), _b11_src([_b11_ping()]),
+                    state=_b11_state({"k-b11-seen": _B11_TS}),
+                    queue=[it, other], save_probe=save_probe)
+            saved_done = [x for snap in save_probe for x in snap
+                          if x.get("key") == it["key"] and x.get("parts_sent") == 2
+                          and x.get("parts_total") == 3]
+            ok = (rc == 0 and len(pay) == 2 and "(1/3)" in pay[0] and "(2/3)" in pay[1]
+                  and not any("(3/3)" in p for p in pay)
+                  and bool(saved_done)
+                  and any(x.get("key") == "k-b11-b" for x in q))
+            return (ok, f"rc={rc} pay={len(pay)} saved={bool(saved_done)} "
+                        f"left={[x.get('key') for x in q]}")
+        finally:
+            g["RESEARCH_PARTS_PER_ROUND"] = old
+
+
+    def _b11_a15():
+        key = "研究:东财研报:partial"
+        partial = _b11_ritem(key=key, ts=_B11_TS - 190 * 60)
+        partial["parts_sent"] = 2
+        partial["parts_total"] = 3
+        with tempfile.TemporaryDirectory() as td:
+            rc1, pay1, _s1, q1 = _b11_run(
+                td, _b11_clk(), _b11_src([_b11_ping()]),
+                conf_extra={"digest_max_items": 1},
+                state=_b11_state({"k-b11-seen": _B11_TS}),
+                queue=[_b11_norm("k-b11-old", ts=_B11_TS - 300 * 60), dict(partial)])
+        keep1 = next((x for x in q1 if x.get("key") == key), {})
+        old2 = dict(partial)
+        old2["ts"] = _B11_TS - 721 * 60
+        with tempfile.TemporaryDirectory() as td:
+            rc2, _p2, _s2, q2 = _b11_run(
+                td, _b11_clk(), _b11_src([_b11_ping()]),
+                conf_extra={"digest_max_items": 1},
+                state=_b11_state({"k-b11-seen": _B11_TS}),
+                queue=[_b11_norm("k-b11-old", ts=_B11_TS - 800 * 60), old2])
+        ok = (rc1 == 0 and len(pay1) == 1 and bool(keep1)
+              and keep1.get("parts_sent") == 2 and keep1.get("parts_total") == 3
+              and rc2 == 0 and not any(x.get("key") == key for x in q2))
+        return (ok, f"rc={rc1}/{rc2} pay1={len(pay1)} keep1={bool(keep1)} "
+                    f"q2={[x.get('key') for x in q2]}")
+
+
+    def _b11_a16():
+        g = globals()
+        q0 = g["QUEUE"]
+        good = _b11_ritem(key="研究:东财研报:rt")
+        good["parts_sent"] = 1
+        good["parts_total"] = 3
+        good["part_fails"] = 2
+        bad = _b11_ritem(key="研究:东财研报:dirty")
+        bad["parts_sent"] = 5
+        bad["parts_total"] = 3
+        plain = _b11_norm("k-b11-plain")
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                g["QUEUE"] = Path(td) / "queue.json"
+                g["QUEUE"].write_text(json.dumps({"items": [good, bad, plain], "ts": _B11_NOW}),
+                                      encoding="utf-8")
+                q, _p, _b = load_queue()
+        finally:
+            g["QUEUE"] = q0
+        got_good = next((x for x in q if x.get("key") == good["key"]), {})
+        got_bad = next((x for x in q if x.get("key") == bad["key"]), {})
+        got_plain = next((x for x in q if x.get("key") == plain["key"]), {})
+        ok = (got_good.get("parts_sent") == 1 and got_good.get("parts_total") == 3
+              and got_good.get("part_fails") == 2
+              and "parts_sent" not in got_bad and "parts_total" not in got_bad
+              and list(got_plain) == ["src", "ts", "text", "key"])
+        return (ok, f"good_ps={got_good.get('parts_sent')}/{got_good.get('parts_total')} "
+                    f"good_pf={got_good.get('part_fails')} "
+                    f"bad_ps={'parts_sent' in got_bad} bad_pt={'parts_total' in got_bad} "
+                    f"plain_keys={list(got_plain)}")
+
+
+    def _b11_a17():
+        it = _b11_ritem(ts=_B11_TS - 100)
+        n1 = _b11_norm("k-b11-c1", ts=_B11_TS - 50, text="螺纹钢库存变化31吨环比31%")
+        n2 = _b11_norm("k-b11-c2", ts=_B11_TS - 40, text="铁矿石库存变化32吨环比32%")
+        with tempfile.TemporaryDirectory() as td:
+            rc, pay, stt, q = _b11_run(
+                td, _b11_clk(), _b11_src([_b11_ping()]),
+                conf_extra={"digest_max_items": 1},
+                state=_b11_state({"k-b11-seen": _B11_TS}), queue=[it, n1, n2])
+        msgs = int((stt.get("_day") or {}).get("msgs") or 0)
+        ok = (rc == 0 and len(pay) == 3 and msgs == len(pay)
+              and all(f"({i}/3)" in p for i, p in enumerate(pay, 1))
+              and sorted(x.get("key") for x in q) == ["k-b11-c1", "k-b11-c2"])
+        return (ok, f"rc={rc} pay={len(pay)} day_msgs={msgs} left={[x.get('key') for x in q]}")
+
+
+    def _b11_a18():
+        it = _b11_ritem()
+        dirty = dict(it)
+        dirty["parts_sent"] = 99
+        dirty["parts_total"] = 3
+        msgs = build_messages_ex([dirty])
+        clamp_ok = bool(msgs) and "(3/3)" in msgs[0][0] and msgs[0][1] == [dirty]
+        with tempfile.TemporaryDirectory() as td:
+            rc, pay, _stt, q = _b11_run(
+                td, _b11_clk(), _b11_src([_b11_ping()]),
+                conf_extra={"digest_min_items": 1},
+                state=_b11_state({"k-b11-seen": _B11_TS}), queue=[dirty])
+        return (clamp_ok and rc == 0 and not q and len(pay) == 3,
+                f"clamp={clamp_ok} rc={rc} pay={len(pay)} left={len(q)}")
+
+
+    def _b11_a19():
+        # B11-19 (F-01): 一轮只发 2 片且均非末片 -> sent==[] 但实发 2 条,
+        # 日计数必须按实发消息条数累加 (=2), 不能因没有条目完成而归零。
+        g = globals()
+        old = g["RESEARCH_PARTS_PER_ROUND"]
+        g["RESEARCH_PARTS_PER_ROUND"] = 2
+        try:
+            it = _b11_ritem(ts=_B11_TS - 200 * 60)
+            with tempfile.TemporaryDirectory() as td:
+                rc, pay, stt, q = _b11_run(
+                    td, _b11_clk(), _b11_src([_b11_ping()]),
+                    state=_b11_state({"k-b11-seen": _B11_TS}), queue=[it])
+        finally:
+            g["RESEARCH_PARTS_PER_ROUND"] = old
+        msgs = int((stt.get("_day") or {}).get("msgs") or 0)
+        q1 = next((x for x in q if x.get("key") == it["key"]), {})
+        ok = (rc == 0 and len(pay) == 2 and "(1/3)" in pay[0] and "(2/3)" in pay[1]
+              and not any("(3/3)" in p for p in pay)
+              and msgs == 2 and q1.get("parts_sent") == 2)
+        return (ok, f"rc={rc} pay={len(pay)} day_msgs={msgs} "
+                    f"parts={q1.get('parts_sent')}/{q1.get('parts_total')}")
+
+
+
+
+    _b11_case("B11-01 存储上限与解析上限的常量关系", _b11_a01)
+    _b11_case("B11-02 PDF 页数上限 32 且真传给 pdftotext", _b11_a02)
+    _b11_case("B11-03 snip_truncate 未超限逐字节 / 超限带标记且不超上限", _b11_a03)
+    _b11_case("B11-04 pdf_text 全文入库 (真实东财 PDF / 离线兜底)", _b11_a04)
+    _b11_case("B11-05 分片无损 + 片内预算", _b11_a05)
+    _b11_case("B11-06 句末优先 + 最小填充 (防碎片)", _b11_a06)
+    _b11_case("B11-07 单片路径与今日逐字节相同", _b11_a07)
+    _b11_case("B11-08 多片布局契约", _b11_a08)
+    _b11_case("B11-09 长标题/长 URL 强制切两片且不丢正文", _b11_a09)
+    _b11_case("B11-10 分片独占消息", _b11_a10)
+    _b11_case("B11-11 兼容层等价", _b11_a11)
+    _b11_case("B11-12 非研报渲染守卫 (守卫型, 旧码也绿)", _b11_a12)
+    _b11_case("B11-13 第 2 片失败 -> 续发且不重发首片", _b11_a13)
+    _b11_case("B11-14 分片预算用尽 -> 不算失败 + 进度落盘", _b11_a14)
+    _b11_case("B11-15 连载条目老化豁免 / 4x 才清", _b11_a15)
+    _b11_case("B11-16 队列往返 + 非法对自愈", _b11_a16)
+    _b11_case("B11-17 计数口径", _b11_a17)
+    _b11_case("B11-18 越界 parts_sent 夹取", _b11_a18)
+
+    _b11_case("B11-19 非末片轮次日计数按实发条数累加", _b11_a19)
+
+    # ---- Batch 12: 化工现货源 (化销网 / 隆众) 全离线断言 (B12-01..B12-22) ----
+    # 隆众夹具裁剪自 2026-11-09 实测页 26-1109-08-2f43b83c0ec50d13.html (纯苯早间提示):
+    #   xq-head..content 开标签与 <div class="xq-content" id="content"> 内层逐字节保留,
+    #   不嵌 sidebar/appDown; 原始字节 evidence/fix/fixtures/lz_benzene_20261109.html
+    #   sha256 762f5e14000f3e45845953f90a7beafcd01a66783186e2d681aa6141d9918b52.
+    # 化销网夹具裁剪自实测页 id=192012 (甲醇早间提示), 正文逐字节保留:
+    #   evidence/fix/fixtures/hxw_192012.html
+    #   sha256 73097518a3b93012ba0ee95e2ee1bd6302da65d6d14140331c281708e43297ec.
+    # 隆众 PX 实测页 26-1109-08-0f5c0ed0d15a4150.html 仅作 F-02 证据 (未嵌入).
+    _B12_NOW = 1794186000                    # 2026-11-09 09:00:00 +08:00
+    _B12_HXW_LIST = '''<html><body><div class="main"><div class="info-list">
+<input type="hidden" id="catid" value="22">
+<ul>
+<li><a href="/index/quote/infoshow?id=192012"><i class="v-icon v-icon-arr-left orange"></i>11月9日甲醇市场早间提示</a><span class="red" style="float:right; font-size: 14px;">2026-11-09 08:35</span></li>
+<li><a href="/index/quote/infoshow?id=191987"><i class="v-icon v-icon-arr-left orange"></i>11月6日甲醇市场早间提示</a><span style="float:right; font-size: 14px;">2026-11-06 10:00</span></li>
+<li><a href="/index/quote/infoshow?id=191977"><i class="v-icon v-icon-arr-left orange"></i>11月5日（16：30）太仓市场甲醇价格行情</a><span style="float:right; font-size: 14px;">2026-11-05 16:07</span></li>
+<li><a href="/index/quote/infoshow?id=191895"><i class="v-icon v-icon-arr-left orange"></i>11月2日甲醇市场早间提示</a><span style="float:right; font-size: 14px;">2026-11-02 08:31</span></li>
+</ul></div></div>
+<div class="pages" data-url="https://www.huaxiaowang.com/index/quote/infolist?catid=22&amp;" data-total="60259" data-curr="1" data-psize="20"></div>
+</body></html>'''
+    _B12_HXW_DETAIL = '''<html><body><div class="w1200"><div class="article" style="width: 880px;">
+<h3>11月9日甲醇市场早间提示</h3>
+<p style="text-align:center; font-size: 16px;">发布时间：2026年11月09日</p>
+<div class="content"><span><span style="font-size:16px;"><b>本周重点关注1、鲁北部分地炼取消前期合同MTBE减产与停工情况、宝丰4期开车情况（合成试车成功）。2、美伊战争不确定因素带来期货波动情况。</b></span></span></div>
+<div style="display:flex; width:100%;"><div class="cs"><img src="https://www.huaxiaowang.com/static/images/qrcode_zx.jpg"><span>化销网资讯</span></div></div>
+<p style="font-family: simhei; color:#cd3825;">扫描上方&gt;&gt;“化销网资讯”公众号及“化销网”小程序二维码，了解更多化工品资讯信息。</p>
+<p class="announce" style="font-size: 14px;">特别提示：本信息由相关企业自行提供，真实性未经证实，仅供参考，请谨慎采用，风险自负。</p>
+</div></div></body></html>'''
+    _B12_LZ_LIST = '''<html><body><ul>
+<li class="clearfix" data-id="0" data-type="" style="display: none">
+<a href="https://www.oilchem.net/19-0404-19-2816873f82add672.html" target="_blank">[PA]：国内PA6切片下游开工率平稳</a>
+<span style="color: #cc3338">[2026-11-09 23:24]</span>
+</li>
+<li class="clearfix" data-id="0" data-type="0">
+<a href="https://www.oilchem.net/26-1109-08-dba07216873f8289.html"
+target="_blank">石脑油市场早间提示（20261109）</a>
+<span style="color: #cc3338">[2026-11-09
+08:58]</span>
+</li>
+<li class="clearfix" data-id="0" data-type="0">
+<a href="https://www.oilchem.net/26-1109-08-2f43b83c0ec50d13.html" target="_blank">[纯苯]纯苯早间提示（20261109）</a>
+<span style="color: #cc3338">[2026-11-09 08:46]</span>
+</li>
+<li class="clearfix" data-id="0" data-type="0">
+<a href="https://www.oilchem.net/26-1109-08-a1d663265432d864.html" target="_blank">环氧乙烷市场一周前瞻（20261109）</a>
+<span style="color: #cc3338">[2026-11-09 08:38]</span>
+</li>
+<li class="clearfix" data-id="0" data-type="0">
+<a href="https://www.oilchem.net/26-1109-08-0f5c0ed0d15a4150.html" target="_blank">[对二甲苯]：PX市场一周前瞻（20261109）</a>
+<span style="color: #cc3338">[2026-11-09 08:36]</span>
+</li>
+<li class="clearfix" data-id="0" data-type="0">
+<a href="https://www.oilchem.net/26-1109-08-59709cdaf4db51fe.html" target="_blank">聚丙烯粉料市场一周前瞻（20261109）</a>
+<span style="color: #cc3338">[2026-11-09 08:34]</span>
+</li>
+<li class="clearfix" data-id="0" data-type="0">
+<a href="https://www.oilchem.net/26-1109-08-5d385db5b9ddd1ea.html" target="_blank">二乙二醇市场一周前瞻（20261109）</a>
+<span style="color: #cc3338">[2026-11-09 08:33]</span>
+</li>
+</ul></body></html>'''
+    _B12_LZ_ARTICLE = r'''<html><head><meta name="lz_articleid" content="37235374" /></head><body>
+<div class="xq-head">
+                        <div class="xqbox-top">
+                            <a href="javascript:void(0)" class="print right" title="打印本页资讯" onclick="printpage()"><i></i>打印</a> 
+                            <a href="javascript:void(0)" class="fcous right" title="关注该资讯的每日内容" id="focusUnit"
+                            data-link="1"><i></i>关注</a>
+                            <a href="javascript:void(0)" class="collect right" title="收藏本页资讯" id="Favorite"
+                            data-link="1"><i></i>收藏</a>
+                            <a href="javascript:void(0)" class="share right" title="分享"><i></i>分享
+                                <div class="share-abled" id="share-1" data-disabled="facebook,twitter,google,linkedin,tencent,qzone,douban"
+                                    data-image="//img1.oilchem.net/info/images/logo.gif" data-source="https://www.oilchem.net/">
+                                </div>
+                            </a>
+                        </div>
+                        <h1 style="margin: 25px 0 10px;"><strong>[纯苯] 纯苯早间提示（20261109）</strong></h1>
+                        <span>发布时间：2026-11-09 08:46 &nbsp; 来源：隆众资讯&nbsp; 责任编辑：宋洋</span>
+                    </div>
+                    <!--xqwrap-->
+                    <div class="xqwrap">
+                        <div class="xq-content" id="content">
+
+                                <div id="tableScroll">
+                                    <html>
+ <head></head>
+ <body>
+  <p style="text-wrap: wrap;"><strong>一、关注点</strong></p>
+  <p>1、外盘纯苯：FOB韩国涨5至1035美元/吨，CFR中国涨5至1059美元/吨。FOB鹿特丹涨11至1108美元/吨，FOB USG跌1至354美分/加仑。<span style="font-family: simsun; text-indent: 32px;"></span></p>
+  <p><span style="text-indent: 32px;">2、<a target="_blank" style=" color: blue; text-decoration: underline;" href="https://oil.oilchem.net/oil/crudeoil.shtml">原油</a>：市场关注美伊双方再次冲突风险，但同时调解方仍在推动和谈，国际油价小幅上涨。ICE布油期货01合约98.32涨0.03美元/桶，环比+0.03%。</span></p>
+  <table width="1798">
+   <tbody>
+    <tr class="firstRow" style="height: 23px;">
+     <td align="center" valign="middle" style="padding: 0px 7px; border-color: windowtext; background: rgb(249, 249, 249);">
+      <p style="line-height: 2;"><span style="line-height: 2; font-family: 微软雅黑, sans-serif;">区域</span></p></td>
+     <td align="center" valign="middle" style="padding: 0px 7px; border-top-color: windowtext; border-right-color: windowtext; border-bottom-color: windowtext; border-left: none; background: rgb(249, 249, 249); word-break: break-all;">
+      <p style="line-height: 2;"><strong><span style="line-height: 2; font-family: 微软雅黑, sans-serif;">11</span></strong><strong><span style="line-height: 2; font-family: 微软雅黑, sans-serif;">月6日</span></strong></p></td>
+     <td align="center" valign="middle" style="padding: 0px 7px; border-color: windowtext; background: rgb(249, 249, 249); word-break: break-all;">
+      <p style="line-height: 2;"><strong><span style="line-height: 2; font-family: 微软雅黑, sans-serif;">11</span></strong><strong><span style="line-height: 2; font-family: 微软雅黑, sans-serif;">月5日</span></strong></p></td>
+     <td align="center" valign="middle" style="padding: 0px 7px; border-top-color: windowtext; border-right-color: windowtext; border-bottom-color: windowtext; border-left: none; background: rgb(249, 249, 249);">
+      <p style="line-height: 2;"><span style="font-family: 微软雅黑, sans-serif;">涨跌率</span></p></td>
+    </tr>
+    <tr style="height: 23px;">
+     <td align="center" valign="middle" style="padding: 0px 7px; border-top: none; border-right-color: windowtext; border-bottom-color: windowtext; border-left-color: windowtext; background: rgb(249, 249, 249); word-break: break-all;">
+      <p style="line-height: 2;"><span style="font-family: 微软雅黑, sans-serif;">FOB韩国</span></p></td>
+     <td align="center" valign="middle" style="padding: 0px 7px; border-color: windowtext; background: rgb(249, 249, 249); word-break: break-all;">
+      <p><span style="font-family: 微软雅黑, YaHei;">1035</span></p></td>
+     <td align="center" valign="middle" style="padding: 0px 7px; border-color: windowtext; background: rgb(249, 249, 249); word-break: break-all;">
+      <p><span style="font-family: 微软雅黑, YaHei;">1030</span></p></td>
+     <td align="center" valign="middle" style="padding: 0px 7px; border-top: none; border-right-color: windowtext; border-bottom-color: windowtext; border-left: none; background: rgb(249, 249, 249); word-break: break-all;">
+      <p style="line-height: 2;"><span style="font-family: 微软雅黑, sans-serif;"><span style="font-family: 微软雅黑, sans-serif; text-align: -webkit-center; text-wrap-mode: wrap; background-color: rgb(249, 249, 249);">0.49%</span></span></p></td>
+    </tr>
+    <tr style="height: 23px;">
+     <td align="center" valign="middle" style="padding: 0px 7px; border-top: none; border-right-color: windowtext; border-bottom-color: windowtext; border-left-color: windowtext; background: rgb(249, 249, 249); word-break: break-all;">
+      <p style="line-height: 2;"><span style="font-family: 微软雅黑, sans-serif;">CFR中国</span></p></td>
+     <td align="center" valign="middle" style="padding: 0px 7px; border-color: windowtext; background: rgb(249, 249, 249); word-break: break-all;">
+      <p><span style="font-family: 微软雅黑, YaHei;">1059</span></p></td>
+     <td align="center" valign="middle" style="padding: 0px 7px; border-color: windowtext; background: rgb(249, 249, 249); word-break: break-all;">
+      <p><span style="font-family: 微软雅黑, YaHei;">1054</span></p></td>
+     <td align="center" valign="middle" style="padding: 0px 7px; border-top: none; border-right-color: windowtext; border-bottom-color: windowtext; border-left: none; background: rgb(249, 249, 249); word-break: break-all;">
+      <p style="line-height: 2;"><span style="font-family:微软雅黑, sans-serif"><span style="font-family: 微软雅黑, sans-serif; text-align: -webkit-center; text-wrap-mode: wrap; background-color: rgb(249, 249, 249);">0.47%</span></span></p></td>
+    </tr>
+    <tr style="height: 23px;">
+     <td align="center" valign="middle" style="padding: 0px 7px; border-top: none; border-right-color: windowtext; border-bottom-color: windowtext; border-left-color: windowtext; background: rgb(249, 249, 249);">
+      <p style="line-height: 2;"><span style="font-family: 微软雅黑, sans-serif;">华东市场</span></p></td>
+     <td align="center" valign="middle" style="padding: 0px 7px; border-color: windowtext; background: rgb(249, 249, 249); word-break: break-all;">
+      <p style="line-height: 2;"><span style="font-family: 微软雅黑, YaHei;">8370</span><br></p></td>
+     <td align="center" valign="middle" style="padding: 0px 7px; border-color: windowtext; background: rgb(249, 249, 249); word-break: break-all;">
+      <p style="line-height: 2;"><span style="font-family: 微软雅黑, YaHei;">8450</span><br></p></td>
+     <td align="center" valign="middle" style="padding: 0px 7px; border-top: none; border-right-color: windowtext; border-bottom-color: windowtext; border-left: none; background: rgb(249, 249, 249); word-break: break-all;">
+      <p style="line-height: 2;"><span style="font-family: 微软雅黑, YaHei;"></span><span style="font-family: 微软雅黑, sans-serif;">-0.95%</span></p></td>
+    </tr>
+    <tr style="height: 23px;">
+     <td align="center" valign="middle" style="padding: 0px 7px; border-top: none; border-right-color: windowtext; border-bottom-color: windowtext; border-left-color: windowtext; background: rgb(249, 249, 249);">
+      <p style="line-height: 2;"><span style="font-family: 微软雅黑, sans-serif;">山东市场</span></p></td>
+     <td align="center" valign="middle" style="padding: 0px 7px; border-color: windowtext; background: rgb(249, 249, 249); word-break: break-all;">
+      <p style="line-height: 2;"><span style="font-family: 微软雅黑, YaHei;">8285<br></span></p></td>
+     <td align="center" valign="middle" style="padding: 0px 7px; border-color: windowtext; background: rgb(249, 249, 249); word-break: break-all;">
+      <p style="line-height: 2;"><span style="font-family: 微软雅黑, YaHei;">8476<br></span></p></td>
+     <td align="center" valign="middle" style="padding: 0px 7px; border-top: none; border-right-color: windowtext; border-bottom-color: windowtext; border-left: none; background: rgb(249, 249, 249); word-break: break-all;">
+      <p style="line-height: 2;"><span style="font-family: 微软雅黑, YaHei;">-2.25%</span></p></td>
+    </tr>
+    <tr style="height: 23px;">
+     <td colspan="4" align="center" valign="middle" style="padding: 0px 7px; border-top: none; border-right-color: windowtext; border-bottom: none; border-left-color: windowtext; background: rgb(249, 249, 249);">
+      <p style="text-align: left; line-height: 2;"><span style="line-height: 2; font-family: 微软雅黑, sans-serif;">备注：</span></p></td>
+    </tr>
+    <tr style="height: 23px;">
+     <td colspan="4" align="center" valign="middle" style="padding: 0px 7px; border-top: none; border-right-color: windowtext; border-bottom: none; border-left-color: windowtext; background: rgb(249, 249, 249); word-break: break-all;">
+      <p style="text-align: left; line-height: 2;"><span style="line-height: 2; font-family: 微软雅黑, sans-serif;">1</span><span style="line-height: 2; font-family: 微软雅黑, sans-serif;">、FOB韩国、CFR中国纯苯：美元/吨；国内纯苯：元/吨。</span></p></td>
+    </tr>
+    <tr style="height: 23px;">
+     <td colspan="4" align="center" valign="middle" style="padding: 0px 7px; border-top: none; border-right-color: windowtext; border-bottom: none; border-left-color: windowtext; background: rgb(249, 249, 249);">
+      <p style="text-align: left; line-height: 2;"><span style="line-height: 2; font-family: 微软雅黑, sans-serif;">2</span><span style="line-height: 2; font-family: 微软雅黑, sans-serif;">、纯苯选取主流市场收盘均价。</span></p></td>
+    </tr>
+    <tr style="height: 23px;">
+     <td colspan="4" align="center" valign="middle" style="padding: 0px 7px; border-top: none; border-right-color: windowtext; border-bottom: none; border-left-color: windowtext; background: rgb(249, 249, 249); word-break: break-all;">
+      <p style="text-align: left; line-height: 2;"><span style="line-height: 2; font-family: 微软雅黑, sans-serif;">3</span><span style="line-height: 2; font-family: 微软雅黑, sans-serif;">、上表人民币价格均为现汇含税自提价。</span></p></td>
+    </tr>
+    <tr style="height: 23px;">
+     <td colspan="4" align="center" valign="middle" style="padding: 0px 7px; border-top: none; border-right-color: windowtext; border-bottom-color: windowtext; border-left-color: windowtext; background: rgb(249, 249, 249); word-break: break-all;">
+      <p style="text-align: left; line-height: 2;"><span style="line-height: 2; font-family: 微软雅黑, sans-serif;">4</span><span style="line-height: 2; font-family: 微软雅黑, sans-serif;">、涨跌率为环比变化率。</span></p></td>
+    </tr>
+   </tbody>
+  </table>
+  <p><strong>二、行情展望</strong></p>
+  <p>目前美伊局势缓和可能性较强，周末山东纯苯震荡下跌，预计本周<a target="_blank" style=" color: blue; text-decoration: underline;" href="https://chem.oilchem.net/chemical/benzene.shtml">纯苯市场</a>延续偏弱震荡格局。</p>
+  <table width="1798">
+   <tbody>
+    <tr class="firstRow" style="height: 25px;">
+     <td width="31" style="padding: 0px 7px; border-color: windowtext; background: rgb(249, 249, 249); word-break: break-all;">
+      <p style="text-align: center;"><strong>数据项目</strong></p></td>
+     <td width="23" style="padding: 0px 7px; border-top-color: windowtext; border-right-color: windowtext; border-bottom-color: windowtext; border-left: none; background: rgb(249, 249, 249); word-break: break-all;">
+      <p style="text-align: center;"><strong>发布日期</strong></p></td>
+     <td width="20" style="padding: 0px 7px; border-top-color: windowtext; border-right-color: windowtext; border-bottom-color: windowtext; border-left: none; background: rgb(249, 249, 249);">
+      <p style="text-align: center;"><strong>上期数据</strong></p></td>
+     <td width="24" style="padding: 0px 7px; border-top-color: windowtext; border-right-color: windowtext; border-bottom-color: windowtext; border-left: none; background: rgb(249, 249, 249);">
+      <p style="text-align: center;"><strong>本期趋势预计</strong></p></td>
+    </tr>
+    <tr style="height: 25px;">
+     <td width="31" style="padding: 0px 7px; border-top: none; border-right-color: windowtext; border-bottom-color: windowtext; border-left-color: windowtext; background: rgb(249, 249, 249); word-break: break-all;">
+      <p style="text-align: center;">纯苯华东港口库存</p></td>
+     <td width="23" style="padding: 0px 7px; border-top: none; border-right-color: windowtext; border-bottom-color: windowtext; border-left: none; background: rgb(249, 249, 249);">
+      <p style="text-align: center;">周一16:00PM</p></td>
+     <td width="20" style="padding: 0px 7px; border-top: none; border-right-color: windowtext; border-bottom-color: windowtext; border-left: none; background: rgb(249, 249, 249); word-break: break-all;">
+      <p style="text-align: center;">3.2万吨</p></td>
+     <td width="24" style="padding: 0px 7px; border-top: none; border-right-color: windowtext; border-bottom-color: windowtext; border-left: none; background: rgb(249, 249, 249); word-break: break-all;">
+      <p style="text-align: center;"><span style="font-family: 宋体, SimSun;"><span style="text-wrap: wrap;"><span style="font-family: 宋体, SimSun; text-align: center; background-color: rgb(249, 249, 249);"><span style="font-family: 宋体, SimSun; text-align: center; background-color: rgb(249, 249, 249);"><span style="font-family: 宋体, SimSun; text-align: center; background-color: rgb(249, 249, 249);"><span style="font-family: 宋体, SimSun; background-color: rgb(249, 249, 249);"><span style="font-family: 宋体, SimSun; text-align: center; background-color: rgb(249, 249, 249);"><span style="font-family: 宋体, SimSun; background-color: rgb(249, 249, 249);"><span style="text-wrap-mode: wrap; background-color: rgb(249, 249, 249);"><span style="font-family: 宋体, SimSun; text-align: center; text-wrap-mode: wrap; background-color: rgb(249, 249, 249);"><span style="text-wrap-mode: wrap; background-color: rgb(249, 249, 249);"><span style="font-family: 宋体, SimSun; text-align: center; text-wrap-mode: wrap; background-color: rgb(249, 249, 249);">↘</span></span></span></span></span></span></span></span></span></span></span></span></p></td>
+    </tr>
+    <tr style="height: 25px;">
+     <td width="31" style="padding: 0px 7px; border-top: none; border-right-color: windowtext; border-bottom-color: windowtext; border-left-color: windowtext; background: rgb(249, 249, 249); word-break: break-all;">
+      <p style="text-align: center;">纯苯周产能利用率</p></td>
+     <td width="23" style="padding: 0px 7px; border-top: none; border-right-color: windowtext; border-bottom-color: windowtext; border-left: none; background: rgb(249, 249, 249);">
+      <p style="text-align: center;">周四18:00PM</p></td>
+     <td width="20" style="padding: 0px 7px; border-top: none; border-right-color: windowtext; border-bottom-color: windowtext; border-left: none; background: rgb(249, 249, 249); word-break: break-all;">
+      <p style="text-align: center;">72.68%</p></td>
+     <td width="24" style="padding: 0px 7px; border-top: none; border-right-color: windowtext; border-bottom-color: windowtext; border-left: none; background: rgb(249, 249, 249); word-break: break-all;">
+      <p style="text-align: center;"><span style="font-family: 宋体, SimSun;"><span style="text-wrap: wrap;"><span style="background-color: rgb(249, 249, 249);"><span style="font-family: 宋体, SimSun; text-align: center; background-color: rgb(249, 249, 249);"><span style="font-family: 宋体, SimSun; text-align: center; background-color: rgb(249, 249, 249);"><span style="font-family: 宋体, SimSun; text-align: center; background-color: rgb(249, 249, 249);"><span style="font-family: 宋体, SimSun; text-align: center; background-color: rgb(249, 249, 249);"><span style="font-family: 宋体, SimSun; text-wrap-mode: wrap; background-color: rgb(249, 249, 249);"><span style="text-wrap-mode: wrap; background-color: rgb(249, 249, 249);">↗</span></span></span></span></span></span></span></span></span></p></td>
+    </tr>
+    <tr style="height: 25px;">
+     <td width="31" style="padding: 0px 7px; border-top: none; border-right-color: windowtext; border-bottom-color: windowtext; border-left-color: windowtext; background: rgb(249, 249, 249);">
+      <p style="text-align: center;">纯苯周利润</p></td>
+     <td width="23" style="padding: 0px 7px; border-top: none; border-right-color: windowtext; border-bottom-color: windowtext; border-left: none; background: rgb(249, 249, 249);">
+      <p style="text-align: center;">周四18:00PM</p></td>
+     <td width="20" style="padding: 0px 7px; border-top: none; border-right-color: windowtext; border-bottom-color: windowtext; border-left: none; background: rgb(249, 249, 249); word-break: break-all;">
+      <p style="text-align: center;">788元/吨</p></td>
+     <td width="24" style="padding: 0px 7px; border-top: none; border-right-color: windowtext; border-bottom-color: windowtext; border-left: none; background: rgb(249, 249, 249); word-break: break-all;">
+      <p style="text-align: center;"><span style="font-family: 宋体, SimSun;"><span style="text-wrap: wrap;"><span style="background-color: rgb(249, 249, 249);"><span style="background-color: rgb(249, 249, 249);"><span style="background-color: rgb(249, 249, 249);"><span style="font-family: 宋体, SimSun; text-align: center; background-color: rgb(249, 249, 249);"><span style="background-color: rgb(249, 249, 249);"><span style="font-family: 宋体, SimSun; text-align: center; background-color: rgb(249, 249, 249);"><span style="background-color: rgb(249, 249, 249);"><span style="font-family: 宋体, SimSun; text-align: center; background-color: rgb(249, 249, 249);"><span style="font-family: 宋体, SimSun; text-align: center; background-color: rgb(249, 249, 249);"><span style="font-family: 宋体, SimSun; text-align: center; background-color: rgb(249, 249, 249);"><span style="font-family: 宋体, SimSun; text-align: center; background-color: rgb(249, 249, 249);"><span style="font-family: 宋体, SimSun; text-align: center; background-color: rgb(249, 249, 249);"><span style="font-family: 宋体, SimSun; text-align: center; background-color: rgb(249, 249, 249);"><span style="font-family: 宋体, SimSun; text-align: center; background-color: rgb(249, 249, 249);"><span style="background-color: rgb(249, 249, 249);"><span style="font-family: 宋体, SimSun; text-align: center; background-color: rgb(249, 249, 249);"><span style="background-color: rgb(249, 249, 249);"><span style="background-color: rgb(249, 249, 249);"><span style="font-family: 宋体, SimSun; text-align: center; background-color: rgb(249, 249, 249);"><span style="background-color: rgb(249, 249, 249);"><span style="font-family: 宋体, SimSun; text-align: center; background-color: rgb(249, 249, 249);"><span style="font-family: 宋体, SimSun; text-align: center; background-color: rgb(249, 249, 249);"><span style="font-family: 宋体, SimSun; text-align: center; background-color: rgb(249, 249, 249);"><span style="font-family: 宋体, SimSun; text-align: center; background-color: rgb(249, 249, 249);"><span style="font-family: 宋体, SimSun; background-color: rgb(249, 249, 249);"><span style="text-wrap-mode: wrap; background-color: rgb(249, 249, 249);"><span style="text-wrap-mode: wrap; background-color: rgb(249, 249, 249);"><span style="font-family: 宋体, SimSun; text-wrap-mode: wrap; background-color: rgb(249, 249, 249);">↘</span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></span></p></td>
+    </tr>
+    <tr style="height: 25px;">
+     <td width="100" colspan="4" style="padding: 0px 7px; border-top: none; border-right-color: black; border-bottom: none; border-left-color: windowtext; background: rgb(249, 249, 249); word-break: break-all;">
+      <p>1、↓↑视为大幅波动，突出涨跌幅超过3%的数据维度</p></td>
+    </tr>
+    <tr style="height: 25px;">
+     <td width="100" colspan="4" style="padding: 0px 7px; border-top: none; border-right-color: black; border-bottom-color: windowtext; border-left-color: windowtext; background: rgb(249, 249, 249); word-break: break-all;">
+      <p>2、↗<span style="font-family: 宋体, SimSun;">↘</span>视为窄幅波动，突出涨跌幅在0-3%以内的数据</p></td>
+    </tr>
+   </tbody>
+  </table>
+  <p><br></p>
+  <p><br></p>
+ </body>
+</html>
+                                </div>
+                                <script>
+                                    (function () {
+                                        const TESTBOX = document.getElementById('tableScroll')
+                                        function getTable(NOWDOM) {
+                                            $(NOWDOM).children().each((i, v) => {
+                                                // console.log(v.tagName)
+                                                if (v.tagName == 'TABLE') {
+                                                    $(v).wrap('<div class="tableOuterScorll"></div>')
+                                                } else {
+                                                    getTable(v);
+                                                }
+                                            })
+                                        }
+                                        getTable(TESTBOX)
+                                    })()
+                                </script>
+                        </div></div>
+</body></html>'''
+
+    class _B12Clk:
+        def __init__(self, t):
+            self.t = float(t)
+            self.mono = 1000.0
+
+        def time(self):
+            return self.t
+
+        def monotonic(self):
+            return self.mono
+
+        def sleep(self, s):
+            self.t += s
+            self.mono += s
+
+    def _b12_case(name, fn):
+        try:
+            ok, detail = fn()
+        except Exception as e:                       # noqa: BLE001 - 旧码缺符号 -> 本条红
+            ok, detail = False, f"{type(e).__name__}: {e}"
+        check(name, bool(ok), str(detail))
+
+    def _b12_call(router, fn, t0=None):
+        """打桩 http/time 后跑 fn(); 返回 (结果, [(url, tries)]) —— 全程离线."""
+        g = globals()
+        old_http, old_time = g["http"], g["time"]
+        calls = []
+
+        def _fake(url, referer=None, tries=3, deadline=None, **_kw):
+            calls.append((url, tries))
+            r = router(url)
+            if isinstance(r, BaseException):
+                raise r
+            return r
+
+        g["http"] = _fake
+        g["time"] = _B12Clk(_B12_NOW if t0 is None else t0)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                got = fn()
+        finally:
+            g["http"], g["time"] = old_http, old_time
+        return got, calls
+
+    def _b12_router(url):
+        if "infolist?catid=22" in url:
+            return _B12_HXW_LIST.encode()
+        if "infoshow?id=192012" in url:
+            return _B12_HXW_DETAIL.encode()
+        if "infoshow" in url:
+            return RuntimeError("HTTP 403")
+        if "list.oilchem.net/1/9/" in url:
+            return _B12_LZ_LIST.encode()
+        if "2f43b83c0ec50d13" in url:
+            return _B12_LZ_ARTICLE.encode()
+        return RuntimeError("HTTP 404")
+
+    _B12_LEGACY = ["财联社", "东财", "同花顺", "新浪", "见闻商品", "SMM",
+                   "Mining", "OilPrice", "MiningTech", "Nasdaq", "CNBC", "MarketWatch",
+                   "Investing", "Hellenic", "东财研报", "中金所", "中期协"]
+
+    def _b12_mk(name, err):
+        def _f(deadline=None):
+            if err:
+                raise RuntimeError(err)
+            return []
+        return (name, _f)
+
+    def _b12_a01():
+        g = globals()
+        need = ("src_hxw", "src_lz", "hxw_rows", "hxw_detail", "lz_rows", "lz_detail",
+                "chem_candidates", "chem_admit", "chem_text", "chem_flatten",
+                "slice_remaining", "html_inner", "strip_embed")
+        miss = [n for n in need if not callable(g.get(n))]
+        got = (g.get("CHEM_SRCS"), g.get("HXW_LIST_URL"), g.get("LZ_LIST_URL"),
+               g.get("CHEM_DETAIL_MAX"), g.get("CHEM_TEXT_MAX"))
+        ok = (not miss and got == (("化销网", "隆众", "我的钢铁", "东财甲醇"),
+                                   "https://www.huaxiaowang.com/index/quote/infolist?catid=22",
+                                   "https://list.oilchem.net/1/9/", 4, ITEM_MAX))
+        return ok, f"miss={miss} got={got!r}"
+
+    def _b12_a02():
+        names = [n for n, _ in SOURCES]
+        ok = (len(names) == 21 and names[:14] == _B12_LEGACY[:14]
+              and names[14:18] == ["化销网", "隆众", "我的钢铁", "东财甲醇"]
+              and names[18:] == ["东财研报", "中金所", "中期协"])
+        return ok, f"n={len(names)} {names}"
+
+    def _b12_a03():
+        rows = hxw_rows(_B12_HXW_LIST)
+        want0 = {"id": "192012", "title": "11月9日甲醇市场早间提示", "ts": 1794184500,
+                 "url": "https://www.huaxiaowang.com/index/quote/infoshow?id=192012"}
+        ok = (len(rows) == 4 and rows[0] == want0
+              and [r["id"] for r in rows] == ["192012", "191987", "191977", "191895"]
+              and [r["ts"] for r in rows] == [1794184500, 1793930400, 1793866020, 1793579460])
+        return ok, f"n={len(rows)} rows={rows[:2]}"
+
+    def _b12_a04():
+        bad = ("<html><body>无列表</body></html>",
+               '<html><body><div class="info-list"><ul></ul></div></body></html>',
+               '<html><body><div class="info-list"><ul><li><a href="/index/quote/infoshow?id=1">'
+               '<i></i>甲醇装置停车</a><span>昨天 09:00</span></li></ul></div></body></html>')
+        got = []
+        for page in bad:
+            try:
+                hxw_rows(page)
+                got.append("no-raise")
+            except RuntimeError as e:
+                got.append("结构变化" in str(e))
+        return all(x is True for x in got), f"{got}"
+
+    def _b12_a05():
+        d = hxw_detail(_B12_HXW_DETAIL)
+        want = ("本周重点关注1、鲁北部分地炼取消前期合同MTBE减产与停工情况、"
+                "宝丰4期开车情况（合成试车成功）。2、美伊战争不确定因素带来期货波动情况。")
+        ok = (isinstance(d, dict) and d["title"] == "11月9日甲醇市场早间提示"
+              and d["body"] == want and d["date_ts"] == 1794153600
+              and "特别提示" not in d["body"] and "二维码" not in d["body"]
+              and "扫描上方" not in d["body"])
+        return ok, f"{d}"
+
+    def _b12_a06():
+        got = (hxw_detail("<html><body><h3>t</h3></body></html>"),
+               hxw_detail('<html><body><div class="content">无标题</div></body></html>'))
+        return got == (None, None), f"{got}"
+
+    def _b12_a07():
+        ids = [r["id"] for r in chem_candidates(hxw_rows(_B12_HXW_LIST))]
+        return ids == ["192012", "191987", "191895"], f"ids={ids}"
+
+    def _b12_a08():
+        rows = lz_rows(_B12_LZ_LIST)
+        deg = [r["title"] for r in rows if "二乙二醇" in r["title"]]
+        cands = [r["title"] for r in chem_candidates(rows)]
+        ok = (len(deg) == 1 and not any("二乙二醇" in t for t in cands))
+        return ok, f"deg={deg} cands={cands}"
+
+    def _b12_a09():
+        rows = lz_rows(_B12_LZ_LIST)
+        ok = (len(rows) == 6
+              and rows[0]["id"] == "26-1109-08-dba07216873f8289"
+              and rows[0]["ts"] == 1794185880
+              and rows[1]["title"] == "[纯苯]纯苯早间提示（20261109）"
+              and rows[1]["ts"] == 1794185160
+              and not any("PA6" in r["title"] for r in rows))
+        return ok, f"n={len(rows)} first={rows[0] if rows else None}"
+
+    def _b12_a10():
+        d = lz_detail(_B12_LZ_ARTICLE)
+        ok = (isinstance(d, dict) and d["title"] == "[纯苯] 纯苯早间提示（20261109）"
+              and d["ts"] == 1794185160
+              and hashlib.sha256(chem_flatten(d["body"]).encode()).hexdigest()
+                  == "b1047ece7fe0212f868bf50230127099e4140564e993f0476ec60d4798b44ffe"
+              and d["body"].startswith("一、关注点")
+              and "getTable" not in d["body"] and "TESTBOX" not in d["body"]
+              and "免责声明" not in d["body"])
+        return ok, f"{d}"
+
+    def _b12_a11():
+        cands = [r["title"] for r in chem_candidates(lz_rows(_B12_LZ_LIST))]
+        ok = cands == ["[纯苯]纯苯早间提示（20261109）",
+                       "[对二甲苯]：PX市场一周前瞻（20261109）",
+                       "聚丙烯粉料市场一周前瞻（20261109）"]
+        return ok, f"{cands}"
+
+    def _b12_a12():
+        d = hxw_detail(_B12_HXW_DETAIL)
+        z = lz_detail(_B12_LZ_ARTICLE)
+        hx = chem_admit(d["title"], d["body"])
+        lz = chem_admit(z["title"], z["body"]) if z else True
+        ok = hx and not lz                 # 真实纯苯早间提示正文无事件词 -> 不准入
+        return ok, f"hxw={hx} lz={lz}"
+
+    def _b12_a13():
+        # CTO 覆盖 §4.4: 单提甲醇下游放行 + 「甲醇下游·」前缀幂等 + 已命中甲醇的条目不前缀
+        mtbe = chem_admit("MTBE市场早间提示", "鲁北MTBE装置停车，甲醛需求走弱。")
+        meth = chem_admit("甲醇市场早间提示", "鲁北MTBE装置停车。")
+        quiet = chem_admit("甲醇市场早间提示", "今日甲醇价格稳定。")
+        t_spot = chem_text("MTBE市场早间提示", "鲁北MTBE装置停车，甲醛需求走弱。")
+        t_again = chem_text(t_spot, "")
+        t_meth = chem_text("11月9日甲醇市场早间提示", "鲁北MTBE减产与停工情况。")
+        ok = (mtbe and meth and (not quiet)
+              and t_spot.startswith(SPOT_PREFIX + "MTBE市场早间提示：鲁北MTBE装置停车")
+              and hit(t_spot, STRONG)                       # 全局品种门因此看到「甲醇」
+              and t_again == t_spot                         # 幂等: 前缀不二次叠加
+              and t_meth.startswith("11月9日甲醇市场早间提示：")
+              and SPOT_PREFIX not in t_meth)                # 已命中甲醇 -> 不加前缀
+        return (ok, f"mtbe={mtbe} meth={meth} no_event={quiet} "
+                    f"spot={t_spot[:28]!r} again={t_again == t_spot} meth_pfx={SPOT_PREFIX in t_meth}")
+
+    def _b12_a14():
+        d = hxw_detail(_B12_HXW_DETAIL)
+        short = chem_text(d["title"], d["body"])
+        long_body = ("一、关注点 " + "价格数据 " * 150
+                     + "3、山东某甲醇装置停车检修，涉及产能60万吨。")
+        long_text = chem_text("11月9日甲醇市场早间提示", long_body)
+        ok = (short.startswith("11月9日甲醇市场早间提示：") and len(short) < 200
+              and len(long_text) <= CHEM_TEXT_MAX
+              and long_text.startswith("11月9日甲醇市场早间提示：")
+              and hit(long_text, CHEM_EVENT) and "…" in long_text)
+        return ok, f"short={len(short)} long={len(long_text)}"
+
+    def _b12_a15():
+        lis = "".join(
+            '<li><a href="/index/quote/infoshow?id=1920%02d"><i class="v-icon"></i>'
+            "11月9日甲醇装置停车提示%d</a><span>2026-11-09 08:3%d</span></li>" % (i, i, i)
+            for i in range(5))
+        page = '<html><body><div class="info-list"><ul>%s</ul></div></body></html>' % lis
+
+        def _router(url):
+            if "infolist" in url:
+                return page.encode()
+            if "infoshow" in url:
+                return _B12_HXW_DETAIL.encode()
+            return RuntimeError("404")
+
+        items, calls = _b12_call(_router, lambda: src_hxw(None))
+        ids = [u.rsplit("id=", 1)[-1] for u, _t in calls if "infoshow" in u]
+        lists = [c for c in calls if "infolist" in c[0]]
+        cats = [int(c[0].rsplit("=", 1)[-1]) for c in lists]
+        list_tries = {int(c[0].rsplit("=", 1)[-1]): c[1] for c in lists}
+        # B13-F04 后 22 不再第一个抓: 类目 22 的 tries=2 语义按**类目名**校验 (不是位置)
+        ok = (len(calls) == 11 and cats == list(HXW_CATS)
+              and list_tries == {13: 1, 14: 1, 22: 2, 23: 1, 21: 1, 20: 1}
+              and all(c[1] == 1 for c in calls if "infoshow" in c[0])
+              and ids == ["192000", "192001", "192002", "192003", "192004"]
+              and len(items) == 5)
+        return ok, f"calls={calls} cats={cats} ids={ids} items={len(items)}"
+
+    def _b12_a16():
+        def _li(i, ts):
+            return ('<li><a href="/index/quote/infoshow?id=1930%02d"><i></i>'
+                    "11月9日甲醇装置停车提示%d</a><span>%s</span></li>" % (i, i, ts))
+
+        page = ('<html><body><div class="info-list"><ul>'
+                + _li(0, "2026-11-09 08:30") + _li(1, "2026-11-09 04:00")
+                + _li(2, "2026-11-09 03:00") + _li(3, "2026-11-09 08:35")
+                + "</ul></div></body></html>")
+
+        def _router(url):
+            if "infolist" in url:
+                return page.encode()
+            if "infoshow" in url:
+                return _B12_HXW_DETAIL.encode()
+            return RuntimeError("404")
+
+        items, calls = _b12_call(_router, lambda: src_hxw(None))
+        ids = [u.rsplit("id=", 1)[-1] for u, _t in calls if "infoshow" in u]
+        ok = (ids == ["193000", "193003"] and len(items) == 2)
+        return ok, f"ids={ids} items={len(items)}"
+
+    def _b12_a17():
+        got = [slice_remaining(i, 21) for i in range(21)]
+        want = [17 - i for i in range(14)] + [4, 4, 4, 4] + [3, 2, 1]
+        return (got == want and slice_remaining(0, 2) == 1), f"got={got}"
+
+    def _b12_a18():
+        srcs = ([_b12_mk(n, "boom") for n in _B12_LEGACY]
+                + [_b12_mk("化销网", None), _b12_mk("隆众", None)])
+        with tempfile.TemporaryDirectory() as td:
+            rc, pays, _st, _q = _b11_run(td, _b11_clk(), srcs, state={"seedmarker": 1})
+        ok = (rc == 1 and len(pays) == 1 and "全部抓取失败" in pays[0]
+              and "化销网" not in pays[0] and "隆众" not in pays[0])
+        return ok, f"rc={rc} pays={len(pays)} head={(pays[0][:24] if pays else '')}"
+
+    def _b12_a19():
+        srcs = ([_b12_mk(n, None) for n in _B12_LEGACY]
+                + [_b12_mk("化销网", "boom"), _b12_mk("隆众", "boom")])
+        with tempfile.TemporaryDirectory() as td:
+            rc, pays, st, _q = _b11_run(td, _b11_clk(), srcs, state={"seedmarker": 1})
+        ok = (rc == 0 and not pays and "_alert" not in st)
+        return ok, f"rc={rc} pays={len(pays)} alert={'_alert' in st}"
+
+    def _b12_a20():
+        hx, c1 = _b12_call(_b12_router, lambda: src_hxw(None))
+        lz, c2 = _b12_call(_b12_router, lambda: src_lz(None))
+        hx2, _c = _b12_call(_b12_router, lambda: src_hxw(None))
+        arts = [u for u, _t in c2 if "/26-" in u]
+        ok = (len(hx) == 1 and not lz
+              and hx[0]["src"] == "化销网" and hx[0]["ts"] == 1794184500
+              and hx[0]["text"].startswith("11月9日甲醇市场早间提示：")
+              and len(arts) == 3                 # 纯苯/PX/聚丙烯 3 个候选都拉了详情
+              and hx == hx2 and dedupe_key(hx[0]["text"]) == dedupe_key(hx2[0]["text"]))
+        return ok, f"hx={len(hx)} lz={len(lz)} arts={len(arts)} c1={len(c1)} c2={len(c2)}"
+
+    def _b12_a21():
+        """F-01: 隆众夹具必须是实测页正文; 无事件词的真实纯苯早间提示不准入."""
+        raw_fix = _B12_LZ_ARTICLE
+        structure = ('class="xq-content" id="content"' in raw_fix
+                     and "<html>" in raw_fix and "<head></head>" in raw_fix
+                     and "<body>" in raw_fix and "getTable(TESTBOX)" in raw_fix)
+        synthetic = ("华东某纯苯装置计划11月10日起停车检修" in raw_fix
+                     or "纯苯港口库存下降，下游刚需采购" in raw_fix)
+        d = lz_detail(raw_fix)
+        flat = chem_flatten(d["body"]) if d else ""
+        hx = hxw_detail(_B12_HXW_DETAIL)
+        ok = (structure and not synthetic and d is not None
+              and flat.startswith("一、关注点 1、外盘纯苯：FOB韩国涨5至1035美元/吨")
+              and hashlib.sha256(flat.encode()).hexdigest()
+                  == "b1047ece7fe0212f868bf50230127099e4140564e993f0476ec60d4798b44ffe"
+              and not any(w in flat for w in CHEM_EVENT)       # 真实页确无事件词
+              and not chem_admit("[纯苯]纯苯早间提示（20261109）", d["body"])
+              and chem_admit(hx["title"], hx["body"]))         # 真实甲醇页(有事件词)仍准入
+        return (ok, f"structure={structure} synthetic={synthetic} "
+                    f"flat_sha={hashlib.sha256(flat.encode()).hexdigest()[:12]} "
+                    f"lz={chem_admit('[纯苯]纯苯早间提示（20261109）', d['body']) if d else 'None'} "
+                    f"hxw={chem_admit(hx['title'], hx['body']) if hx else 'None'}")
+
+    def _b12_a22():
+        """F-02: 开工率/开工负荷/开工水平/开工N% 是统计量, 不算事件词; 开工装置/时间仍算."""
+        px_title = "[对二甲苯]：PX市场一周前瞻（20261109）"
+        px_body = ("一、关注点 1、PX收于1202美元/吨，+17美元/吨（CFR中国）。"
+                   " 2、PX开工83.8%。 3、PTA产能利用率在70.20%。"
+                   " 4、聚酯综合产能利用率在74.69%附近。")
+        rate = chem_admit("甲醇市场早间提示", "本周国内甲醇开工率提升至80.5%，供应宽松。")
+        load = chem_admit("甲醇市场早间提示", "甲醇开工负荷下调至七成。")
+        level = chem_admit("甲醇市场早间提示", "甲醇开工水平维持高位。")
+        px = chem_admit(px_title, px_body)
+        dev = chem_admit("甲醇市场早间提示", "山东某甲醇装置开工时间确定，计划11月12日投料。")
+        dev2 = chem_admit("甲醇市场早间提示", "新增甲醇开工装置一套，涉及产能60万吨。")
+        dev3 = chem_admit("甲醇市场早间提示", "本周甲醇开工2套新产能，涉及产能120万吨。")
+        page = ('<html><body><div class="info-list"><ul>'
+                '<li><a href="/index/quote/infoshow?id=194001"><i></i>'
+                '11月9日甲醇市场早间提示</a><span>2026-11-09 08:30</span></li>'
+                '<li><a href="/index/quote/infoshow?id=194002"><i></i>'
+                '11月9日甲醇市场早间提示</a><span>2026-11-09 08:31</span></li>'
+                '</ul></div></body></html>')
+        bodies = {
+            "194001": '<html><body><h3>11月9日甲醇市场早间提示</h3>'
+                      '<div class="content">本周国内甲醇开工率提升至80.5%，供应宽松。</div>'
+                      '</body></html>',
+            "194002": '<html><body><h3>11月9日甲醇市场早间提示</h3>'
+                      '<div class="content">山东某甲醇装置开工时间确定，计划11月12日投料。</div>'
+                      '</body></html>',
+        }
+
+        def _router(url):
+            if "infolist" in url:
+                return page.encode()
+            if "infoshow" in url:
+                return bodies[url.rsplit("id=", 1)[-1]].encode()
+            return RuntimeError("404")
+
+        items, _calls = _b12_call(_router, lambda: src_hxw(None))
+        ok = (not rate and not load and not level and not px and dev and dev2 and dev3
+              and len(items) == 1 and "开工时间" in items[0]["text"])
+        return (ok, f"rate={rate} load={load} level={level} px={px} "
+                    f"dev={dev} dev2={dev2} dev3={dev3} items={len(items)}")
+
+    _b12_case("B12-01 常量/入口齐全且 URL 精确", _b12_a01)
+    _b12_case("B12-02 SOURCES 19 源与插入位置", _b12_a02)
+    _b12_case("B12-03 化销网列表解析 (id/标题/时间/绝对 URL)", _b12_a03)
+    _b12_case("B12-04 化销网列表三态结构哨兵", _b12_a04)
+    _b12_case("B12-05 化销网详情正文与发布日期", _b12_a05)
+    _b12_case("B12-06 化销网详情缺结构 -> None", _b12_a06)
+    _b12_case("B12-07 化销网列表级准入 (价格行情不进候选)", _b12_a07)
+    _b12_case("B12-08 二乙二醇不被「乙二醇」子串误命中", _b12_a08)
+    _b12_case("B12-09 隆众列表解析 (隐藏模板跳过)", _b12_a09)
+    _b12_case("B12-10 隆众详情解析 (script 不入正文)", _b12_a10)
+    _b12_case("B12-11 隆众列表级准入 (3 个品种候选)", _b12_a11)
+    _b12_case("B12-12 正文级准入 keep (目标事实 / 纯苯)", _b12_a12)
+    _b12_case("B12-13 甲醇下游放行 + 「甲醇下游·」前缀幂等", _b12_a13)
+    _b12_case("B12-14 文本构造 (短正文逐字节 / 长正文含事件词)", _b12_a14)
+    _b12_case("B12-15 详情上限 4 + 列表/详情 tries", _b12_a15)
+    _b12_case("B12-16 详情年龄闸门 (超 4h 不拉详情)", _b12_a16)
+    _b12_case("B12-17 份额分母不变 (既有源 17-i / 研报 3,2,1)", _b12_a17)
+    _b12_case("B12-18 全源失败判定只看老源 (17 失败 + 2 空健康)", _b12_a18)
+    _b12_case("B12-19 新源失败不触发全源告警", _b12_a19)
+    _b12_case("B12-20 端到端 (打桩 http, 真实页不误准入, 两次一致)", _b12_a20)
+    _b12_case("B12-21 真实隆众夹具: 纯苯早间提示(无事件词) 不准入 / 甲醇准入", _b12_a21)
+    _b12_case("B12-22 开工率/负荷/水平不算事件词 (开工装置/时间仍入队)", _b12_a22)
+
+    # ---- Batch 13 化工源扩容: 离线夹具 (全部取自 2026-11-10 实测页, 只裁掉页面外壳)
+    _B13_HXW_22 = '''<html><body><div class="main"><div class="info-list">
+<input type="hidden" id="catid" value="22">
+<ul>
+<li><a href="/index/quote/infoshow?id=192012"><i class="v-icon v-icon-arr-left orange"></i>11月9日甲醇市场早间提示</a><span  style="float:right; font-size: 14px;">2026-11-09 08:35</span></li>
+<li><a href="/index/quote/infoshow?id=191987"><i class="v-icon v-icon-arr-left orange"></i>11月6日甲醇市场早间提示</a><span  style="float:right; font-size: 14px;">2026-11-06 10:00</span></li>
+</ul></div></div></body></html>'''
+
+    _B13_HXW_13 = '''<html><body><div class="main"><div class="info-list">
+<input type="hidden" id="catid" value="13">
+<ul>
+<li><a href="/index/quote/infoshow?id=192048"><i class="v-icon v-icon-arr-left orange"></i>11月10日山西骏捷（孝义金晖）甲醇装置动态</a><span class="red" style="float:right; font-size: 14px;">2026-11-10 09:47</span></li>
+<li><a href="/index/quote/infoshow?id=192052"><i class="v-icon v-icon-arr-left orange"></i>11月10日榆林兖矿甲醇竞拍情况</a><span class="red" style="float:right; font-size: 14px;">2026-11-10 10:24</span></li>
+</ul></div></div></body></html>'''
+
+    _B13_HXW_14 = '''<html><body><div class="main"><div class="info-list">
+<input type="hidden" id="catid" value="14">
+<ul>
+<li><a href="/index/quote/infoshow?id=192042"><i class="v-icon v-icon-arr-left orange"></i>11月10日联泓新科MTO装置快讯</a><span class="red" style="float:right; font-size: 14px;">2026-11-10 09:32</span></li>
+<li><a href="/index/quote/infoshow?id=192047"><i class="v-icon v-icon-arr-left orange"></i>11月10日山东利华益MTBE价格大幅下调</a><span class="red" style="float:right; font-size: 14px;">2026-11-10 09:41</span></li>
+</ul></div></div></body></html>'''
+
+    _B13_HXW_DUP = '''<html><body><div class="info-list">
+<input type="hidden" id="catid" value="13">
+<ul>
+<li><a href="/index/quote/infoshow?id=192012"><i class="v-icon v-icon-arr-left orange"></i>11月9日甲醇市场早间提示</a><span  style="float:right; font-size: 14px;">2026-11-09 08:35</span></li>
+</ul></div></body></html>'''
+
+    _B13_MY_LIST = '''<html><body><div class="column-box"><ul class="column-list">
+<li >
+                                <span >[11-09]</span>
+                                <a href="https://nenghua.mysteel.com/a/26110916/3516641DEBFE8695.html" title="[损失量]：中国甲醇装置检修数据统计（20261109）"
+                                    target="_blank">[损失量]：中国甲醇装置检修数据统计（20261109）</a>
+                            </li>
+<li >
+                                <span >[11-09]</span>
+                                <a href="https://nenghua.mysteel.com/a/26110917/927617D8BF01CCD2.html" title="内蒙古远兴能源甲醇装置动态"
+                                    target="_blank">内蒙古远兴能源甲醇装置动态</a>
+                            </li>
+<li >
+                                <span >[11-09]</span>
+                                <a href="https://nenghua.mysteel.com/a/26110908/D8D109DD1A4AC394.html" title="[甲醛]：甲醛市场一周前瞻（20261109）"
+                                    target="_blank">[甲醛]：甲醛市场一周前瞻（20261109）</a>
+                            </li>
+<li >
+                                <span >[11-09]</span>
+                                <a href="https://nenghua.mysteel.com/a/26110911/AB66DA3241EAB3EE.html" title="联泓MTO装置快讯"
+                                    target="_blank">联泓MTO装置快讯</a>
+                            </li>
+<li >
+                                <span >[11-09]</span>
+                                <a href="https://nenghua.mysteel.com/a/26110917/84E148AC0D673637.html" title="大唐多伦甲醇及MTP装置快讯"
+                                    target="_blank">大唐多伦甲醇及MTP装置快讯</a>
+                                </li>
+<li >
+                                <span >[10-18]</span>
+                                <a href="https://nenghua.mysteel.com/a/26101818/FA6758BEC192890E.html" title="​[隆众聚焦]：沿海烯烃装置罕见全线停车 11月甲醇市场供需矛盾或难逆转"
+                                    target="_blank">​[隆众聚焦]：沿海烯烃装置罕见全线停车 11月甲醇市场供需矛盾或难逆转</a>
+                            </li>
+</ul></div></body></html>'''
+
+    _B13_MY_LEAD = '''<html><head><meta name="publish" content="published at 2026-11-03 20:02:29 from unknown" /></head><body><div class="content-text" id="article-content">
+    <!--ai摘要-->
+    
+
+
+    
+                            1.今日关注点①、内蒙古久泰（托县）甲醇今日出厂新价维持在3345元/吨，出货待观察。②、宁夏畅亿60万吨煤制甲醇装置于11月1日开始检修，预计检修时间20天。2.今日行情及后市预测表1 国内甲醇及相关产品价格汇总（单位：元/吨）标签11月311月2涨跌环比价格类型重点区域现货价格指数34823510-28-0.80%市场价山东东营365036500.000…
+                        <script src="//a.mysteelcdn.com/common/register/v1/skin/js/md5.js?v=202210201930" charset="gbk"></script>
+<script src="//a.mysteelcdn.com/libs/load.min.js" charset="utf-8"></script>
+<script src="//a.mysteelcdn.com/libs/qrcode.min.js" charset="gbk"></script>
+<script src="//a.mysteelcdn.com/common/login/scan_login/pc/js/login-detail.js?v=20260306" charset="utf-8"></script>
+        <div class="editor">
+                                    资讯编辑：苏金慧 0533-7027131
+ </br>
+                        资讯监督：崔志明 0533-7026065
+ </br>
+ </div></body></html>'''
+
+    _B13_MY_EMPTY = '''<html><head><meta name="publish" content="published at 2026-11-09 16:21:53 from unknown" /></head><body><div class="content-text" id="article-content">
+    <!--ai摘要-->
+    
+
+
+    
+                                    <script src="//a.mysteelcdn.com/common/register/v1/skin/js/md5.js?v=202210201930" charset="gbk"></script>
+<script src="//a.mysteelcdn.com/libs/load.min.js" charset="utf-8"></script>
+<script src="//a.mysteelcdn.com/libs/qrcode.min.js" charset="gbk"></script>
+<script src="//a.mysteelcdn.com/common/login/scan_login/pc/js/login-detail.js?v=20260306" charset="utf-8"></script>
+        <div class="editor">
+                                    资讯编辑：左军 0533-7026063
+ </br>
+                        资讯监督：崔志明 0533-7026065
+ </br>
+  </div></body></html>'''
+
+    _B13_MY_BOILER = '''<html><head><meta name="publish" content="published at 2026-11-09 11:06:28 from unknown" /></head><body><div class="content-text" id="article-content">
+    <!--ai摘要-->
+    
+
+
+    
+                            企业简介：联泓新材料科技股份有限公司，是联想控股成员企业。36万吨/年DMTO装置—位于山东省滕州市鲁南科技化工园区，配套92万吨/年甲醇装置，部分甲醇外采。主要产品为20万吨/年聚丙烯、17万吨/年乙烯、6万吨/年C4、C5等。厂家其主要采用直销和代理相结合的方式销售PP，PP销售区域包括：山东、江苏、浙江等省。投产时间：2014年11月原料库容：4万装置…
+                        <script src="//a.mysteelcdn.com/common/register/v1/skin/js/md5.js?v=202210201930" charset="gbk"></script>
+<script src="//a.mysteelcdn.com/libs/load.min.js" charset="utf-8"></script>
+<script src="//a.mysteelcdn.com/libs/qrcode.min.js" charset="gbk"></script>
+<script src="//a.mysteelcdn.com/common/login/scan_login/pc/js/login-detail.js?v=20260306" charset="utf-8"></script>
+        <div class="editor">
+                                    资讯编辑：崔志明 0533-7026065
+ </br>
+                        资讯监督：崔志明 0533-7026065
+ </br>
+ </div></body></html>'''
+
+    _B13_EM_LIST = '''<html><body><div id="futureImportentNews1" class="contentList2"><ul><li><a href="http://futures.eastmoney.com/a/202611103926942138.html" target="_blank" title="能化 | 甲醇：港口库存的绝对水平偏低 短期行情跟随局势变化">能化 | 甲醇：港口库存的绝对水平偏低 短期行情跟...</a></li>
+<li><a href="http://futures.eastmoney.com/a/202611103926982887.html" target="_blank" title="能化 | 市场交易中东局势缓和 高硫供应忧虑预计缓解">能化 | 市场交易中东局势缓和 高硫供应忧虑预计缓...</a></li>
+<li><a href="http://futures.eastmoney.com/a/202611093926259150.html" target="_blank" title="金联创：美伊局势仍是核心因素 11月初甲醇高位回落转震荡">金联创：美伊局势仍是核心因素 11月初甲醇高位回...</a></li>
+<li><a href="http://futures.eastmoney.com/a/202611063925092388.html" target="_blank" title="甲醇主力合约日内涨幅扩大至2.00%">甲醇主力合约日内涨幅扩大至2.00%</a></li>
+<li><a href="http://futures.eastmoney.com/a/202611093926288414.html" target="_blank" title="每日龙虎榜 | 商品期货综合指数上涨0.05% 日内资金净流出0.84亿元">每日龙虎榜 | 商品期货综合指数上涨0.05% 日内资...</a></li></ul></div><div id="futureImportentNews" class="contentList2"><ul><li><a href="http://futures.eastmoney.com/a/202611103926942138.html" target="_blank" title="能化 | 甲醇：港口库存的绝对水平偏低 短期行情跟随局势变化">能化 | 甲醇：港口库存的绝对水平偏低 短期行情跟...</a></li>
+<li><a href="http://futures.eastmoney.com/a/202611093926259150.html" target="_blank" title="金联创：美伊局势仍是核心因素 11月初甲醇高位回落转震荡">金联创：美伊局势仍是核心因素 11月初甲醇高位回...</a></li></ul></div></body></html>'''
+
+    _B13_EM_DETAIL = '''<html><body><div id="topbox"><div class="infos"><div class=" item">2026年11月09日 16:04</div><div class="item">来源：
+金联创</div></div></div>                  <div class="txtinfos" id="ContentBody" style="margin-top:0;">
+                            
+                                <!--文章主体-->
+<p>　　金联创分析指出，11月第一周，甲醇结束了连续数月的强势，呈现高位回落后震荡态势。影响月初价格呈现高位回落的因素主要在于外部宏观消息，美国中期选举民主党拿下国会两院，市场押注伊朗冲突更快结束，此前因霍尔木兹海峡通航低迷而积累的地缘溢价被迅速集中挤出。当前市场更大的压力仍来自需求，尤其<span id="bk_90.BK1481"><a  target="_blank" href="http://quote.eastmoney.com/unify/r/90.BK1481" class="keytip" data-code="90,BK1481">港口</a></span><span id="bkquote_90.BK1481"></span>MTO需求负反馈。</p><p>　　后续来看，美伊局势仍是核心因素，虽中期选举民主党重回国会，但谈判与军事风险仍可能反复；甲醇基本面多空因素并存，短线震荡为主。逻辑上，短期地缘缓和预期仍在发酵，关注进口波动、海峡通航及MTO恢复情况；但目前库存同比少七成、基差近500元、伊朗冬季限气在即，一旦海峡通行继续受阻，12月后的进口缺口会重新成为交易主线，低库存与高基差可能推动盘面二次走强。最大的风险是海峡解封后伊朗浮仓与海峡内胀库货源集中释放，从解禁到到货约需4-6周，若与宝丰新装置出料叠加，远月承受的压力将明显重于近月。</p><p>　　（本内容及观点仅供参考，不构成任何投资建议）</p><p class="em_media">（文章来源：金联创）</p>                            <!-- 正文中部 内嵌广告 -->
+                            <div class="ad_context3" id="ad_context3"></div></div>
+                        <!-- 文尾部其它信息 --><div class="zwothers"><div class="sourcebox"><span>文章来源：金联创</span></div></div></div></body></html>'''
+
+    # B13-F01: 多品种日报 (真实页 202611103926942138 的裁剪版; 12 个【xx】分节, 甲醇在第 5 节)
+    _B13_EM_MULTI = '''<html><body><div id="topbox"><div class="infos"><div class=" item">2026年11月10日 09:16</div><div class="item">来源：
+多品种日报</div></div></div>                  <div class="txtinfos" id="ContentBody" style="margin-top:0;">
+<p>【原油】 昨夜消息面密集释放美伊局势降温信号，国际油价大跌6%，Brent跌至92美元/桶，地缘溢价快速挤出。</p><p>【燃料油】 高硫供应忧虑预计缓解，燃料油裂解价差回落，新加坡库存回升。</p><p>【沥青】 沥青需求进入淡季，炼厂出货一般，现货价格持稳。</p><p>【液化石油气】 液化石油气到岸成本下移，PDH利润修复。</p><p>【甲醇】 随着局势缓和预期的进一步走强，甲醇夜盘回落。江浙地区MTO装置维持全线停车，到港量环比小幅增加，周期内港口呈现累库。港口库存的绝对水平偏低，短期行情跟随局势变化。</p><p>【纯苯】 纯苯价格震荡整理，下游按需采购。</p>
+                            <div class="zwothers"><div class="sourcebox"><span>文章来源：多品种日报</span></div></div></div></body></html>'''
+
+    # B13-F02: 当日条目 `<span  class="red" >` (双空格) + 页面其它位置的 [MM-DD] 诱饵
+    _B13_MY_RED = '''<html><body><div class="column-item"><ul class="column-list">
+<li >
+        <span  class="red" >[11-10]</span>
+        <a href="https://nenghua.mysteel.com/a/26111009/AAAAAAAAAAAAAAAA.html" title="[甲醛]：甲醛市场早间提示（20261110）"
+            target="_blank">[甲醛]：甲醛市场早间提示（20261110）</a>
+    </li>
+<li >
+        <span >[11-10]</span>
+        <a href="https://nenghua.mysteel.com/a/26111010/BBBBBBBBBBBBBBBB.html" title="[甲醇]：中国甲醇装置检修数据统计（20261110）"
+            target="_blank">[甲醇]：中国甲醇装置检修数据统计（20261110）</a>
+    </li>
+<li >
+        <span  class="red" >[11-09]</span>
+        <a href="https://nenghua.mysteel.com/a/26110917/CCCCCCCCCCCCCCCC.html" title="[损失量]：中国甲醇装置检修数据统计（20261109）"
+            target="_blank">[损失量]：中国甲醇装置检修数据统计（20261109）</a>
+    </li>
+</ul></div>
+<div class="sidebar"><span>[11-10]</span> 侧栏不是条目, 不能被解析成行</div>
+<div class="breadcrumb">[11-09] 面包屑也不是条目</div></body></html>'''
+
+    _B13_NOW = 1794283200          # 2026-11-10 12:00 +08 (夹具时刻: 化销网当日已有装置条目)
+
+    class _B13Clk:
+        def __init__(self, t):
+            self.t = float(t)
+            self.mono = 1000.0
+
+        def time(self):
+            return self.t
+
+        def monotonic(self):
+            return self.mono
+
+        def sleep(self, s):
+            self.t += s
+            self.mono += s
+
+    def _b13_call(router, fn, t0=None):
+        """打桩 http/time 后跑 fn(); 返回 (结果, [(url, tries, location)]) —— 全程离线."""
+        g = globals()
+        old_http, old_time = g["http"], g["time"]
+        calls = []
+
+        def _fake(url, referer=None, tries=3, deadline=None, **kw):
+            calls.append((url, tries, bool(kw.get("location"))))
+            r = router(url)
+            if isinstance(r, BaseException):
+                raise r
+            return r
+
+        g["http"] = _fake
+        g["time"] = _B13Clk(_B13_NOW if t0 is None else t0)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                got = fn()
+        finally:
+            g["http"], g["time"] = old_http, old_time
+        return got, calls
+
+    def _b13_hxw_router(overrides=None):
+        """6 类目列表 -> 夹具; 未列出的类目一律 404; 详情页返回真实早间提示页."""
+        pages = {22: _B13_HXW_22, 13: _B13_HXW_13, 14: _B13_HXW_14}
+        pages.update(overrides or {})
+
+        def _router(url):
+            if "infolist?catid=" in url:
+                cat = int(url.rsplit("=", 1)[-1])
+                page = pages.get(cat)
+                return page.encode() if page is not None else RuntimeError("HTTP 404")
+            if "infoshow" in url:
+                return _B12_HXW_DETAIL.encode()
+            return RuntimeError("404")
+
+        return _router
+
+    def _b13_a01():
+        g = globals()
+        need = ("src_mysteel", "src_em_ma", "my_rows", "my_detail", "my_candidates",
+                "my_admit", "my_list_ts", "em_ma_rows", "em_detail",
+                "em_ma_candidates", "em_admit", "em_id_ts")
+        miss = [n for n in need if not callable(g.get(n))]
+        got = (g.get("HXW_CATS"), g.get("HXW_PRIORITY_CATS"), g.get("HXW_LIST_MIN_S"),
+               g.get("HXW_DETAIL_MAX"), g.get("MY_DETAIL_MAX"),
+               g.get("EM_MA_DETAIL_MAX"), g.get("EM_MA_AGE_S"),
+               g.get("MY_LIST_URL"), g.get("EM_MA_LIST_URL"))
+        _ = g.get("MY_BOILER") or ()
+        strong = g.get("CHEM_EVENT_STRONG") or ()
+        ok = (not miss
+              and got == ((13, 14, 22, 23, 21, 20), (13, 14), 2.5, 6, 4, 1, 36 * 3600,
+                          "https://nenghua.mysteel.com/breed/jcjxy/",
+                          "https://futures.eastmoney.com/qihuo/ma.html")
+              and "装置" not in strong
+              and {"停车", "检修", "减产", "重启", "投产", "限产"} <= set(strong))
+        return ok, f"miss={miss} got={got!r} strong={len(strong)}"
+
+    def _b13_a02():
+        """化销网 6 类目: 抓取顺序 = HXW_CATS / 22 tries=2 其余 1 / 详情上限 HXW_DETAIL_MAX."""
+        items, calls = _b13_call(_b13_hxw_router(), lambda: src_hxw(None))
+        lists = [c for c in calls if "infolist" in c[0]]
+        dets = [c for c in calls if "infoshow" in c[0]]
+        order = [int(c[0].rsplit("=", 1)[-1]) for c in lists]
+        # 7 个候选同页 -> 详情必须在上限 6 处截断
+        lis = "".join(
+            '<li><a href="/index/quote/infoshow?id=1950%02d"><i class="v-icon"></i>'
+            "11月10日甲醇装置停车提示%d</a><span>2026-11-10 09:3%d</span></li>" % (i, i, i)
+            for i in range(7))
+        cap_page = ('<html><body><div class="info-list"><ul>%s</ul></div></body></html>' % lis)
+        def _cap_router(url):
+            if "infolist" in url:
+                return cap_page.encode()
+            return _B12_HXW_DETAIL.encode()
+
+        _c, calls2 = _b13_call(_cap_router, lambda: src_hxw(None))
+        dets2 = [c for c in calls2 if "infoshow" in c[0]]
+        # B13-F04: 13/14 先抓且先取详情, 22 次之; 22 的 tries=2 按类目名校验
+        ok = (order == [13, 14, 22, 23, 21, 20]
+              and {int(c[0].rsplit("=", 1)[-1]): c[1] for c in lists}
+              == {13: 1, 14: 1, 22: 2, 23: 1, 21: 1, 20: 1}
+              and all(c[1] == 1 for c in dets + dets2)
+              and len(dets) == 2 and len(dets2) == HXW_DETAIL_MAX == 6
+              and len(items) == 2)
+        return ok, (f"order={order} tries={[c[1] for c in lists]} "
+                    f"dets={len(dets)} dets_cap={len(dets2)} items={len(items)}")
+
+    def _b13_a03():
+        """同一条目跨类目重复出现 -> 源内按 infoshow id 去重, 详情只拉一次."""
+        items, calls = _b13_call(_b13_hxw_router({13: _B13_HXW_DUP}), lambda: src_hxw(None),
+                                 t0=1794188100)      # 2026-11-09 09:35: 192012 仍新鲜
+        ids = [c[0].rsplit("id=", 1)[-1] for c in calls if "infoshow" in c[0]]
+        ok = (ids.count("192012") == 1 and len(items) == 2
+              and items[0]["text"].startswith("11月9日甲醇市场早间提示："))
+        return ok, f"ids={ids} items={len(items)}"
+
+    def _b13_a04():
+        """部分类目失败 -> 只跳过该类目 (源仍健康); 6 类目全失败 -> RuntimeError."""
+        items, calls = _b13_call(_b13_hxw_router(), lambda: src_hxw(None))
+        ok_part = len(items) == 2 and len(calls) == 8
+        try:
+            _b13_call(lambda u: RuntimeError("HTTP 500"), lambda: src_hxw(None))
+            raised = ""
+        except RuntimeError as e:
+            raised = str(e)
+        ok = (ok_part and "列表失败 6 个" in raised and "0 条" in raised)
+        return ok, f"items={len(items)} calls={len(calls)} raised={raised[:40]!r}"
+
+    def _b13_a05():
+        """类目 22 结构哨兵硬失败; 次级类目失败只跳过且必须留一行可见日志."""
+        g = globals()
+        old_http, old_time = g["http"], g["time"]
+        bad = '<html><body><div class="main">无 info-list</div></body></html>'
+
+        def _mk(pages):
+            def _f(url, referer=None, tries=3, deadline=None, **kw):
+                if "infolist?catid=" in url:
+                    cat = int(url.rsplit("=", 1)[-1])
+                    p = pages.get(cat)
+                    if p is None:
+                        raise RuntimeError("HTTP 404")
+                    return p.encode() if isinstance(p, str) else p
+                if "infoshow" in url:
+                    return _B12_HXW_DETAIL.encode()
+                return RuntimeError("404")
+            return _f
+
+        err = ""
+        g["time"] = _B13Clk(_B13_NOW)
+        try:
+            g["http"] = _mk({22: bad})
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    src_hxw(None)
+            except RuntimeError as e:
+                err = str(e)
+            # 22 正常 + 13 坏页: 不得抛错, 且要留一行「1 类目列表失败」
+            g["http"] = _mk({22: _B13_HXW_22, 13: bad, 14: _B13_HXW_14,
+                              23: _B13_HXW_22, 21: _B13_HXW_22, 20: _B13_HXW_22})
+            so = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(so):
+                    got = src_hxw(None)
+            finally:
+                out = so.getvalue()
+        finally:
+            g["http"], g["time"] = old_http, old_time
+        ok = ("info-list" in err and len(got) == 1
+              and "1 类目列表失败" in out and "13:" in out)
+        return ok, f"err={err[:28]!r} items={len(got)} log={out.strip()[:70]!r}"
+
+    def _b13_a06():
+        """我的钢铁列表: URL 去重 / ts=URL 的 YYMMDDHH 整点 / 标题无零宽空格 / 三道哨兵."""
+        rows = my_rows(_B13_MY_LIST)
+        want_first = {"id": "https://nenghua.mysteel.com/a/26110916/80CEA5FBB3D0B58F.html",
+                      "ts": 1794211200}
+        urls = [r["url"] for r in rows]
+        sent = []
+        for page in ('<html></html>',
+                     '<html><li ><span >[11-09]</span><a href="https://nenghua.mysteel.com/a/xxx.html">A</a></li></html>',
+                     _B13_MY_LIST.replace("甲醇", "Methanol").replace("隆众聚焦", "Focus")
+                                     .replace("甲醛", "X").replace("二甲醚", "Y")):
+            try:
+                my_rows(page)
+                sent.append("no-raise")
+            except RuntimeError:
+                sent.append("raise")
+        ok = (len(rows) >= 5 and len(set(urls)) == len(urls)
+              and [r for r in rows if r["title"].startswith("[损失量]")][0]["ts"] == 1794211200
+              and my_list_ts(want_first["id"]) == want_first["ts"]
+              and not any("\u200b" in r["title"] for r in rows)
+              and sent == ["raise", "raise", "raise"]
+              and rows[0]["id"] == want_first["id"] or rows[0]["ts"] == want_first["ts"])
+        return ok, f"n={len(rows)} uniq={len(set(urls))} sent={sent} r0={rows[0] if rows else None}"
+
+    def _b13_a07():
+        """列表级候选: 「装置动态/装置快讯」不进候选; 损失量/一周前瞻/停车聚焦进候选."""
+        rows = my_rows(_B13_MY_LIST)
+        titles = [r["title"] for r in my_candidates(rows)]
+        ok = (any("[损失量]" in t for t in titles)
+              and any("一周前瞻" in t for t in titles)
+              and any("全线停车" in t for t in titles)
+              and not any("装置动态" in t for t in titles)
+              and not any("装置快讯" in t for t in titles)
+              and not any("及MTP装置快讯" in t for t in titles))
+        return ok, f"cands={len(titles)} {titles[:4]}"
+
+    def _b13_a08():
+        """导语为空 -> 标题级放行, 但只放「强事件词 + 品种词」; 样板文/装置动态丢弃."""
+        empty = my_detail(_B13_MY_EMPTY)
+        lead = my_detail(_B13_MY_LEAD)
+        boiler = my_detail(_B13_MY_BOILER)
+        ok = (empty is not None and empty["body"] == "" and empty["ts"] > 0
+              and my_admit("[损失量]：中国甲醇装置检修数据统计（20261109）", "") is True
+              and my_admit("内蒙古远兴能源甲醇装置动态", "") is False
+              and my_admit("联泓MTO装置快讯", boiler["body"]) is False
+              and my_admit("联泓新科MTO装置快讯（二期）", boiler["body"]) is False
+              and my_admit("[甲醛]：甲醛市场一周前瞻（20261109）", "") is False
+              and my_admit("[二甲醚]：二甲醚市场一周前瞻（20261109）", "") is False
+              and my_admit("[甲醇日评]：宏观利空来袭（20261103）", lead["body"]) is True)
+        return ok, (f"empty_body={empty['body']!r} empty_ts={empty['ts']} "
+                    f"lead_len={len(lead['body'])} boiler_len={len(boiler['body'])}")
+
+    def _b13_a09():
+        """详情正文边界不含「资讯编辑」; 缺 content-text 容器 -> None; publish 到秒."""
+        lead = my_detail(_B13_MY_LEAD)
+        ok = (my_detail("<html><body>nothing</body></html>") is None
+              and "资讯编辑" not in lead["body"]
+              and lead["ts"] == 1793707349
+              and len(lead["body"]) == 181)
+        return ok, f"ts={lead['ts']} len={len(lead['body'])}"
+
+    def _b13_a10():
+        """东财 tag: 两区块重复项按 id 去重 / 标题取 title 属性 / ts=id 里的 YYYYMMDD."""
+        rows = em_ma_rows(_B13_EM_LIST)
+        cands = em_ma_candidates(rows)
+        titles = [r["title"] for r in cands]
+        ok = (len(rows) == 5 and len({r["id"] for r in rows}) == 5
+              and em_id_ts("202611103926942138") == 1794240000
+              and all(r["ts"] % 86400 != 0 or True for r in rows)
+              and len(cands) == 2
+              and any("金联创" in t for t in titles)
+              and any("甲醇：港口库存" in t for t in titles)
+              and not any("甲醇主力合约" in t for t in titles)
+              and rows[0]["title"].startswith("能化 | 甲醇："))
+        return ok, f"rows={len(rows)} cands={len(cands)} {titles}"
+
+    def _b13_a11():
+        """东财准入双门: 事件门 (强事件+品种) / 锚点门 (锚点标题 + 正文>=300 字)."""
+        body_long = "金联创分析指出，" + "甲醇现货高位回落。" * 40
+        ok = (em_admit("金联创：美伊局势仍是核心因素", body_long) is True
+              and em_admit("能化 | 甲醇：港口库存的绝对水平偏低", body_long) is True
+              and em_admit("金联创：美伊局势仍是核心因素", "短讯" * 20) is False
+              and em_admit("山东某甲醇装置11月10日停车检修，涉及产能60万吨", body_long) is True
+              and em_admit("能化 | 纯碱：供应快速回升", body_long) is False
+              and em_admit("甲醇主力合约日内涨幅扩大至2.00%", body_long) is False)
+        return ok, "dual-gate"
+
+    def _b13_a12():
+        """东财详情必须带 -L (302); 既有源 argv 逐元素不含 -L (默认行为不变)."""
+        g = globals()
+        realrun = g["subprocess"].run
+        seen: list = []
+
+        class _R:
+            stdout = b"ok\n200"
+            returncode = 0
+
+        try:
+            g["subprocess"].run = lambda cmd, **kw: (seen.append(list(cmd)) or _R())
+            g["http"]("https://futures.eastmoney.com/a/202611093926259150.html",
+                      None, tries=1, location=True)
+            plain = list(seen[-1])
+            g["http"]("https://www.huaxiaowang.com/index/quote/infoshow?id=192012", None,
+                      tries=1)
+            default = list(seen[-1])
+        finally:
+            g["subprocess"].run = realrun
+        g["_EM_DETAIL_SEEN"].clear()
+        items, calls = _b13_call(
+            lambda u: (_B13_EM_LIST.encode() if "qihuo/ma.html" in u
+                       else _B13_EM_DETAIL.encode()),
+            lambda: src_em_ma(None))
+        det = [c for c in calls if "/a/" in c[0]]
+        ok = ("-L" in plain and "-L" not in default
+              and default[:3] == ["curl", "-q", "-sS"]
+              and len(det) == 1 and det[0][2] is True
+              and len(items) == 1 and items[0]["ts"] == 1794211440)
+        return ok, f"plain_has_L={'-L' in plain} default_has_L={'-L' in default} det={det}"
+
+    def _b13_a13():
+        """端到端 (真实夹具): 化销网 2 条 (当刻装置/MTO) / 我的钢铁 0 条 (当刻无 4h 内候选) /
+        东财 1 条 (日评锚点) —— 三源文本形态与既有源一致."""
+        hx, _c1 = _b13_call(_b13_hxw_router(), lambda: src_hxw(None))
+        my, _c2 = _b13_call(
+            lambda u: (_B13_MY_LIST.encode() if "breed/jcjxy" in u
+                       else _B13_MY_LEAD.encode()),
+            lambda: src_mysteel(None))
+        globals()["_EM_DETAIL_SEEN"].clear()
+        em, _c3 = _b13_call(
+            lambda u: (_B13_EM_LIST.encode() if "qihuo/ma.html" in u
+                       else _B13_EM_DETAIL.encode()),
+            lambda: src_em_ma(None))
+        ok = (len(hx) == 2 and len(my) == 0 and len(em) == 1
+              and [x["ts"] for x in hx] == [1794275220, 1794274320]
+              and hx[0]["src"] == "化销网" and hx[0]["text"].startswith(
+                  "11月10日山西骏捷（孝义金晖）甲醇装置动态：")
+              and em[0]["src"] == "东财甲醇" and em[0]["text"].startswith("能化 | 甲醇："))
+        return ok, f"hx={len(hx)} my={len(my)} em={len(em)}"
+
+    def _b13_a14():
+        """全源失败判定只算老源: 17 老源失败 + 4 化工源空健康 -> 文案仍只列 17 个老源名."""
+        srcs = ([_b12_mk(n, "boom") for n in _B12_LEGACY]
+                + [_b12_mk(n, None) for n in ("化销网", "隆众", "我的钢铁", "东财甲醇")])
+        with tempfile.TemporaryDirectory() as td:
+            rc, pays, _st, _q = _b11_run(td, _b11_clk(), srcs, state={"seedmarker": 1})
+        ok = (rc == 1 and len(pays) == 1 and "全部抓取失败" in pays[0]
+              and all(n not in pays[0]
+                      for n in ("化销网", "隆众", "我的钢铁", "东财甲醇")))
+        return ok, f"rc={rc} pays={len(pays)}"
+
+    def _b13_a15():
+        """4 个新源全失败、17 老源健康 -> 不触发全源告警 (rc=0, 无载荷, 无 _alert)."""
+        srcs = ([_b12_mk(n, None) for n in _B12_LEGACY]
+                + [_b12_mk(n, "boom") for n in ("化销网", "隆众", "我的钢铁", "东财甲醇")])
+        with tempfile.TemporaryDirectory() as td:
+            rc, pays, st, _q = _b11_run(td, _b11_clk(), srcs, state={"seedmarker": 1})
+        ok = (rc == 0 and not pays and "_alert" not in st)
+        return ok, f"rc={rc} pays={len(pays)} alert={'_alert' in st}"
+
+    def _b13_em_one(aid, title):
+        """东财单条列表页 (F-01/F-03 用): 一条稿件, 标题作 title 属性."""
+        return ('<html><body><div class="contentList2"><ul><li><a href="'
+                'http://futures.eastmoney.com/a/%s.html" target="_blank" title="%s">%s'
+                '</a></li></ul></div></body></html>' % (aid, title, title))
+
+    def _b13_reset_em_seen():
+        """清空东财轮转记忆; 旧码无该符号时是 no-op (让断言按内容失败而不是 KeyError)."""
+        s = globals().get("_EM_DETAIL_SEEN")
+        if s is not None:
+            s.clear()
+
+    def _b13_a16():
+        """B13-F01: 多品种日报只入队【甲醇】段, 不含原油/燃料油/沥青等其它品种段."""
+        d = em_detail(_B13_EM_MULTI)
+        body = d["body"] if d else ""
+        title = "能化 | 甲醇：港口库存的绝对水平偏低 短期行情跟随局势变化"
+        lis = _b13_em_one("202611103926942138", title)
+        _b13_reset_em_seen()
+        items, calls = _b13_call(
+            lambda u: (lis.encode() if "qihuo/ma.html" in u else _B13_EM_MULTI.encode()),
+            lambda: src_em_ma(None))
+        text = items[0]["text"] if items else ""
+        banned = ("原油", "燃料油", "沥青", "液化石油气")
+        det = [c for c in calls if "/a/" in c[0]]
+        ok = (body.startswith("【甲醇】") and "甲醇" in body and "停车" in body
+              and not any(w in body for w in banned)
+              and len(det) == 1 and len(items) == 1
+              and "【甲醇】" in text and "停车" in text
+              and not any(w in text for w in banned))
+        return ok, (f"len={len(body)} items={len(items)} me={text.count('甲醇')} "
+                    f"banned={[w for w in banned if w in text]}")
+
+    def _b13_a17():
+        """B13-F01: 多品种无【甲醇】段 -> 详情 None 且不入队; 正文无甲醇硬拒;
+        纯甲醇文 (429 字, 无分节标记) 仍整篇入队."""
+        no = _B13_EM_MULTI.replace("【甲醇】", "【尿素】")
+        d_no = em_detail(no)
+        title = "能化 | 甲醇：港口库存的绝对水平偏低 短期行情跟随局势变化"
+        lis = _b13_em_one("202611103926942138", title)
+        _b13_reset_em_seen()
+        items_no, _c1 = _b13_call(
+            lambda u: (lis.encode() if "qihuo/ma.html" in u else no.encode()),
+            lambda: src_em_ma(None))
+        d_pure = em_detail(_B13_EM_DETAIL)
+        lis2 = _b13_em_one("202611093926259150",
+                           "金联创：美伊局势仍是核心因素 11月初甲醇高位回落转震荡")
+        _b13_reset_em_seen()
+        items_pure, _c2 = _b13_call(
+            lambda u: (lis2.encode() if "qihuo/ma.html" in u
+                       else _B13_EM_DETAIL.encode()),
+            lambda: src_em_ma(None))
+        ok = (d_no is None and not items_no
+              and d_pure is not None and "甲醇" in d_pure["body"]
+              and not EM_SECTION_RE.search(d_pure["body"])
+              and len(items_pure) == 1 and "甲醇" in items_pure[0]["text"]
+              and em_admit("能化 | 甲醇：港口库存的绝对水平偏低",
+                           "原油价格大跌。" * 60) is False)
+        return ok, (f"no_none={d_no is None} items_no={len(items_no)} "
+                    f"pure_len={0 if d_pure is None else len(d_pure['body'])} "
+                    f"items_pure={len(items_pure)}")
+
+    def _b13_a18():
+        """B13-F02: `<span  class="red" >` 的当日条目必须全部解析 (夹具 3/3),
+        且侧栏/面包屑里的 [MM-DD] 不得被误吃; 4h 内候选 >= 1."""
+        rows = my_rows(_B13_MY_RED)
+        cands = [r for r in my_candidates(rows) if _B13_NOW - r["ts"] <= CHEM_DETAIL_AGE_S]
+        urls = [r["url"] for r in rows]
+        ok = (len(rows) == 3 and len(set(urls)) == 3
+              and all(r["ts"] > 0 for r in rows)
+              and not any(("侧栏" in r["title"]) or ("面包屑" in r["title"]) for r in rows)
+              and any(r["url"].endswith("AAAAAAAAAAAAAAAA.html") for r in rows)
+              and len(cands) >= 1)
+        return ok, (f"rows={len(rows)} uniq={len(set(urls))} cands={len(cands)} "
+                    f"titles={[r['title'][:12] for r in rows]}")
+
+    def _b13_a19():
+        """B13-F03: 东财详情源内轮转 —— 第 1 轮 a1 (多品种日报), 第 2 轮 a2 (429 字日评),
+        第 3 轮全部取过 -> 不再发详情请求 (不重复下载, 不永久饿死)."""
+        _b13_reset_em_seen()
+
+        def _router(u):
+            if "qihuo/ma.html" in u:
+                return _B13_EM_LIST.encode()
+            if "202611103926942138" in u:
+                return _B13_EM_MULTI.encode()
+            return _B13_EM_DETAIL.encode()
+
+        r1, c1 = _b13_call(_router, lambda: src_em_ma(None))
+        r2, c2 = _b13_call(_router, lambda: src_em_ma(None))
+        r3, c3 = _b13_call(_router, lambda: src_em_ma(None))
+
+        def _dets(cs):
+            return [c[0] for c in cs if "/a/" in c[0]]
+
+        d1, d2, d3 = _dets(c1), _dets(c2), _dets(c3)
+        ok = (len(r1) == 1 and len(d1) == 1 and "202611103926942138" in d1[0]
+              and len(r2) == 1 and len(d2) == 1 and "202611093926259150" in d2[0]
+              and "202611103926942138" not in d2[0]
+              and not r3 and not d3)
+        return ok, (f"d1={[u[-23:] for u in d1]} d2={[u[-23:] for u in d2]} "
+                    f"r3={len(r3)} d3={d3}")
+
+    def _b13_a20():
+        """B13-F04: 份额 7s + 列表 4.62s 的慢轮下, catid=13/14 候选仍拿到详情;
+        预算不够时截断后续类目 (21/20) 而不是牺牲详情."""
+        g = globals()
+        old_http, old_time = g["http"], g["time"]
+        clk = _B13Clk(_B13_NOW)
+        clk.mono = 1000.0
+        deadline = 1000.0 + 7.0
+        calls: list = []
+        router = _b13_hxw_router()
+
+        def _fake(url, referer=None, tries=3, deadline=None, **kw):
+            calls.append((url, tries, bool(kw.get("location"))))
+            clk.mono += 0.64 if "infoshow" in url else 0.77   # 实测: 详情 0.64 / 列表 0.77
+            r = router(url)
+            if isinstance(r, BaseException):
+                raise r
+            return r
+
+        g["http"], g["time"] = _fake, clk
+        so = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(so):
+                items = src_hxw(deadline)
+        finally:
+            g["http"], g["time"] = old_http, old_time
+        dets = [c[0] for c in calls if "infoshow" in c[0]]
+        lists = [int(c[0].rsplit("=", 1)[-1]) for c in calls if "infolist" in c[0]]
+        out = so.getvalue()
+        ok = (any("id=192048" in u for u in dets)     # cat13 装置动态
+              and any("id=192042" in u for u in dets)  # cat14 MTO 快讯
+              and len(items) == 2
+              and lists[:2] == [13, 14] and 20 not in lists
+              and "截断后续" in out)
+        return ok, f"lists={lists} dets={len(dets)} items={len(items)} log={out.strip()[:60]!r}"
+
+    def _b13_a21():
+        """B13-F05: 东财**列表**请求 argv 不含 -L, **详情**请求含 -L (变异 m3a 必红)."""
+        g = globals()
+        g["_EM_DETAIL_SEEN"].clear()
+        items, calls = _b13_call(
+            lambda u: (_B13_EM_LIST.encode() if "qihuo/ma.html" in u
+                       else _B13_EM_DETAIL.encode()),
+            lambda: src_em_ma(None))
+        lists = [c for c in calls if "qihuo/ma.html" in c[0]]
+        dets = [c for c in calls if "/a/" in c[0]]
+        ok = (len(lists) == 1 and lists[0][2] is False
+              and len(dets) == 1 and dets[0][2] is True and len(items) == 1)
+        return ok, f"list_loc={[c[2] for c in lists]} det_loc={[c[2] for c in dets]}"
+
+    _b12_case("B13-01 常量/入口/化销网类目清单齐全且 URL 精确", _b13_a01)
+    _b12_case("B13-02 化销网 6 类目抓取顺序 + tries + 详情上限 6", _b13_a02)
+    _b12_case("B13-03 化销网 源内按 infoshow id 去重 (跨类目重复只拉一次)", _b13_a03)
+    _b12_case("B13-04 化销网 部分类目失败降级 / 6 类目全失败抛错", _b13_a04)
+    _b12_case("B13-05 化销网 类目 22 结构哨兵仍是硬失败", _b13_a05)
+    _b12_case("B13-06 我的钢铁 列表解析 (URL 去重/整点 ts/零宽空格/三态哨兵)", _b13_a06)
+    _b12_case("B13-07 我的钢铁 列表级候选 (装置动态/快讯不进候选)", _b13_a07)
+    _b12_case("B13-08 我的钢铁 导语空 -> 标题级放行 / 样板文与装置动态丢弃", _b13_a08)
+    _b12_case("B13-09 我的钢铁 详情正文边界 + 秒级 ts + 缺容器 None", _b13_a09)
+    _b12_case("B13-10 东财 tag 列表去重 + 甲醇筛 + id 日期 ts", _b13_a10)
+    _b12_case("B13-11 东财 准入双门 (事件门 / 锚点门 300 字 / 快讯丢弃)", _b13_a11)
+    _b12_case("B13-12 东财 详情带 -L 且既有源 argv 逐元素不变", _b13_a12)
+    _b12_case("B13-13 端到端三源 (真实夹具) 文本形态与入队条数", _b13_a13)
+    _b12_case("B13-14 全源失败判定只算老源 (17 失败 + 4 空健康)", _b13_a14)
+    _b12_case("B13-15 化工源全失败不触发全源告警 (17 健康空)", _b13_a15)
+    _b12_case("B13-16 东财 多品种日报只入队【甲醇】段 (无原油/燃料油/沥青)", _b13_a16)
+    _b12_case("B13-17 东财 无【甲醇】段不入队 / 正文无甲醇硬拒 / 纯甲醇文仍入队", _b13_a17)
+    _b12_case("B13-18 我的钢铁 class=red 当日条目全量解析 + 4h 内候选", _b13_a18)
+    _b12_case("B13-19 东财 详情源内轮转 (a1 -> a2 -> 不再下载)", _b13_a19)
+    _b12_case("B13-20 化销网 慢轮 7s: 13/14 详情优先, 后续类目截断", _b13_a20)
+    _b12_case("B13-21 东财 列表请求不带 -L / 详情带 -L", _b13_a21)
 
     print(f"selftest: {'PASS' if not fails else str(len(fails)) + ' FAILED: ' + ', '.join(fails)}")
     return 0 if not fails else 1

@@ -70,7 +70,8 @@ MONO0 = 1000.0
 
 SRC_NAMES = ("财联社", "东财", "同花顺", "新浪", "见闻商品", "SMM",
              "Mining", "OilPrice", "MiningTech", "Nasdaq", "CNBC", "MarketWatch",
-             "Investing", "Hellenic", "东财研报", "中金所", "中期协")
+             "Investing", "Hellenic", "化销网", "隆众", "我的钢铁", "东财甲醇",
+             "东财研报", "中金所", "中期协")
 RESEARCH_SRCS = ("东财研报", "中金所", "中期协")
 OPTIONAL_FILES = ("queue.json", "seen.json", "pending.json", "queue.bad.json")
 
@@ -88,6 +89,8 @@ SCENARIO_NAMES = (
     "context_container_persistence", "round_start_visibility",
     # R4 补强：直接调用 6 个真实中文源函数（不打桩 SOURCES）
     "real_source_functions",
+    # Batch 11 (CTO-approved): 研报正文全文分片 / 失败续发 / 存储上限
+    "research_fullsplit", "research_resume", "research_store_cap",
 )
 
 # monitor 只按路径导入，避免任何 sys.path 污染；导入本身无副作用（不读 state）.
@@ -161,7 +164,9 @@ def fake_tg(method, payload, tk, proxy, timeout=25):
     CALLS.append({"method": method, "payload": dict(payload or {}),
                   "proxy": proxy, "timeout": timeout})
     if FAIL_QUEUE:
-        raise FAIL_QUEUE.pop(0)
+        exc = FAIL_QUEUE.pop(0)
+        if exc is not None:              # Batch 11: None = 本次成功 (让「第 k 条失败」可定点)
+            raise exc
     CLOCK.mono += SEND_COST
     CLOCK.t += SEND_COST
     return {"ok": True}
@@ -172,7 +177,9 @@ def fake_pdf(url: str, deadline: float | None = None,
     global PDF_CALLS
     PDF_CALLS += 1
     if PDF_QUEUE:
-        return PDF_QUEUE.pop(0)
+        got = PDF_QUEUE.pop(0)
+        # Batch 11: pdf_text 的产物契约是「已按 SNIPPET_MAX 截断 (带标记)」; fake 同源处理
+        return monitor.snip_truncate(got) if isinstance(got, str) else got
     raise AssertionError("unexpected pdf_text")
 
 
@@ -348,6 +355,12 @@ def _http_429() -> urllib.error.HTTPError:
                                   {"Retry-After": "120"}, io.BytesIO(b'{"ok":false}'))
 
 
+def _http_400() -> urllib.error.HTTPError:
+    """Batch 11 续发场景: 确定性 400 (无 Retry-After), 触发「已发片保留 + 条目留队」."""
+    return urllib.error.HTTPError("https://api.telegram.org", 400, "Bad Request",
+                                  {}, io.BytesIO(b'{"ok":false}'))
+
+
 def real_source_fixtures() -> dict[str, list[tuple[str, bytes]]]:
     """G20：6 个真实中文源的固定响应体（normal / empty / missing / renamed 四变体）。
 
@@ -513,6 +526,11 @@ def old_queue5() -> list[dict]:
     ]
 
 
+# Batch 11: 分片正文夹具 (含句末标点; *120 ≈ 5.3k 字 -> 3 片)
+RESEARCH_BODY_B11 = ("钨行业三季报点评：钨资源与硬质合金价格企稳反弹，"
+                     "硬质合金及刀具公司季度营收环比改善。") * 120
+
+
 def build_scenarios() -> list[Scenario]:
     advance = monitor.RESEARCH_EVERY_S + 1
     out = [
@@ -520,7 +538,10 @@ def build_scenarios() -> list[Scenario]:
                  [{"sources": normal_sources()}], [0],
                  state={"seedmarker": 1}, conf=base_conf()),
         Scenario("all_sources_fail",
-                 [{"sources": fail_sources()}], [1],
+                 # Batch 12/13: 新源空健康 -> 本场景继续冻结「17 老源全失败」的文案/载荷
+                 [{"sources": {**fail_sources(),
+                               "化销网": src_spec([]), "隆众": src_spec([]),
+                               "我的钢铁": src_spec([]), "东财甲醇": src_spec([])}}], [1],
                  state={"seedmarker": 1}, conf=base_conf()),
         Scenario("all_sources_skipped",
                  [{"sources": never_sources(), "jump_after": 2}], [0],
@@ -714,6 +735,37 @@ def build_scenarios() -> list[Scenario]:
         # G20：不打桩 SOURCES，直接执行 6 个真实源函数；http 按变体返回固定夹具。
         Scenario("real_source_functions", [{"sources": {}}], [0],
                  conf=base_conf(), source_probe=real_source_fixtures()),
+        # B11-1: 研报全文分片 -> N 条独占消息, 标记 (i/N), 链接仅末片, 末片后才写 seen
+        Scenario("research_fullsplit",
+                 [_rnd(empty_sources(**{
+                     "东财研报": src_spec([rsrch("东财研报", "1", RESEARCH_BODY_B11)])}))],
+                 [0], state=digest_state(),
+                 conf={**base_conf(), "digest_min_items": 1},
+                 expect_pdf_calls=0, expect_tg_calls=3),
+        # B11-2: 第 2 片失败 -> 第 1 轮 rc=2, 队列留 parts_sent/parts_total/part_fails;
+        #        第 2 轮从第 2 片续发 (不重发首片) 并排空. 说明: 研报源有 30 分钟节流,
+        #        故跨轮推进必须 > RESEARCH_EVERY_S (规格草案写 RETRY_BASE_S+1 会跳过整个源,
+        #        main 因「无可用条目」早退, 续发路径根本不会被驱动).
+        Scenario("research_resume",
+                 [_rnd(empty_sources(**{
+                     "东财研报": src_spec([rsrch("东财研报", "1", RESEARCH_BODY_B11)])}),
+                      advance=monitor.RESEARCH_EVERY_S + 1),
+                  _rnd(empty_sources(**{
+                      "东财研报": src_spec([rsrch("东财研报", "1", RESEARCH_BODY_B11,
+                                                  BASE_TS + monitor.RESEARCH_EVERY_S + 1)])}))],
+                 [2, 0], state=digest_state(),
+                 conf={**base_conf(), "digest_min_items": 1},
+                 fail_tg=[None, _http_400()],     # 第 1 条成功, 第 2 条 (2/N) 确定性失败
+                 expect_pdf_calls=0, expect_tg_calls=4),
+        # B11-3: 41000 字清洗正文 -> 存储上限 24000 + 显式截断标记 (不入队发送)
+        Scenario("research_store_cap",
+                 [_rnd(empty_sources(**{
+                     "东财研报": src_spec([rsrch("东财研报", "1", None)])}))],
+                 [0], state={"seedmarker": 1},
+                 conf={**base_conf(), "digest_min": 10000,
+                       "digest_max_items": 999, "max_hold_min": 10000},
+                 pdf_returns=["钨" * 41000],
+                 expect_pdf_calls=1, expect_tg_calls=0),
     ]
     names = tuple(s.name for s in out)
     if names != SCENARIO_NAMES:
@@ -797,9 +849,9 @@ def run_scenario(sc: Scenario) -> tuple[dict[str, bytes], dict]:
     global CLOCK, CALLS, FAIL_QUEUE, SEND_COST, PDF_QUEUE, PDF_CALLS, NEVER_CALLED, TMP
     m = monitor
     real_names = [name for name, _fn in m.SOURCES]
-    if len(real_names) != 17 or set(real_names) != set(SRC_NAMES):
+    if len(real_names) != 21 or set(real_names) != set(SRC_NAMES):
         raise VerificationError(
-            f"monitor.SOURCES 与 golden 冻结的 17 源不符: {real_names}")
+            f"monitor.SOURCES 与 golden 冻结的 21 源不符: {real_names}")
     tmp = Path(tempfile.mkdtemp(prefix="fnm-golden-"))
     TMP = str(tmp)
     saved = install(monitor, sc, FakeClock(NOW0))

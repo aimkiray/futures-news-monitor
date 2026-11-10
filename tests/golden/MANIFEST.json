@@ -1,7 +1,7 @@
 {
-  "generated_at_commit": "e6858c5cbad213fd6d1ce0b8f004d77b7b922817",
+  "generated_at_commit": "8edf766a7a11918732aa82689395a9058a4b0e4d",
   "python": "3.11.15",
-  "record_reason": "R1 v3.3 行为等价基线 @ R4 4e6f5a53 (28 场景 = spec 14 + CTO G15-G17 + S1-S8 + R3 G18-G19 + R4 G20 真实源函数)",
+  "record_reason": "Batch 13: 化销网扩 6 类目 + 新增我的钢铁/东财甲醇, 源数 19->21, 仅 stdout 源日志变化 (CTO-approved 2026-11-10)",
   "scenarios": {
     "aging_stale": {
       "absent": [
@@ -15,7 +15,7 @@
         "seen.json": "dbed122afacfdafec707d1cf5f5a197fd8b57a6ecd51b00feee08e0befe67d59",
         "sends.jsonl": "49471b4631e95522a2f5fa96468890e394103732a4af41bde00ea58b508850a8",
         "stderr.txt": "fcf5f983c44f75749567574a697775cd0542fb67300c314ede59fdad19827c0a",
-        "stdout.txt": "3ea8b1ca4206712fc500b63f9cd103dde6922c09a791dda6524f8e237c5d47d5"
+        "stdout.txt": "ab036181a3fbee7ce81c6a630e524f47cd214f0d886586a393d1563fa32edca2"
       }
     },
     "alert_suppression": {
@@ -30,7 +30,7 @@
         "seen.json": "3627e996d83e24f45300cf20bdbdadbe0cc28c709171dc0824ae279f491b872b",
         "sends.jsonl": "a81e7ebc2048b8f327b6b0763b5d23bfbbb3cca06d96f559812ad0d7daa0a24b",
         "stderr.txt": "b4b912e009a1407f93ec1b1a02ae386100e736229dc3743cae6a74125a1d6433",
-        "stdout.txt": "7894f8fe373290cd51ec7df8b35810e0bacbd88c21756ced7c4aba95f20df19e"
+        "stdout.txt": "6030ac359346c35f18bd75eb4cb2138406054eaa1aaa4f5507812ac2e9fb8213"
       }
     },
     "all_sources_fail": {
@@ -45,7 +45,7 @@
         "seen.json": "8233d2ee5fb013f96be51614d72a38ad5c232b74bc0b34ccfa7a4973b9845242",
         "sends.jsonl": "9243f8c9bfc5eb48aa61c5f4768e982fe31910da009f7574a6fd5509ca873f86",
         "stderr.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "stdout.txt": "5a5abab59021895fd769124a8a0b29470123576d4d31e2e386087a4161da00bc"
+        "stdout.txt": "faf8cc176208e2af662a9c9410a928e720d4ebb7ea72e28efcf01ae6226be742"
       }
     },
     "all_sources_skipped": {
@@ -60,7 +60,7 @@
         "seen.json": "cd5abde4561e0a1385fec4c331680d4e34cbf95f605061bdfddff85fccf9310b",
         "sends.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "stderr.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "stdout.txt": "e219cf0aba6bde20623aaa3d23e9af7d09b1b8b9282d06d1f9e5dccd74428a0f"
+        "stdout.txt": "57ae45cd9fb29eff454e81428335923bdf46ee469d255a12c33f14f8ec84a8b5"
       }
     },
     "clock_rollback": {
@@ -75,7 +75,7 @@
         "seen.json": "09f306f9e8eba4f8504314b6cc25b466c52e1fb15e2f52b05f18415212c808bd",
         "sends.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "stderr.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "stdout.txt": "1740de7ae457deeabb128e8ee7c167876a34a387daf118caf24202221947b2f2"
+        "stdout.txt": "80e2e7c6df87ddd944100071d955e3476a630df35533ef6e1b0bcd413286b0d4"
       }
     },
     "context_container_persistence": {
@@ -90,7 +90,7 @@
         "seen.json": "b48259b71c8894395340595f2a2b1d47d495b0e1adfd5a1d7668b2d4a4c0d99d",
         "sends.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "stderr.txt": "fcf5f983c44f75749567574a697775cd0542fb67300c314ede59fdad19827c0a",
-        "stdout.txt": "36d5e4ba383baa9d5d08c5bb4f94d043d753fb237bfc656fec89961d24ccb9f7"
+        "stdout.txt": "ade46df13ca038c04fe6530206262c32450250482fd05be7de4cefb817bc51bf"
       }
     },
     "daily_cap": {
@@ -105,7 +105,7 @@
         "seen.json": "501cfd2e096c38ebd05121aad610f3b8ab141c690eaab3a12090d62cf2f2035a",
         "sends.jsonl": "b5fb3c504bd4a979db920a5eec2351d8c72fcb13c421cc52fa8b03c932c86434",
         "stderr.txt": "fcf5f983c44f75749567574a697775cd0542fb67300c314ede59fdad19827c0a",
-        "stdout.txt": "d2a7abf2bafb524fafa95f4175553892619d3e984aeb2f6926a3c7ce15b70edb"
+        "stdout.txt": "0ab080b28cd7d3aeaa560cdc4725c05f6029114b4643435f0fdac2b50a7f4dfa"
       }
     },
     "digest_due": {
@@ -120,7 +120,7 @@
         "seen.json": "86c5f3d8d2f20bbc3b1f84ecc46d4d3bf56342c7ac9a122d8e7ae6811678155f",
         "sends.jsonl": "348a967cd29b5e7a509eb48f10d7a18eb26bb015b46842ba6e59e9d762bc0593",
         "stderr.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "stdout.txt": "83221472851b05de42e88c26be476b8f8c7ed5eea4bdc9b20835e8ac799617f0"
+        "stdout.txt": "a2295a0bf90965e50c08cfbbcfe3f9b0e3b29a1f8771293e5ff9c38269b6cb7c"
       }
     },
     "lock_unwritable": {
@@ -165,7 +165,7 @@
         "seen.json": "c249d214941ddc7d4b44486d0c7cef3e43b159afb6c047a5aaeeb7a7b4278b6a",
         "sends.jsonl": "63dd534469483fad51d8c3cfdd826e49060cd3e766802284bcdeb7adc275d016",
         "stderr.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "stdout.txt": "392072a2668d1536b021af4937c9ad2287524e6b82d7a4ac7092d0ba05a410b0"
+        "stdout.txt": "da37da9829fb827897932ea825c14ac4b00587903471f2c7d0322d200e1e540a"
       }
     },
     "near_merge": {
@@ -180,7 +180,7 @@
         "seen.json": "809e280a00032c48e2876d4e752aa6bcf2571097e34b000312feb4aebf5dd103",
         "sends.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "stderr.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "stdout.txt": "116886d01b97bf88052c553632545b09a89bf426b156e90cb1f5abaf6df004fe"
+        "stdout.txt": "a2768fcc576b0f1ae14eb58d9c1051012e4bb6269be45caac0605d4203f17f52"
       }
     },
     "normal_round": {
@@ -195,7 +195,7 @@
         "seen.json": "809e280a00032c48e2876d4e752aa6bcf2571097e34b000312feb4aebf5dd103",
         "sends.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "stderr.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "stdout.txt": "b11809ceb9cbce3b62a286ea7e8e445b592b3f6532ead75f51e3c50db5a0865c"
+        "stdout.txt": "2480a05323d8bd384b267968786c0882a027499060a562dbffce003514f13c2e"
       }
     },
     "proxy_leg": {
@@ -210,7 +210,7 @@
         "seen.json": "86c5f3d8d2f20bbc3b1f84ecc46d4d3bf56342c7ac9a122d8e7ae6811678155f",
         "sends.jsonl": "a9187807aa35401d46bbe256d0f7ef21eb8d97a5dbb1b9e71be28f96ee158b91",
         "stderr.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "stdout.txt": "e35ee51a10ba31023fcce2e284763e1e3e9c0b6c20107b4f63cc13f89371c244"
+        "stdout.txt": "69b7f2a2f5e734463076dac9223c419c021102481f86242d802693a86761e859"
       }
     },
     "queue_corrupt": {
@@ -225,7 +225,7 @@
         "seen.json": "809e280a00032c48e2876d4e752aa6bcf2571097e34b000312feb4aebf5dd103",
         "sends.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "stderr.txt": "416ca5f46e791aad8e4c2b4522ee8d4cd9e77eae5f4e46541982355a9dbc220c",
-        "stdout.txt": "17a244beb0e8f1c0601522c6941569e44ae3f669d77cbb433472f41004de7801"
+        "stdout.txt": "38975b8ad83f12c689093782ec1887a6a37d1ca2717372ca63b5b5dd62c7e526"
       }
     },
     "queue_write_fail": {
@@ -240,7 +240,7 @@
         "seen.json": "86c5f3d8d2f20bbc3b1f84ecc46d4d3bf56342c7ac9a122d8e7ae6811678155f",
         "sends.jsonl": "348a967cd29b5e7a509eb48f10d7a18eb26bb015b46842ba6e59e9d762bc0593",
         "stderr.txt": "4b5fd8e73f3151f29e7b9eaac52a0ad42f3cb46c7a8b8c419d1de840e268ec88",
-        "stdout.txt": "1b98e767e23ac422224835c4eec14274283a63b8a8618070947e85d20895d875"
+        "stdout.txt": "ae1772cf711ebeae5ee93df7b5b10750ed3198ee1ed8a22e906971dcce6e04a6"
       }
     },
     "real_source_functions": {
@@ -271,7 +271,52 @@
         "seen.json": "520616e737d7ae0c31bec1ab2a3113a39c7023ceac1170d03e1abf4aa4cbbeff",
         "sends.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "stderr.txt": "fcf5f983c44f75749567574a697775cd0542fb67300c314ede59fdad19827c0a",
-        "stdout.txt": "ceaa1284d1cca43f29e20bba2901b3316e982ed85af394e920b83368cfd024be"
+        "stdout.txt": "54ff843d6c5112b9a640d91f738824198757f38f9ebe48cdc13e818bc18a0413"
+      }
+    },
+    "research_fullsplit": {
+      "absent": [
+        "pending.json",
+        "queue.bad.json"
+      ],
+      "backup_name": null,
+      "files": {
+        "queue.json": "c15f5e2d81ae8dae99021fd7ccd946205511eb974e7c6c721cad0ed421ade21e",
+        "rc.json": "c14196f132c1e9be0508ae80ab52fcb3e1d3fc05880415f3dc980971df207c9e",
+        "seen.json": "608e073e674dce2fdf2dc5f3b848cb37543ce9f6c49e5c68b76b663f7fbf11f1",
+        "sends.jsonl": "d9f413f8d5ef4df5b02a397d3a184603a51647be5cab5bc757c5a88c2acb979b",
+        "stderr.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stdout.txt": "e1974845053eef5c9a2794d53f64babfba1cca2472de6a0c261fafdbf52f74bf"
+      }
+    },
+    "research_resume": {
+      "absent": [
+        "pending.json",
+        "queue.bad.json"
+      ],
+      "backup_name": null,
+      "files": {
+        "queue.json": "48a3d511929c768edc707fd23e584b79d9363e4d8c62f7a0279f517332dc9da0",
+        "rc.json": "4ffe2926863bb3e1c47cb7b1d256d16ef077b5169953b5c61c3c7d802269b0d7",
+        "seen.json": "6756c2502399383003a385b0aacf000dd3bde7a977ef7668ba48247b2c927dda",
+        "sends.jsonl": "7efd72841252de1835a313f2e760617541e6ac9a880c2dc7ab4695e2c2e61c91",
+        "stderr.txt": "7f74ed6cef3d4b63533b57201963492163c34ee1e1e465e3f20b19d7d484f9cb",
+        "stdout.txt": "ddb69f64267694207d2606b976451589de6dcbd2ea2334173c0c8eaf574d3899"
+      }
+    },
+    "research_store_cap": {
+      "absent": [
+        "pending.json",
+        "queue.bad.json"
+      ],
+      "backup_name": null,
+      "files": {
+        "queue.json": "18536b6abb3c461d2b81f378d4809c90318a822acbad5ca5eb025e9ba025d981",
+        "rc.json": "c14196f132c1e9be0508ae80ab52fcb3e1d3fc05880415f3dc980971df207c9e",
+        "seen.json": "809e280a00032c48e2876d4e752aa6bcf2571097e34b000312feb4aebf5dd103",
+        "sends.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stderr.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stdout.txt": "849f72bb1e8811ce066bae51c098b2d598b21ccc5f97c6e857de9fb3530b7abc"
       }
     },
     "retry_backoff": {
@@ -286,7 +331,7 @@
         "seen.json": "5e50222f5b8bfc93a6a5dd87e31027b8847b46bd355a4c3a02991eaebf832736",
         "sends.jsonl": "7761ae2092a95315ae4d36388f7994eeb17f2ccbfde0881644e40244afd902fa",
         "stderr.txt": "40cb76856364e09d6fa268636e4ebdba86f11a6e6774eb0ab20616053957e6f2",
-        "stdout.txt": "c6a7a96e5c44508e88fb1a8bde8bf1e5415230f06c32f86f26c11633801f58ac"
+        "stdout.txt": "3a25bec8cfb8b66f5526486b07a0feb8c897bbed3998cf74968822e5fb5e6df0"
       }
     },
     "rollback_tolerance": {
@@ -301,7 +346,7 @@
         "seen.json": "09f306f9e8eba4f8504314b6cc25b466c52e1fb15e2f52b05f18415212c808bd",
         "sends.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "stderr.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "stdout.txt": "ab8778a419bcd8f66daaff40fa641079ac59c0b613485b4fb13a2708e840479f"
+        "stdout.txt": "09922afea685f26821afe6cc4ccd4351eb5e9013c1c0997bb7efd87429914ae7"
       }
     },
     "round_start_visibility": {
@@ -316,7 +361,7 @@
         "seen.json": "b48259b71c8894395340595f2a2b1d47d495b0e1adfd5a1d7668b2d4a4c0d99d",
         "sends.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "stderr.txt": "fcf5f983c44f75749567574a697775cd0542fb67300c314ede59fdad19827c0a",
-        "stdout.txt": "e5dadb6b205ce46e2f5c5e5f8047b00d6ab1a9809c73f2177ea8fcbfa9359525"
+        "stdout.txt": "50e2b7869c13eca96df2d36169d943716fc11cd56343de874781699ab82ca555"
       }
     },
     "send_429": {
@@ -331,7 +376,7 @@
         "seen.json": "84d92f945bee12f4a7ea2f6a7923b5f3ef78d53ed98b64d423bf61c57c27280b",
         "sends.jsonl": "348a967cd29b5e7a509eb48f10d7a18eb26bb015b46842ba6e59e9d762bc0593",
         "stderr.txt": "4b520c20977d6a1b743d6ed3c2eabdd7663a2ba4c05457ac4c846080fd7b724f",
-        "stdout.txt": "e65e1059fa89da7d63da4a7c5b1d997350f9e42e0bf280d0d1c0b90714e82a7a"
+        "stdout.txt": "8bd46286cc96d6dd86e4377f1b2fd07a8faa52c4f8b165a09e5f0e6d56bb2d8b"
       }
     },
     "send_gate": {
@@ -346,7 +391,7 @@
         "seen.json": "dce1c0cca390631ac67cba8c4b28dcad6bfb325ca4781353b3115cbedb8cf35b",
         "sends.jsonl": "e31304a6756756e7e289cfb1903dad1fab2ed068f5632e0d445e1e181fb15685",
         "stderr.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "stdout.txt": "4428d9b3e2df18e50f0a11d96449fa082e50f942af74cda2a129e9483de2dbfa"
+        "stdout.txt": "8aaae65fad0c4289d9c17234066e3c8e40a68058f965ed013752dbadca452b04"
       }
     },
     "soft_deadline": {
@@ -361,7 +406,7 @@
         "seen.json": "c6448eff5c7ec706dbb995449cfe39f9c6d61bd058d72e7510d1ac787e3f6655",
         "sends.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "stderr.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "stdout.txt": "679b509051f35b01916b87aec5b84debf5f5219d0842e5eb2e49fa8e40f78c50"
+        "stdout.txt": "d3707ff3e0ce2739ecf52d970f99d425b6d69941457e23b01f579e67b5fa839b"
       }
     },
     "src_alert_threshold": {
@@ -376,7 +421,7 @@
         "seen.json": "809e280a00032c48e2876d4e752aa6bcf2571097e34b000312feb4aebf5dd103",
         "sends.jsonl": "6418de79a3d4f75bb9d2e4f0fa52d12e166f236a0f1ff9470c4f260adaccc53f",
         "stderr.txt": "50c078764346c8c682f6202a3498380dc567ebdd911df276d04e66f3fbcd9ab2",
-        "stdout.txt": "fc627e52ff54477fa9a86bc15ab5e72e10c29f31e65945896070d03758d98bfb"
+        "stdout.txt": "05c7823450f9728d8cf942c7732678a725bf92962577ced12e1e21b4df0d807e"
       }
     },
     "state_corrupt": {
@@ -406,7 +451,7 @@
         "seen.json": "085fb83de5593578ee0a7d5a47065e9bddc43f9465bd81d977d7808833f8c0a2",
         "sends.jsonl": "348a967cd29b5e7a509eb48f10d7a18eb26bb015b46842ba6e59e9d762bc0593",
         "stderr.txt": "c82e7a37ad3fdc479999d8f959d53b0eb9cec5a17a788b242eb1349d435bcf16",
-        "stdout.txt": "d398ea4e3a987f02a89f87260fe9cd86d5003e11f42f0daf0b96b5706a096e13"
+        "stdout.txt": "a723d811dc47109010cfdc53904bf29bfad88987688415713a6c2da53729c768"
       }
     },
     "throttle_skip": {
@@ -421,7 +466,7 @@
         "seen.json": "3f578934bd0228ee9a1d7ef8a78b60f46116062328d973e8c86b86ea5bfc12b5",
         "sends.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         "stderr.txt": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "stdout.txt": "b6a777483206dfbfdd76826091b19edb0cc962c5e36e7567cd0ac543b41311c7"
+        "stdout.txt": "0ddef6b9ae57c0450a3dff027eedd92647e3ac07fb16b048ccb03ed0a22a53c0"
       }
     }
   },
