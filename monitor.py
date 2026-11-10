@@ -639,7 +639,7 @@ def atomic_write_text(path: Path, text: str) -> bool:
     """同目录 temp + replace 原子写文本 + fsync (存档轮转 / dump 导出共用)."""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")   # pid 后缀: 无锁并发 dump/轮转同 PATH 不互撕
         with open(tmp, "w", encoding="utf-8", newline="") as fh:   # newline="" -> 恒 LF, 不做 CRLF 翻译
             fh.write(text)
             fh.flush()
@@ -676,7 +676,7 @@ def read_items_archive() -> list[dict]:
                     out.append(rec)
     except FileNotFoundError:
         pass
-    except OSError as e:
+    except (OSError, ValueError) as e:              # ValueError 含 UnicodeDecodeError: 非法 UTF-8 存档不崩栈
         err(f"items 存档读取失败 {ITEMS_ARCHIVE.name}: {type(e).__name__}: {e}")
     return out
 
@@ -687,11 +687,15 @@ def items_archive_append(new_items: list[dict]) -> int:
     契约 (spec §3.11 / T-31 / T-32 / R-9):
       - 行形 {"src","ts","text","key","url"?,"snippet"?,"schema":1}, JSONL 真追加 (非 JSON 数组)
       - 存档侧 key 集合去重: 已归档 key 跳过 (重复命中不重复落档); 调用方只传「本轮新进队列」的条目
-      - 追加用 O_APPEND 单批 write; 追加后行数 > ITEMS_ARCHIVE_MAX 则原子重写保留最近 ITEMS_ARCHIVE_KEEP 行
+      - 追加用 O_APPEND 单批 write + close 前 fsync; 追加后行数 > ITEMS_ARCHIVE_MAX 则原子重写保留最近 ITEMS_ARCHIVE_KEEP 行
       - 存档读不出 -> 去重无据, 宁可不追加也不重复落档; 写失败只记 err, 不影响主流程退码 (队列才是真源)
+      - meta schema 闸自愈每次调用即执行 (读存档之前), 不被全 dup 轮/读失败闸住
     """
     if not new_items:
         return 0
+    meta = load_json(ITEMS_META, None)                # §3.9 schema 闸: 缺失/版本不符时自愈重写
+    if not (isinstance(meta, dict) and meta.get("schema") == ITEMS_SCHEMA):
+        save_json(ITEMS_META, {"schema": ITEMS_SCHEMA})
     keys: set[str] = set()
     old_lines: list[str] = []
     try:
@@ -741,17 +745,33 @@ def items_archive_append(new_items: list[dict]) -> int:
         err(f"items 存档目录不可建 {ITEMS_ARCHIVE.parent}: {type(e).__name__}: {e}")
         return 0
     payload = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows).encode("utf-8")
+    view = memoryview(payload)                        # 重试只续写剩余 view: 部分写后整批重写会重复落档
     last = ""
     for i in range(3):                                # 与 save_json 同口径的轻量重试
         try:
             fd = os.open(ITEMS_ARCHIVE, os.O_WRONLY | os.O_CREAT | os.O_APPEND
                          | getattr(os, "O_BINARY", 0))   # O_APPEND 单批 write; Windows 需 O_BINARY 保 LF
             try:
-                view = memoryview(payload)
                 while view:
-                    view = view[os.write(fd, view):]
+                    n = os.write(fd, view)
+                    if n <= 0:
+                        raise OSError("os.write 返回 0, 写不进")   # 防 0 写字节死循环
+                    view = view[n:]
+                os.fsync(fd)                          # close 前 fsync: 与 save_json/atomic_write_text 耐久口径一致
             finally:
                 os.close(fd)
+            # P3-7: O_CREAT 新档的目录项不随文件 fsync 落盘——崩溃后新档
+            # 目录项可丢; 补父目录 fsync (save_json:513-520 /
+            # atomic_write_text:648-655 同款写法; 既有档追加也做,
+            # 代价微小且免 exists() TOCTOU 分辨)
+            try:
+                dfd = os.open(str(ITEMS_ARCHIVE.parent), os.O_RDONLY)
+                try:
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
+            except OSError:
+                pass
             break
         except OSError as e:
             last = f"{type(e).__name__}: {e}"
@@ -764,20 +784,28 @@ def items_archive_append(new_items: list[dict]) -> int:
         keep = (old_lines + [json.dumps(r, ensure_ascii=False) for r in rows])[-ITEMS_ARCHIVE_KEEP:]
         if atomic_write_text(ITEMS_ARCHIVE, "\n".join(keep) + "\n"):
             log(f"items 存档轮转: {total} -> {len(keep)} 行 (上限 {ITEMS_ARCHIVE_MAX})")
-    meta = load_json(ITEMS_META, None)                # §3.9 schema 闸: 缺失/版本不符时自愈重写
-    if not (isinstance(meta, dict) and meta.get("schema") == ITEMS_SCHEMA):
-        save_json(ITEMS_META, {"schema": ITEMS_SCHEMA})
     return len(rows)
 
 
+# --dump-items 目标守卫 (P3-8): resolve 归一后命中任一 state/conf 件即拒——
+# JSON 快照覆盖 JSONL 存档/seen/queue/pending/meta/conf 会毁形真源;
+# 覆盖 LOCK 会把锁文件换成新 inode, 持旧 inode 锁者与后继 flock 者可并发进入。
+# 清单在函数体内逐次取模块全局 (非 import 期绑死)——测试经 setattr
+# 重定向路径后守卫仍生效, 与旧 ITEMS_ARCHIVE 单件守卫同口径。
 def dump_items(path: Path) -> int:
     """--dump-items PATH: 存档原子导出 {"schema":1,"ts":<now>,"items":[...]} (spec §3.11).
 
     独立子命令语义: 不进抓取/锁/发送主路径; 返回 0 成功 / 1 落盘失败。
     """
+    out = Path(path)
+    resolved = out.resolve()
+    for guarded in (ITEMS_ARCHIVE, ITEMS_META, STATE, QUEUE, PENDING,
+                    LOCK, CONF):                      # 任一 state/conf 件命中即拒
+        if resolved == guarded.resolve():
+            err(f"--dump-items 目标不能覆盖 state/conf 件 {guarded}")
+            return 1
     items = read_items_archive()
     payload = {"schema": ITEMS_SCHEMA, "ts": int(time.time()), "items": items}
-    out = Path(path)
     if not atomic_write_text(out, json.dumps(payload, ensure_ascii=False) + "\n"):
         return 1
     log(f"items 存档导出 {len(items)} 条 -> {out}")
@@ -2455,9 +2483,14 @@ def main() -> int:
     stats = "--stats" in args or dry
     explain = "--explain" in args
 
-    if "--dump-items" in args:                     # §3.11 存档导出子命令: 独立早退, 不进抓取/锁/网络主路径
-        idx = args.index("--dump-items")           # (可与 --dry-run 并置; 导出即其全部语义)
-        out_arg = args[idx + 1] if idx + 1 < len(args) else ""
+    dump_arg = next((a for a in args                     # §3.11 存档导出子命令: 独立早退, 不进抓取/锁/网络主路径
+                     if a == "--dump-items" or a.startswith("--dump-items=")), None)
+    if dump_arg is not None:                         # (可与 --dry-run 并置; 导出即其全部语义)
+        if dump_arg.startswith("--dump-items="):     # 等号形: --dump-items=PATH
+            out_arg = dump_arg.split("=", 1)[1]
+        else:
+            idx = args.index(dump_arg)
+            out_arg = args[idx + 1] if idx + 1 < len(args) else ""
         if not out_arg or out_arg.startswith("--"):
             err("--dump-items 需要 PATH 参数")
             return 2
