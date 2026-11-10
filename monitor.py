@@ -35,7 +35,13 @@
 
 用法:
   futures-news-monitor.py [--dry-run] [--seed] [--all] [--limit N] [--stats] [--explain]
-                          [--flush-now] [--queue] [--selftest]
+                          [--flush-now] [--queue] [--selftest] [--dump-items PATH]
+
+读面 (spec §3.11): 新进队列的条目按 key 去重真追加到 items 存档
+      ~/.pi/agent/state/futures-news-items.jsonl (JSONL 每行一条
+      {"src","ts","text","key","url"?,"snippet"?,"schema":1}), 供 fnm_adapter 聚合;
+      schema 版本另记旁路 futures-news-items.meta.json (§3.9);
+      行数 > 10000 时原子轮转保留最近 6000 (R-9); --dump-items 原子导出快照。
 """
 from __future__ import annotations
 
@@ -76,6 +82,8 @@ STATE = HOME / ".pi/agent/state/futures-news-seen.json"
 PENDING = HOME / ".pi/agent/state/futures-news-pending.json"   # 已发送但 state 落盘失败的待确认键
 QUEUE = HOME / ".pi/agent/state/futures-news-queue.json"       # v5 聚合队列 (攒到窗口再发)
 LOCK = HOME / ".pi/agent/state/futures-news.lock"
+ITEMS_ARCHIVE = HOME / ".pi/agent/state/futures-news-items.jsonl"      # items 存档 (读面数据形, spec §3.11)
+ITEMS_META = HOME / ".pi/agent/state/futures-news-items.meta.json"     # schema 版本闸旁路 (spec §3.9)
 LOG = Path("/tmp/futures-news.out")
 LOG_MAX = 2 * 1024 * 1024
 ERRLOG = Path("/tmp/futures-news.err")   # launchd StandardErrorPath; 必须原地轮转 (U3)
@@ -141,6 +149,11 @@ DIGEST_MAX_ITEMS = 40                # 队列攒到这么多立刻提前发 (尖
 MAX_HOLD_MIN = 45                    # 最早一条在队里最多待这么久就强制发 (V2: 90 -> 45, 单条迟到减半)
 QUEUE_MAX = 200                      # 队列硬上限, 超出的最旧条目丢弃并记账
 DAILY_MSG_CAP = 80                   # 单日通知条数上限 (安全阀; 实测自然峰值 44/天)
+
+# ---- items 存档 (spec §3.11 / R-9: JSONL 真追加 + key 去重 + 行数轮转)
+ITEMS_ARCHIVE_MAX = 10000            # 存档行数硬上限, 超过即原子轮转
+ITEMS_ARCHIVE_KEEP = 6000            # 轮转后保留最近 N 行 (丢弃最旧 ~40%)
+ITEMS_SCHEMA = 1                     # items 数据形 schema 版本 (§3.9)
 
 # 通用短标题: 不能单独作为去重签名, 必须回退到正文
 GENERIC_TITLES = {"快讯", "要闻", "早报", "午报", "晚报", "研报", "提醒", "公告", "周报",
@@ -619,6 +632,156 @@ def queue_upsert(queue: list[dict], items: list[dict]) -> tuple[int, int]:
         have.add(it["key"])
         added += 1
     return added, len(items) - added
+
+
+# ------------------------------------------------------- items 存档 (spec §3.11)
+def atomic_write_text(path: Path, text: str) -> bool:
+    """同目录 temp + replace 原子写文本 + fsync (存档轮转 / dump 导出共用)."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        with open(tmp, "w", encoding="utf-8", newline="") as fh:   # newline="" -> 恒 LF, 不做 CRLF 翻译
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        tmp.replace(path)
+        try:
+            dfd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass
+        return True
+    except OSError as e:
+        err(f"atomic_write_text 失败 {path.name}: {type(e).__name__}: {e}")
+        return False
+
+
+def read_items_archive() -> list[dict]:
+    """读 JSONL 存档 -> 条目列表; 文件不存在=空, 坏行跳过 (dump / 去重共用)."""
+    out: list[dict] = []
+    try:
+        with open(ITEMS_ARCHIVE, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(rec, dict):
+                    out.append(rec)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        err(f"items 存档读取失败 {ITEMS_ARCHIVE.name}: {type(e).__name__}: {e}")
+    return out
+
+
+def items_archive_append(new_items: list[dict]) -> int:
+    """items 存档真追加 + key 去重 + 行数轮转; 返回实际落档行数.
+
+    契约 (spec §3.11 / T-31 / T-32 / R-9):
+      - 行形 {"src","ts","text","key","url"?,"snippet"?,"schema":1}, JSONL 真追加 (非 JSON 数组)
+      - 存档侧 key 集合去重: 已归档 key 跳过 (重复命中不重复落档); 调用方只传「本轮新进队列」的条目
+      - 追加用 O_APPEND 单批 write; 追加后行数 > ITEMS_ARCHIVE_MAX 则原子重写保留最近 ITEMS_ARCHIVE_KEEP 行
+      - 存档读不出 -> 去重无据, 宁可不追加也不重复落档; 写失败只记 err, 不影响主流程退码 (队列才是真源)
+    """
+    if not new_items:
+        return 0
+    keys: set[str] = set()
+    old_lines: list[str] = []
+    try:
+        with open(ITEMS_ARCHIVE, "r", encoding="utf-8") as fh:
+            for line in fh:
+                s = line.strip()
+                if not s:
+                    continue
+                old_lines.append(s)
+                try:
+                    k = json.loads(s).get("key")
+                except (json.JSONDecodeError, AttributeError):
+                    continue                            # 坏行照原样保留, 仅不参与 key 集合
+                if k:
+                    keys.add(str(k))
+    except FileNotFoundError:
+        pass                                          # 首轮: 无存档 = 空 key 集合
+    except (OSError, ValueError) as e:
+        err(f"items 存档读取失败, 本轮跳过追加 {ITEMS_ARCHIVE.name}: {type(e).__name__}: {e}")
+        return 0
+    rows: list[dict] = []
+    for it in new_items:
+        if not isinstance(it, dict):
+            continue
+        key, ts, text = it.get("key"), it.get("ts"), it.get("text")
+        if not key or not isinstance(ts, int) or isinstance(ts, bool) \
+                or not isinstance(text, str) or not text:
+            continue                                  # 形不合的条目不进档 (与 load_queue 同口径)
+        key = str(key)
+        if key in keys:
+            continue                                  # T-31: 同 key 重复命中只落一行
+        keys.add(key)
+        rec = {"src": str(it.get("src") or "?"), "ts": ts, "text": text, "key": key}
+        url = it.get("url")
+        if is_http_url(url):                          # 与 queue_upsert 同口径: 仅 http(s) url 落档
+            rec["url"] = url
+            snip = it.get("snippet")
+            if isinstance(snip, str):
+                rec["snippet"] = snip
+        rec["schema"] = ITEMS_SCHEMA
+        rows.append(rec)
+    if not rows:
+        return 0
+    try:
+        ITEMS_ARCHIVE.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        err(f"items 存档目录不可建 {ITEMS_ARCHIVE.parent}: {type(e).__name__}: {e}")
+        return 0
+    payload = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows).encode("utf-8")
+    last = ""
+    for i in range(3):                                # 与 save_json 同口径的轻量重试
+        try:
+            fd = os.open(ITEMS_ARCHIVE, os.O_WRONLY | os.O_CREAT | os.O_APPEND
+                         | getattr(os, "O_BINARY", 0))   # O_APPEND 单批 write; Windows 需 O_BINARY 保 LF
+            try:
+                view = memoryview(payload)
+                while view:
+                    view = view[os.write(fd, view):]
+            finally:
+                os.close(fd)
+            break
+        except OSError as e:
+            last = f"{type(e).__name__}: {e}"
+            time.sleep(0.2 * (i + 1))
+    else:
+        err(f"items 存档追加失败 {ITEMS_ARCHIVE.name}: {last}")
+        return 0
+    total = len(old_lines) + len(rows)
+    if total > ITEMS_ARCHIVE_MAX:                     # R-9 硬约束: 原子重写保留最近 6000 行
+        keep = (old_lines + [json.dumps(r, ensure_ascii=False) for r in rows])[-ITEMS_ARCHIVE_KEEP:]
+        if atomic_write_text(ITEMS_ARCHIVE, "\n".join(keep) + "\n"):
+            log(f"items 存档轮转: {total} -> {len(keep)} 行 (上限 {ITEMS_ARCHIVE_MAX})")
+    meta = load_json(ITEMS_META, None)                # §3.9 schema 闸: 缺失/版本不符时自愈重写
+    if not (isinstance(meta, dict) and meta.get("schema") == ITEMS_SCHEMA):
+        save_json(ITEMS_META, {"schema": ITEMS_SCHEMA})
+    return len(rows)
+
+
+def dump_items(path: Path) -> int:
+    """--dump-items PATH: 存档原子导出 {"schema":1,"ts":<now>,"items":[...]} (spec §3.11).
+
+    独立子命令语义: 不进抓取/锁/发送主路径; 返回 0 成功 / 1 落盘失败。
+    """
+    items = read_items_archive()
+    payload = {"schema": ITEMS_SCHEMA, "ts": int(time.time()), "items": items}
+    out = Path(path)
+    if not atomic_write_text(out, json.dumps(payload, ensure_ascii=False) + "\n"):
+        return 1
+    log(f"items 存档导出 {len(items)} 条 -> {out}")
+    return 0
 
 
 def to_int(v, default: int = 0) -> int:
@@ -2292,6 +2455,14 @@ def main() -> int:
     stats = "--stats" in args or dry
     explain = "--explain" in args
 
+    if "--dump-items" in args:                     # §3.11 存档导出子命令: 独立早退, 不进抓取/锁/网络主路径
+        idx = args.index("--dump-items")           # (可与 --dry-run 并置; 导出即其全部语义)
+        out_arg = args[idx + 1] if idx + 1 < len(args) else ""
+        if not out_arg or out_arg.startswith("--"):
+            err("--dump-items 需要 PATH 参数")
+            return 2
+        return dump_items(Path(out_arg))
+
     conf = load_json(CONF, {})
     CFG.clear()
     CFG.update(conf)                  # 供无参源函数读取 proxy (Batch 6 U2)
@@ -2522,6 +2693,8 @@ def main() -> int:
         log(f"研报摘要待补: {len(fresh) - len(kept_fresh)} 篇推迟到下一轮入队")
     fresh = kept_fresh
     added, dup_q = queue_upsert(queue, fresh)
+    if added and not dry:                          # items 存档 (§3.11): 只记本轮真正新进队列的条目;
+        items_archive_append(queue[-added:])       # dry-run 不落档 (干跑不改动任何状态文件)
 
     meta = digest_meta(seen)
     interval = digest_min * 60
@@ -3733,7 +3906,8 @@ def selftest() -> int:
         st.mkdir(parents=True, exist_ok=True)
         kept = {k: globals()[k] for k in ("STATE", "QUEUE", "PENDING", "LOCK", "CONF",
                                           "LOG", "ERRLOG", "SOURCES", "time", "tg",
-                                          "resolve_token", "rotate_log", "rotate_stderr")}
+                                          "resolve_token", "rotate_log", "rotate_stderr",
+                                          "ITEMS_ARCHIVE", "ITEMS_META")}
         payloads: list[str] = []
         try:
             globals()["STATE"] = st / "seen.json"
@@ -3743,6 +3917,8 @@ def selftest() -> int:
             globals()["CONF"] = st / "conf.json"
             globals()["LOG"] = st / "out.log"
             globals()["ERRLOG"] = st / "err.log"
+            globals()["ITEMS_ARCHIVE"] = st / "items.jsonl"      # items 存档隔离到 tempdir
+            globals()["ITEMS_META"] = st / "items.meta.json"
             globals()["SOURCES"] = srcs
             globals()["time"] = clock
 
