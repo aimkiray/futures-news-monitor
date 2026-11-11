@@ -613,7 +613,7 @@ def build_scenarios() -> list[Scenario]:
                      东财=src_spec([it("东财", "螺纹钢库存变化31吨环比31%")])))],
                  [0] * 8, state={"seedmarker": 1}, conf=base_conf(),
                  expect_tg_calls=2, expect_pdf_calls=0),
-        # G16: 日上限已到（msgs=80）-> 第 1 轮发 1 条触顶提示，第 2 轮不再重复
+        # G16: 日上限已到（msgs=160）-> 第 1 轮发 1 条触顶提示，第 2 轮不再重复
         Scenario("daily_cap",
                  [_rnd(empty_sources(
                      财联社=src_spec([it("财联社", FILTERED_TEXT)]))),
@@ -622,7 +622,7 @@ def build_scenarios() -> list[Scenario]:
                  [0, 0],
                  state={"seedmarker": 1,
                         "_digest": {"last_flush": NOW0 - 31 * 60},
-                        "_day": {"date": "2026-11-04", "msgs": 80}},
+                        "_day": {"date": "2026-11-04", "msgs": 160}},
                  queue=queue3(), conf=base_conf(),
                  expect_tg_calls=1),
         # G17: 第 1 轮队列 5 条全部超 max_age -> 发 3 条、剩余 2 条按 stale 记账丢弃；

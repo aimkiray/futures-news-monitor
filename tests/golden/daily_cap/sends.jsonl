@@ -1,1 +1,1 @@
-{"method": "sendMessage", "payload": {"chat_id": 1, "disable_web_page_preview": "true", "parse_mode": "HTML", "text": "⚠️ 今日快讯已达 80 条上限, 新条目暂缓推送, 明天 0 点恢复 (队列上限 200 条, 超出按最旧丢弃)"}, "proxy": "", "timeout": 8}
+{"method": "sendMessage", "payload": {"chat_id": 1, "disable_web_page_preview": "true", "parse_mode": "HTML", "text": "⚠️ 今日快讯已达 160 条上限, 新条目暂缓推送, 明天 0 点恢复 (队列上限 200 条, 超出按最旧丢弃)"}, "proxy": "", "timeout": 8}

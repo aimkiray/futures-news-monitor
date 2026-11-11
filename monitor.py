@@ -316,7 +316,7 @@ DIGEST_MIN_ITEMS = 3                 # 窗口到点也要至少这么多条才�
 DIGEST_MAX_ITEMS = 40                # 队列攒到这么多立刻提前发 (尖峰保护)
 MAX_HOLD_MIN = 45                    # 最早一条在队里最多待这么久就强制发 (V2: 90 -> 45, 单条迟到减半)
 QUEUE_MAX = 200                      # 队列硬上限, 超出的最旧条目丢弃并记账
-DAILY_MSG_CAP = 80                   # 单日通知条数上限 (安全阀; 实测自然峰值 44/天)
+DAILY_MSG_CAP = 160                  # 单日通知条数上限 (安全阀); 实测 2026-11-11 20:18 原上限 80 触顶, 当日已发 90 条 (研报分片 + 化工源接入后)
 
 # ---- items 存档 (spec §3.11 / R-9: JSONL 真追加 + key 去重 + 行数轮转)
 ITEMS_ARCHIVE_MAX = 10000            # 存档行数硬上限, 超过即原子轮转
@@ -11225,9 +11225,40 @@ target="_blank">石脑油市场早间提示（20261109）</a>
           and len(_b16_official) == 5 and all(_b16_official_reasons),
           _b16_em_err or f"em={_b16_em_got} official={_b16_official_reasons}")
 
+    # ==== Batch 18: 日上限 160 的边界行为 (只读离线; 旧码 cap=80 时 B18-01/02 必红) ====
+    def _b18_cap_round(msgs: int):
+        with tempfile.TemporaryDirectory() as _td:
+            _clk = _B6Clock(1793800000)
+            _q = [{"src": "S0", "ts": int(_clk.time()) - 60,
+                   "text": f"沪铜库存变化{i}吨环比1%", "key": f"b18-{i}"}
+                  for i in range(1, 4)]
+            return _b6_run_main(
+                Path(_td), _clk,
+                [("S0", lambda deadline=None: [
+                    {"src": "S0", "ts": int(_clk.time()) - 60,
+                     "text": "沪铜库存变化9吨环比9%"}])],
+                state={"seedmarker": 1,
+                       "_day": {"date": datetime.now(TZ_CN).strftime("%Y-%m-%d"),
+                                "msgs": msgs},
+                       "_digest": {"last_flush": 1793800000 - 31 * 60}},
+                queue_raw=json.dumps({"items": _q, "ts": 1793800000}))
+
+    _b18_r1, _b18_p1, _b18_s1, _b18_q1, _ = _b18_cap_round(DAILY_MSG_CAP - 1)
+    check("B18-01 日上限 160: msgs=159 仍放行, 发后计数=160",
+          _b18_r1 == 0 and len(_b18_p1) == 1 and "上限" not in _b18_p1[0]
+          and int((_b18_s1.get("_day") or {}).get("msgs") or 0) == 160
+          and not _b18_q1,
+          f"rc={_b18_r1} n={len(_b18_p1)} day={_b18_s1.get('_day')} q={len(_b18_q1)}")
+    _b18_r2, _b18_p2, _b18_s2, _b18_q2, _ = _b18_cap_round(DAILY_MSG_CAP)
+    check("B18-02 日上限 160: msgs=160 即拦截, 只发 1 条触顶提示且队列保留",
+          _b18_r2 == 0 and len(_b18_p2) == 1 and "上限" in _b18_p2[0]
+          and int((_b18_s2.get("_day") or {}).get("msgs") or 0) == 161
+          and len(_b18_q2) == 4,
+          f"rc={_b18_r2} n={len(_b18_p2)} day={_b18_s2.get('_day')} q={len(_b18_q2)}")
+
     # ==== Batch 17: 内嵌真实 PDF 样本 / 缺工具显式 SKIP ====
     # 旧码 (batch16, 00be299) 样本缺失时打桩仍 ok; B17-01/02/03/04 在旧码上均红.
-    _B17_TOTAL = 550                         # 548 (Batch 17 前) + B17-05/06 计数断言
+    _B17_TOTAL = 552                         # 544 (Batch 16 实测) + 6 (B17-01..06) + 2 (B18-01..02) = 552
     _B17_COUNTER_ENV = "FUTNEWS_SELFTEST_COUNTER_PROBE"
 
     def _b17_a01():

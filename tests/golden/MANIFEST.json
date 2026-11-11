@@ -1,7 +1,7 @@
 {
-  "generated_at_commit": "8edf766a7a11918732aa82689395a9058a4b0e4d",
+  "generated_at_commit": "5a119ca742456982bdf8f2598ef18bcbd6de2742",
   "python": "3.11.15",
-  "record_reason": "Batch 13: 化销网扩 6 类目 + 新增我的钢铁/东财甲醇, 源数 19->21, 仅 stdout 源日志变化 (CTO-approved 2026-11-10)",
+  "record_reason": "Batch 18: DAILY_MSG_CAP 80->160, daily_cap 场景重录 (CTO-approved 2026-11-11)",
   "scenarios": {
     "aging_stale": {
       "absent": [
@@ -102,10 +102,10 @@
       "files": {
         "queue.json": "b4fc82fc5f4620c1a00160fa0ba353d1b6f46c35abbc48395cc3f1353f0084fa",
         "rc.json": "7211ad359c55dcd75c38c53c5da3fe7c80724fec884b8ac9042a261f3e14caa4",
-        "seen.json": "501cfd2e096c38ebd05121aad610f3b8ab141c690eaab3a12090d62cf2f2035a",
-        "sends.jsonl": "b5fb3c504bd4a979db920a5eec2351d8c72fcb13c421cc52fa8b03c932c86434",
+        "seen.json": "fb100a7ae10b048f42bf286d8a323ae30b82df163bb72935df9625f291276349",
+        "sends.jsonl": "76771cf06fff9b0bf5a2d7c25d8df5d1d742f9e514403324f84538b4bec6df11",
         "stderr.txt": "fcf5f983c44f75749567574a697775cd0542fb67300c314ede59fdad19827c0a",
-        "stdout.txt": "0ab080b28cd7d3aeaa560cdc4725c05f6029114b4643435f0fdac2b50a7f4dfa"
+        "stdout.txt": "12752113dc0a3476347223a1ad23afd641e6510646f0fe47b5efbfe3e1bfb91e"
       }
     },
     "digest_due": {
