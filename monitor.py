@@ -416,6 +416,34 @@ CONTEXT = [
 ]
 # 兼容旧接口/conf.keywords: 默认词表 = 所有层并集
 DEFAULT_KEYWORDS = list(dict.fromkeys(STRONG + MACRO + ANCHOR + CONTEXT))
+
+# ---------------- Batch 16: 研报准入 (品种层 + 产业层) ----------------
+# 品种层: PRODUCT_ALIASES 的品种名与全部别名 —— **不含 STRONG_EXTRA**。
+#   STRONG_EXTRA 里的「油价/金价/铜价/银价」是**价格口语**, 「LME/上期所/中金所」是**交易场所**,
+#   「黄金储备/央行购金」是需求指标, 「中证1000股指期货」是股指口径 —— 都不是商品品种;
+#   它们放进研报门会让「上周油价下跌」这类宏观稿过关 (2026-11-11 实测 9 条误收里 3 条走这条路)。
+#   BARE_ANCHOR_SKIP 的裸字 (苹果/玻璃) 仍排除: 研报标题里「苹果」= 苹果公司 (实测 3 条误收)。
+PRODUCT_WORDS = sorted({p for p in PRODUCT_ALIASES if p not in BARE_ANCHOR_SKIP}
+                       | {a for al in PRODUCT_ALIASES.values() for a in al})
+# 产业层: 商品产业链的行业名/环节名 —— 研报标题与 industryName 的行业口径。
+#   与 MACRO 的分工: MACRO 是「宏观事件变量」(快讯门用), 本表是「研究口径的资产域」(研报门用);
+#   两表可以并存, 因为两扇门互不引用。唯一重叠词「大宗商品」的裁决见 Batch 16 规格 §3.4。
+RESEARCH_INDUSTRY = [
+    "煤炭", "煤化工", "石化", "炼化", "基础化工", "化纤", "聚酯",
+    "钢铁", "普钢", "特钢", "有色金属", "工业金属", "贵金属", "小金属", "钨",
+    "能源金属", "稀土", "农产品", "养殖", "种植", "饲料", "油脂", "软商品",
+    "农林牧渔", "航运", "造纸", "浮法玻璃", "纺织", "大宗商品", "商品期货",
+]
+# 研报专用**硬否决**表 (Batch 16 R1): 命中即丢, 与是否命中品种/产业层无关。
+#   与 NOISE_SOFT 的区别: NOISE_SOFT 是「软噪声」—— 只有在没有强品种/锚点时才降权否决
+#   (见 filter_reason 第 5 步); 研报门没有「强品种短路」这层结构, 命中行业词就放行,
+#   所以权益/信用/分红口径的稿必须**硬否决**才拦得住 (实测: 基础化工ETF双周报 /
+#   农林牧渔基金持仓 / 港口信用风险 三条都能靠行业词过关, 而它们讲的是基金、债券与评级)。
+RESEARCH_DENY = [
+    "ETF", "基金持仓", "持仓分析", "信用风险", "债券",
+    "评级调整", "股东", "回购", "业绩预告", "分红", "股息",
+]
+
 # 全大写缩写需要词边界, 否则 PE 命中 APPLE / PP 命中 APP;
 # 覆盖所有词表 (含 NOISE), 大小写不敏感匹配 -> 源站写小写 lme/pta 也不漏
 ACRONYMS = sorted({w.upper() for w in
@@ -1695,6 +1723,33 @@ def research_item(src: str, ident: str, title: str, url: str, ts: int,
             "snippet": snippet, "key": research_key(src, ident)}
 
 
+def research_gate_reason(title: str, industry: str = "") -> str:
+    """研报准入门槛 (Batch 16 方案 C): 只认品种层 + 产业层; 空串=放行, 否则为丢弃原因.
+
+    与 filter_reason 的分工: 快讯走 filter_reason (五层词表, 有效层命中即放行),
+    研报走本函数 —— MACRO / MACRO_EVENT / ANCHOR / CONTEXT / STRONG_EXTRA 一概不放行.
+    两个函数互不调用, 词表互不共享; PRODUCT_WORDS / RESEARCH_INDUSTRY 只出现在本函数
+    与 research_reason 的噪声豁免里 (filter_reason 的 co_names 不含这两张表).
+    不做噪声否决 (NOISE_HARD): 旧口径下噪声否决本就被 STRONG 短路, 实测 11 条保留样本
+    中 4 条带 A股/三季报/亏损/上市 等噪声词, 加否决会直接误杀.
+    """
+    t = (title or "").strip()
+    if not norm_text(t):
+        return "内容过短"
+    blob = f"{t} {industry or ''}"
+    if SKIP_RE.search(strip_decor(blob)):
+        return "栏目/日历"
+    if len(norm_text(blob)) < 4:
+        return "内容过短"
+    deny = first_hit(blob, RESEARCH_DENY)     # 研报专用硬否决: 先于层判定
+    if deny:
+        return f"研报否决:{deny}"
+    if hit(blob, PRODUCT_WORDS) or hit(blob, RESEARCH_INDUSTRY):
+        return ""
+    ev = first_hit(blob, MACRO)
+    return f"研报无品种/产业:{ev}" if ev else "研报无品种/产业"
+
+
 def research_reason(text: str) -> str:
     """研报源的过滤口径 (Batch 7): 豁免「品种锚点」硬门槛, 保留栏目/噪声否决.
 
@@ -1704,13 +1759,15 @@ def research_reason(text: str) -> str:
     顺序与 filter_reason **不同**: 本函数把「具体品种/产业锚点」放在噪声否决**之前**
     (更宽) —— 否则「夯实股东回报」里的「股东」会把「电解铝量价齐升」这种正牌商品
     研报误杀。Batch 9 C-F-05 只同步注释, 行为一字不改。
+    Batch 16: 噪声豁免增加产业层 —— 研报门已按「品种 + 产业」放行, 主门不得再用
+    NOISE_HARD 把「钨行业三季报」这类产业稿按「三季报」二次误杀 (实测差量 0/200).
     """
     t = (text or "").strip()
     if SKIP_RE.search(strip_decor(t)):
         return "栏目/日历"
     if len(norm_text(t)) < 4:
         return "内容过短"
-    if hit(t, STRONG) or hit(t, ANCHOR):
+    if hit(t, STRONG) or hit(t, ANCHOR) or hit(t, RESEARCH_INDUSTRY):
         return ""
     hard = first_hit(t, NOISE_HARD)
     if hard:
@@ -3075,8 +3132,9 @@ def src_em_report(deadline: float | None = None) -> list[dict]:
                 continue
             org = clean_text(it.get("orgSName"))
             industry = clean_text(it.get("industryName"))
-            if filter_reason(f"{title} {industry}", DEFAULT_KEYWORDS, True):
-                continue                      # 与快讯同一套词表: 无品种/产业锚点的研报不留
+            reason = research_gate_reason(title, industry)
+            if reason:                        # Batch 16: 只认品种层 + 产业层 (方案 C)
+                continue
             code = str(it.get("infoCode") or "").strip()
             if not code or code in seen_codes:
                 continue
@@ -4190,7 +4248,7 @@ def digest_policy(conf: dict, opts: RunOpts, seen: dict,
         log(f"研报摘要待补: {len(fresh) - len(kept_fresh)} 篇推迟到下一轮入队")
     fresh = kept_fresh
     added, dup_q = queue_upsert(queue, fresh)
-    if added and not dry:                          # items 存档 (§3.11): 只记本轮真正新进队列的条目;
+    if added and not opts.dry:                     # items 存档 (§3.11): 只记本轮真正新进队列的条目;
         items_archive_append(queue[-added:])       # dry-run 不落档 (干跑不改动任何状态文件)
 
     meta = digest_meta(seen)
@@ -10847,6 +10905,205 @@ target="_blank">石脑油市场早间提示（20261109）</a>
     _b15_case("B15-04 非研报渲染逐字节不变 (正文含声明词/伪造 snippet 均不受影响)", _b15_a04)
     _b15_case("B15-05 生产形态: 末片不再以版权段收尾, 正文不丢且分片数不增", _b15_a05)
     _b15_case("B15-06 正文自带声明词: 渲染期不误裁 (护栏在文本层同样生效)", _b15_a06)
+
+    # ---- Batch 16: 研报准入门槛换层 (品种层 + 产业层, 方案 C)
+    _b16_keep = [
+        ("煤炭行业周报：动力煤价止跌企稳，炼焦煤价再度下探", "煤炭开采"),
+        ("中小盘行业深度报告：工业金属：铜铝分化与盈利结构", "工业金属"),
+        ("煤炭行业2027年度投资策略：能源安全内外共振，煤炭周期上行景气延续", "煤炭开采"),
+        ("农林牧渔行业专题报告：生猪出栏量与出栏体重数据梳理-2026年1-9月13家上市猪企月度数据整理", "养殖业"),
+        ("农产品研究跟踪系列报告（227）：牛肉与散奶价格持续走强，仔猪价格环比新低", "养殖业"),
+        ("生猪养殖行业W45周报：猪价加速下行，养殖亏损持续扩大", "养殖业"),
+        ("A股锂矿行业2026Q3财报梳理分析：锂价下跌，企业盈利承压", "电池"),
+        ("钨行业三季报点评：钨资源与硬质合金价格企稳反弹，高端制品价格持续坚挺", "工业金属"),
+        ("【鑫期汇】宏观专题：民主党赢得两院：四条资产线（科技股、黄金、原油和铜）的四种定价…", ""),
+        ("大周期行业周报（11月第1周）：宏观因子催化黄金反弹", ""),
+        ("宏观与大宗商品周报", ""),
+    ]
+    _b16_drop = [
+        ("美国2026年10月CPI数据点评：能源回落难掩核心通胀粘性，12月加息渐成定局", ""),
+        ("10月CPI再超预期，基本锁定12月美联储加息，升息幅度仍有不确定性", ""),
+        ("2026年10月进出口数据解读：10月出口延续高增势头，油价上涨带动进口增速显著加快", ""),
+        ("美国10月就业数据跟踪：非农就业强劲，工资增速逐步企稳", ""),
+        ("海外宏观周报（2026年第42期）：非农就业大超预期，中选后美国经济怎么看？", ""),
+        ("宏观周报：美国就业数据强劲强化加息预期", ""),
+        ("10月美国CPI前瞻：油价与经济韧性的双重检验——海外周报", ""),
+        ("中期选举民主党大胜，非农数据好于预期", ""),
+        ("交通运输行业跟踪报告：上周油价下跌，航空股底部反弹", "物流"),
+    ]
+    # ---- F-01 行为夹具: 官方源打桩 (固定 2026-11-11 周三; 不联网, 不依赖宿主日期)
+    # 评审 F-01: 原 B16-27 只查 func.__code__.co_names (顶层名字); 用列表推导把新门
+    # 接进 src_cffex 时该名字只出现在嵌套 code object 里 -> 35 条断言全绿而运行期
+    # 3 条归零. 改为运行期行为断言: 打桩后条数与 text 逐字匹配, 套门即红.
+    _b16_fixed = datetime(2026, 11, 11, 12, 0, tzinfo=TZ_CN)
+    _b16_cffex_texts = [
+        "中金所月度数据统计 2026年10月｜中国金融期货交易所",
+        "中金所日度行情统计 2026年11月11日｜中国金融期货交易所 · 收盘后发布",
+        "中金所周度数据统计 2026年11月09日当周｜中国金融期货交易所 · 周度汇总",
+    ]
+    _b16_cfa_rows = [
+        {"docId": "B16CFA202608", "docTitle": "2026年8月全国期货市场交易情况简报",
+         "docPubUrl": "/upload/2026/09/10/B16CFA202608.pdf",
+         "docRelTime": "2026-09-10 10:00:00"},
+        {"docId": "B16CFA202607", "docTitle": "2026年7月全国期货市场交易情况简报",
+         "docPubUrl": "/upload/2026/08/12/B16CFA202607.pdf",
+         "docRelTime": "2026-08-12 10:00:00"},
+        # 第 3 行故意给出: src_cfa 只取 rows[:2], 断言「恰好 2 条」而不是「有几条取几条」
+        {"docId": "B16CFA202606", "docTitle": "2026年6月全国期货市场交易情况简报",
+         "docPubUrl": "/upload/2026/07/10/B16CFA202606.pdf",
+         "docRelTime": "2026-07-10 10:00:00"},
+    ]
+    _b16_cfa_texts = [
+        "2026年8月全国期货市场交易情况简报｜中国期货业协会 · 2026-09-10",
+        "2026年7月全国期货市场交易情况简报｜中国期货业协会 · 2026-08-12",
+    ]
+
+    def _b16_run_stubbed(fn, **patches):
+        """在打桩的模块全局下跑 fn(); 无论成败都恢复原值, 异常也按断言红返回."""
+        saved = {k: globals()[k] for k in patches}
+        try:
+            globals().update(patches)
+            return fn(), ""
+        except Exception as e:                       # noqa: BLE001 - 旧码缺符号/网络异常都算红
+            return None, f"{type(e).__name__}: {e}"
+        finally:
+            globals().update(saved)
+
+    def _b16_cffex_probe():
+        real_dt = globals()["datetime"]
+
+        class _FixedDT(real_dt):                     # 保留构造/其它类方法, 只冻结 now()
+            @classmethod
+            def now(cls, tz=None):
+                return _b16_fixed.astimezone(tz) if tz else _b16_fixed
+        items, err = _b16_run_stubbed(src_cffex, datetime=_FixedDT,
+                                      http_ok=lambda *a, **k: True)
+        return ([it["text"] for it in items] if items is not None else []), err
+
+    def _b16_cfa_probe():
+        payload = json.dumps({"data": {"dataList": _b16_cfa_rows}},
+                             ensure_ascii=False).encode("utf-8")
+        items, err = _b16_run_stubbed(src_cfa, http=lambda *a, **k: payload)
+        return ([it["text"] for it in items] if items is not None else []), err
+
+    def _b16_em_probe():
+        rows = [
+            {"title": "煤炭行业周报：动力煤价止跌企稳", "orgSName": "某证券",
+             "industryName": "煤炭开采", "infoCode": "B16EMPASS",
+             "publishDate": "2026-11-11 00:00:00.000"},
+            {"title": "美国10月CPI数据点评：能源回落难掩核心通胀粘性，12月加息渐成定局",
+             "orgSName": "某证券", "industryName": "", "infoCode": "B16EMDROP",
+             "publishDate": "2026-11-11 00:00:00.000"},
+        ]
+        payload = json.dumps({"data": rows}, ensure_ascii=False).encode("utf-8")
+        items, err = _b16_run_stubbed(src_em_report, http=lambda *a, **k: payload)
+        return ([it["text"] for it in items] if items is not None else []), err
+
+    for _i, (_t, _ind) in enumerate(_b16_keep, 1):
+        check(f"B16-{_i:02d} 保留样本 K{_i}: 品种/产业层放行",
+              research_gate_reason(_t, _ind) == "", research_gate_reason(_t, _ind))
+    for _i, (_t, _ind) in enumerate(_b16_drop, 1):
+        check(f"B16-{11 + _i:02d} 剔除样本 D{_i}: 研报门丢弃",
+              research_gate_reason(_t, _ind) != "", research_gate_reason(_t, _ind))
+    # F-02 已知行为 (评审登记, 与旧码一致, 非回归, Batch 16 不改产品):
+    # industryName 只参与源门 research_gate_reason, 不进 research_item 的 text
+    # (text 只有「标题｜机构 · 日期」). 因此「标题不含产业词、只靠 industryName
+    # 过源门、又含 NOISE_HARD 词」的产业稿 (例: 2026年三季报综述… 行业=煤炭开采)
+    # 仍会被主门 research_reason 以「噪声:三季报」二次拒绝, 端到端不入列.
+    # 本条只断言源门放行; 该端到端边界见 reports/w4/fix-report.md F-02.
+    check("B16-21 产业词只在 industryName 也放行 (标题无品种)",
+          research_gate_reason("2026年三季报综述：煤价上行盈利改善，关注复产弹性", "煤炭开采") == ""
+          and research_gate_reason("2026年三季报综述：煤价上行盈利改善，关注复产弹性") != "",
+          research_gate_reason("2026年三季报综述：煤价上行盈利改善，关注复产弹性", "煤炭开采"))
+    check("B16-22 title 为空: 不靠 industryName 兜底, 原因=内容过短",
+          research_gate_reason("", "煤炭开采") == "内容过短",
+          research_gate_reason("", "煤炭开采"))
+    check("B16-23 全宏观无品种 (含价格口语 金价): 研报门丢弃",
+          research_gate_reason("美联储加息预期升温，金价承压", "") != "",
+          research_gate_reason("美联储加息预期升温，金价承压", ""))
+    check("B16-24 快讯门逐字节不变: 20 条夹具 filter_reason 全部仍放行",
+          all(filter_reason(f"{_t} {_ind}".strip(), DEFAULT_KEYWORDS, True) == ""
+              for _t, _ind in _b16_keep + _b16_drop),
+          [f"{_t} {_ind}" for _t, _ind in _b16_keep + _b16_drop
+           if filter_reason(f"{_t} {_ind}".strip(), DEFAULT_KEYWORDS, True)])
+    check("B16-25 research_reason 产业层同样豁免噪声否决 (三季报不再误杀钨行业)",
+          research_reason("钨行业三季报点评：钨精矿供给收缩｜某证券 · 2026-11-11") == "",
+          research_reason("钨行业三季报点评：钨精矿供给收缩｜某证券 · 2026-11-11"))
+    check("B16-26 品种层不含 STRONG_EXTRA 的价格口语/交易所名",
+          not hit("油价上涨，金价承压，LME 库存", PRODUCT_WORDS)
+          and hit("沪铜、原油、生猪、PTA", PRODUCT_WORDS),
+          first_hit("油价上涨，金价承压，LME 库存", PRODUCT_WORDS))
+    # B16-27 (F-01 修复): 原 co_names 子句只看顶层名字, 嵌套列表推导/内嵌函数不可见.
+    # 改为运行期行为: 中金所三个 HEAD 全 2xx 打桩 -> 恰好 3 条, text 逐字.
+    # 中期协同口径为 B16-36; 东财接线与官方标题必死为 B16-37.
+    _b16_cffex_got, _b16_cffex_err = _b16_cffex_probe()
+    check("B16-27 三源差异化: 中金所/中期协不接研报门 (否则产出归零)",
+          not _b16_cffex_err and _b16_cffex_got == _b16_cffex_texts,
+          _b16_cffex_err or f"n={len(_b16_cffex_got)} got={_b16_cffex_got}")
+    check("B16-28 大宗商品裁决: 只入产业层(与 MACRO 并存), 能源/油价/物流 不入表",
+          "大宗商品" in RESEARCH_INDUSTRY and "大宗商品" in MACRO
+          and "能源" not in RESEARCH_INDUSTRY and "油价" not in RESEARCH_INDUSTRY
+          and "物流" not in RESEARCH_INDUSTRY)
+    check("B16-29 产业族表卫生: 30 条/无重复/纯中文/单字仅钨/仅大宗商品与 MACRO 重叠",
+          len(RESEARCH_INDUSTRY) == 30 and len(set(RESEARCH_INDUSTRY)) == 30
+          and all(not w.isascii() for w in RESEARCH_INDUSTRY)
+          and [w for w in RESEARCH_INDUSTRY if len(w) == 1] == ["钨"]
+          and [w for w in RESEARCH_INDUSTRY if w in MACRO] == ["大宗商品"]
+          and not [w for w in RESEARCH_INDUSTRY
+                   if w in CONTEXT or w in STRONG or w in NOISE_HARD],
+          [w for w in RESEARCH_INDUSTRY if w in MACRO or w in CONTEXT or w in STRONG])
+    check("B16-30 品种层完整性: 全部别名在册, 裸字(苹果/玻璃)与 STRONG_EXTRA 不在册",
+          all(a in PRODUCT_WORDS for al in PRODUCT_ALIASES.values() for a in al)
+          and not [p for p in BARE_ANCHOR_SKIP if p in PRODUCT_WORDS]
+          and not (set(STRONG_EXTRA) & set(PRODUCT_WORDS)),
+          sorted(set(STRONG_EXTRA) & set(PRODUCT_WORDS)))
+    check("B16-31 快讯准入零接触: filter_reason 不引用新表, DEFAULT_KEYWORDS 仍 305",
+          "PRODUCT_WORDS" not in filter_reason.__code__.co_names
+          and "RESEARCH_INDUSTRY" not in filter_reason.__code__.co_names
+          and "RESEARCH_DENY" not in filter_reason.__code__.co_names
+          and len(DEFAULT_KEYWORDS) == 305
+          and DEFAULT_KEYWORDS == list(dict.fromkeys(STRONG + MACRO + ANCHOR + CONTEXT)),
+          str(len(DEFAULT_KEYWORDS)))
+    check("B16-32 研报硬否决: ETF 双周报 (行业词命中也要丢)",
+          research_gate_reason("基础化工周期行业ETF双周报：碳排放双控工作体系实施方案公布", "化学制品")
+          == "研报否决:ETF"
+          and hit("基础化工周期行业ETF双周报：碳排放双控工作体系实施方案公布 化学制品",
+                  PRODUCT_WORDS + RESEARCH_INDUSTRY),
+          research_gate_reason("基础化工周期行业ETF双周报：碳排放双控工作体系实施方案公布", "化学制品"))
+    check("B16-33 研报硬否决: 基金持仓分析",
+          research_gate_reason("农林牧渔2026Q3基金持仓分析：养殖及种植链优质标的重仓环比明显提升", "养殖业")
+          == "研报否决:基金持仓"
+          and hit("农林牧渔2026Q3基金持仓分析：养殖及种植链优质标的重仓环比明显提升 养殖业",
+                  PRODUCT_WORDS + RESEARCH_INDUSTRY),
+          research_gate_reason("农林牧渔2026Q3基金持仓分析：养殖及种植链优质标的重仓环比明显提升", "养殖业"))
+    check("B16-34 研报硬否决: 信用风险回顾",
+          research_gate_reason("港口行业2026年三季度信用风险回顾及四季度展望——多节点摩擦下的港口韧性", "航运港口")
+          == "研报否决:信用风险"
+          and hit("港口行业2026年三季度信用风险回顾及四季度展望——多节点摩擦下的港口韧性 航运港口",
+                  PRODUCT_WORDS + RESEARCH_INDUSTRY),
+          research_gate_reason("港口行业2026年三季度信用风险回顾及四季度展望——多节点摩擦下的港口韧性", "航运港口"))
+    check("B16-35 研报否决表卫生: 11 条/无子串冗余/不误杀 11 条保留样本",
+          len(RESEARCH_DENY) == 11 and len(set(RESEARCH_DENY)) == 11
+          and all(not [v for v in RESEARCH_DENY if v != w and w in v] for w in RESEARCH_DENY)
+          and all(not hit(f"{_t} {_ind}", RESEARCH_DENY) for _t, _ind in _b16_keep)
+          and not (set(RESEARCH_DENY) & set(RESEARCH_INDUSTRY)),
+          [w for w in RESEARCH_DENY if w in " ".join(t for t, _ in _b16_keep)])
+    # B16-36/37 (F-01 修复): 与 B16-27 同口径的运行期行为断言 —— 中期协搜索响应
+    # 打桩取 rows[:2] -> 恰好 2 条逐字; 东财打桩 -> 新门接线可观测 (CPI 稿被拒),
+    # 且 5 条官方统计标题进新门必死 (这正是中金所/中期协不得接门的原因).
+    _b16_cfa_got, _b16_cfa_err = _b16_cfa_probe()
+    check("B16-36 中期协打桩 2 条逐字不变 (套研报门即归零; F-01 中期协侧)",
+          not _b16_cfa_err and _b16_cfa_got == _b16_cfa_texts,
+          _b16_cfa_err or f"n={len(_b16_cfa_got)} got={_b16_cfa_got}")
+    _b16_em_got, _b16_em_err = _b16_em_probe()
+    _b16_official = [t.split("｜")[0] for t in _b16_cffex_texts + _b16_cfa_texts]
+    _b16_official_reasons = [research_gate_reason(t, "") for t in _b16_official]
+    check("B16-37 东财接新门 (CPI 稿被拒) + 5 条官方统计标题进新门必死",
+          not _b16_em_err
+          and _b16_em_got == ["煤炭行业周报：动力煤价止跌企稳｜某证券 · 2026-11-11"]
+          and len(_b16_official) == 5 and all(_b16_official_reasons),
+          _b16_em_err or f"em={_b16_em_got} official={_b16_official_reasons}")
+
     print(f"selftest: {'PASS' if not fails else str(len(fails)) + ' FAILED: ' + ', '.join(fails)}")
     return 0 if not fails else 1
 
