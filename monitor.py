@@ -1064,6 +1064,185 @@ PDF_TABLE = re.compile(r"^\[?[Tt]able[_\-\w]*\]?$|^[图表]\s*\d")     # 版式�
 PDF_NUM = re.compile(r"^[\s\d.,%+\-—–/()（）亿元万股手吨桶美元]+$")   # 纯数字/单位行 (表格碎片)
 PDF_CJK = re.compile(r"[\u4e00-\u9fff]")
 
+# 尾部免责/版权/地址样板段 (Batch 14): batch11 全文推送后, PDF 末页的券商合规声明会独占
+# 最后几条 (i/N) 消息。只在全文第一个声明标记处动刀, 再叠四条护栏。
+PDF_TAIL_MIN_PCT = 0.55          # 声明起点必须落在全文 55% 之后
+PDF_TAIL_MIN_KEEP = 600          # 裁完至少留下这么多字 (短报告不动刀)
+PDF_TAIL_CONFIRM_LINES = 4       # 自我印证窗口: 4 行内至少命中 2 处标记
+PDF_TAIL_REPEAT_MIN = 3          # 同一行出现 >= 3 次 = 页眉/页脚/水印, 不作裁切依据
+PDF_TAIL_FRAG_MAX = 120          # 裁切点之前尾行清理的字符预算
+PDF_TAIL_FRAG_LEFTOVER = 10      # 去掉残片段后剩余可打印字符 <= 此值 = 「整行基本就是它」(F-05)
+PDF_TAIL_DECOR = r"[\s·•・\-–—*|│]"  # 行首允许的装饰符 (项目符号/破折号/竖线)
+PDF_TAIL_MARKER = re.compile(
+    r"免责声明|重要声明|法律声明|特别声明|分析师声明|分析师承诺|证券分析师承诺"
+    r"|免责条款|投资评级说明|评级说明|著作权|版权所有|保留一切"
+    r"|未经.{0,12}书面(?:授权|许可)|未经我方许可|版权仅为本公司所有|保留追究"
+    r"|请阅读最后一页|证券投资咨询(?:业务|执业)资格|证券投资咨询业务的说明"
+    r"|本报告仅供|本报告由.{0,30}证券|本报告的版权")
+PDF_TAIL_BODY_HINT = re.compile(
+    r"数据来源|资料来源|(?:图|表)\s*[:：]|图表\s*\d|单位\s*[:：]|万吨|元/吨|亿元"
+    r"|同比|环比|库存|产量|开工率|进口量|出口量|现货价|期货价|Mysteel|Wind|Choice")
+PDF_TAIL_NOISE = re.compile(
+    r"发送给|eastmoney\.com|@[A-Za-z0-9._-]+\.(?:com|cn|net)"
+    r"|^第\s*\d+\s*页|^p\d+$|^-\s*\d+\s*-$", re.I)
+PDF_TAIL_ORPHAN = re.compile(
+    r"^(?:证券研究报告|研究报告|公司研究|行业研究|策略研究|金融工程|晨会纪要|专题报告)$")
+# 明确「非正文」的残片 (Batch 14 修复 F-01): 只用高精度模式, 不用长度/句末符启发式——
+# 后者会把「长飞光纤光缆 107.2000」这类正文表格行当残片砍掉 (国信真实 PDF 29690->29636)。
+# Batch 14 修复 F-05: 网址/邮箱/电话/邮编/门牌都是**子串**模式, 直接按命中整行删会把
+# 「更多数据请见 www.mysteel.com 公布的周度库存…」这类完整正文句一起砍掉; 故删除判定
+# 统一交给 _pdf_tail_frag (正文逃逸 + 行首锚定 + 「整行基本就是该残片」), 见其 docstring.
+PDF_TAIL_FRAG = re.compile(
+    r"(?:https?://|www\.)[^\s，。；、）)]*"                  # 网址 (整段)
+    r"|[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"     # 邮箱
+    r"|(?:电话|传真|总机|手机)\s*[:：]?\s*[\d\-—–()（）+ ]{6,}"  # 电话/总机号码
+    r"|请阅读最后一页"                                      # 免责提示语
+    r"|^第\s*\d+\s*页|^p\d+$|^-\s*\d+\s*-$"                  # 页码
+    r"|邮编\s*[:：]\s*\d{5,}"                                # 地址块: 邮编
+    r"|(?:路|街|大道|道)\s*\d+\s*号"                          # 地址块: 门牌
+    , re.I)
+# F-05 ①: 残片必须**从行首开始** (允许前置空白与 · - | 等装饰符) 才可整行删.
+PDF_TAIL_FRAG_EDGE = re.compile(
+    r"^(?:" + PDF_TAIL_DECOR + r"*)(?:"
+    r"(?:https?://|www\.)[^\s，。；、）)]*"
+    r"|[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}"
+    r"|(?:电话|传真|总机|手机)\s*[:：]?\s*[\d\-—–()（）+ ]{6,}"
+    r"|请阅读最后一页"
+    r"|第\s*\d+\s*页|p\d+$|-\s*\d+\s*-$"
+    r"|邮编\s*[:：]\s*\d{5,}"
+    r"|(?:路|街|大道|道)\s*\d+\s*号"
+    r")", re.I)
+# F-05 ②: 正文逃逸 —— 含正文特征词的行一律不删. 比 PDF_TAIL_BODY_HINT 更宽 (多出
+# 元/%/涨/跌/图:/表:), 且**只用于 pdf_tail_trim**, 不参与 pdf_tail_cut 的护栏③,
+# 以免声明段里常见的「元/%」把真实声明段也放行.
+PDF_TAIL_TRIM_ESCAPE = re.compile(
+    r"数据来源|资料来源|库存|同比|环比|万吨|元|%|％|涨|跌|图\s*[:：]|表\s*[:：]")
+
+
+def _pdf_tail_frag(s: str) -> bool:
+    """该行是否「明确非正文」的残片 (Batch 14 修复 F-05).
+
+    正文逃逸优先: 命中 PDF_TAIL_TRIM_ESCAPE (库存/同比/万吨/元/%/涨/跌/图:/表:/数据来源)
+    的行整行保留 —— 一条含 URL 的完整正文句不能因为 URL 子串被当残片删掉。
+    其余行只有两种情形才算残片:
+      ① 残片从行首开始 (允许 · - | 等装饰符): 「https://…」「电话：0755-…」「邮编：100033」;
+      ② 去掉残片片段后剩余可打印字符 <= PDF_TAIL_FRAG_LEFTOVER: 「这行基本就是这个
+         URL/号码/地址」, 如「北京市西城区金融大街 7 号」。
+    「长飞光纤光缆 107.2000」不含任何上述片段, 一律不删。
+    """
+    if PDF_TAIL_TRIM_ESCAPE.search(s):
+        return False
+    if PDF_TAIL_FRAG_EDGE.search(s):
+        return True
+    if PDF_TAIL_FRAG.search(s):
+        rest = PDF_TAIL_FRAG.sub("", s)
+        return len(re.sub(PDF_TAIL_DECOR, "", rest)) <= PDF_TAIL_FRAG_LEFTOVER
+    return False
+
+
+def pdf_tail_cut(lines: list[str], confirm: int | None = PDF_TAIL_CONFIRM_LINES) -> int:
+    """返回尾部「免责/版权/地址样板段」的起始行下标; 判定不裁时返回 len(lines) (Batch 14).
+
+    只在**全文第一个**声明标记处动刀, 再叠四条护栏, 缺一不裁 (宁可少裁, 不可误裁):
+      ① 第一个标记落在全文 PDF_TAIL_MIN_PCT 之后 (正文小标题「风险提示」等够不着);
+      ② 标记之前仍有 >= PDF_TAIL_MIN_KEEP 字正文 (短报告不清空);
+      ③ 标记之后不得再有正文特征 (「数据来源/图表/库存/同比」…; 开源那份不裁);
+      ④ 自我印证: 标记起 confirm 行内至少 2 处命中 (孤零零一个小标题不裁);
+         confirm=None 表示窗口取「标记起至末尾」。文本层 (pdf_tail_trim_text) **不得**用
+         None: 扁平串里的伪行段远比原始 PDF 行短, 「标记起至末尾」会把正文后段几百字后的
+         真实声明尾也算进确认窗口, 于是正文里单处「著作权」就被当成裁切点 (B15 修复 F-01:
+         4136 字样本裁到 2820 字, 丢 43 句)。文本层改用 12 段有界窗口, 见 pdf_tail_trim_text。
+    页眉/页脚/水印不算标记: 同一行重复 >= PDF_TAIL_REPEAT_MIN 次, 或命中 PDF_TAIL_NOISE
+    (东财水印「XX证券版权所有发送给…eastmoney.com」、「第 8 页共 8 页」)。
+    """
+    n = len(lines)
+    if n < 2:
+        return n
+    prefix = [0]
+    for s in lines:
+        prefix.append(prefix[-1] + len(s) + 1)
+    counts: dict[str, int] = {}
+    for s in lines:
+        counts[s] = counts.get(s, 0) + 1
+    first = next((i for i, s in enumerate(lines)
+                  if counts[s] < PDF_TAIL_REPEAT_MIN
+                  and not PDF_TAIL_NOISE.search(s) and PDF_TAIL_MARKER.search(s)), n)
+    if first >= n:
+        return n
+    if prefix[first] < prefix[-1] * PDF_TAIL_MIN_PCT:
+        return n
+    if prefix[first] < PDF_TAIL_MIN_KEEP:
+        return n
+    if PDF_TAIL_BODY_HINT.search(" ".join(lines[first:])):
+        return n
+    window = lines[first:] if confirm is None else lines[first:first + confirm]
+    if sum(len(PDF_TAIL_MARKER.findall(x)) for x in window) < 2:
+        return n
+    return first
+
+
+def pdf_tail_trim(lines: list[str], cut: int) -> int:
+    """把裁切点之前的「重复页脚/水印/页码/网址/地址/孤立标签行」丢掉, 预算 PDF_TAIL_FRAG_MAX (Batch 14).
+
+    只清理不裁正文 (Batch 14 修复 F-01): 每条被删的行都必须命中 PDF_TAIL_NOISE /
+    _pdf_tail_frag / PDF_TAIL_ORPHAN, 或「同一行重复 >= PDF_TAIL_REPEAT_MIN 次且含声明标记」
+    的页脚; 其余行原样保留 —— 表格行「长飞光纤光缆 107.2000」不含任何上述特征, 一律留下。
+    Batch 14 修复 F-05: 网址/电话等子串残片不再整行删, 只有行首或「整行基本就是它」才删,
+    含正文特征词的行一律逃逸 (见 _pdf_tail_frag)。
+    """
+    counts: dict[str, int] = {}
+    for s in lines[:cut]:
+        counts[s] = counts.get(s, 0) + 1
+    kept = sum(len(s) + 1 for s in lines[:cut])
+    dropped = 0
+    while cut > 0:
+        s = lines[cut - 1]
+        noise = (PDF_TAIL_NOISE.search(s) or _pdf_tail_frag(s)
+                 or PDF_TAIL_ORPHAN.match(s)
+                 or (counts[s] >= PDF_TAIL_REPEAT_MIN and PDF_TAIL_MARKER.search(s)))
+        if not noise or dropped + len(s) > PDF_TAIL_FRAG_MAX:
+            break
+        dropped += len(s)
+        cut -= 1
+    return cut if kept - dropped >= PDF_TAIL_MIN_KEEP else cut
+
+
+def _pdf_tail_segments(text: str) -> list[str]:
+    """把扁平正文按句末标点切成伪行 (Batch 15): "".join(结果) == 原文, 逐字节可逆."""
+    segs: list[str] = []
+    start = 0
+    for i, ch in enumerate(text):
+        if ch in "。！？；!?;\n":
+            segs.append(text[start:i + 1])
+            start = i + 1
+    if start < len(text):
+        segs.append(text[start:])
+    return segs
+
+
+def pdf_tail_trim_text(text: str) -> str:
+    """字符串级尾部声明剔除 (Batch 15): 对**已入库**的 snippet 再跑一次 pdf_tail_cut +
+    pdf_tail_trim, 供渲染前纵深防御使用.
+
+    与 pdf_clean 的区别: pdf_clean 拿到的是 pdftotext 原始行, 可以直接跑行级护栏;
+    队列里的 snippet 已被 pdf_clean 用 " " 拼成**单行**, 直接喂给 pdf_tail_trim 只有
+    1 行 -> 永不裁. 故先按句末标点还原成伪行, 再原样复用同一套四护栏与残片规则
+    (不新增判据, 单一裁决源). 不裁时**逐字节返回原串**, 保证幂等与「干净正文零改动」.
+    """
+    body = str(text or "")
+    if not body or not PDF_TAIL_MARKER.search(body):
+        return body                        # 快路径: 全文无任何声明标记
+    segs = _pdf_tail_segments(body)
+    # 护栏④ 用**有界**窗口 (Batch 15 修复 F-01): None = 「标记起至末尾」会让正文后段的
+    # 单处声明词与几百字后的真实声明尾同处一个窗口, 裁切点前移 (实测 4136 -> 2820 字,
+    # 丢 43 句). 12 段落在实测安全平台 [8, 32] 内: 真实万联尾段 2 处标记都在 12 段内
+    # (7044 -> 6220 仍裁), 而「正文里 1 处标记 + 其后 >12 段正文」的窗口只有 1 处 -> 不裁.
+    cut = pdf_tail_cut(segs, confirm=12)
+    if cut >= len(segs):
+        return body                        # 四护栏拒裁 (含 < 2 段/短报告) -> 原样
+    cut = pdf_tail_trim(segs, cut)
+    return body if cut >= len(segs) else "".join(segs[:cut]).rstrip()
+
 
 def pdf_clean(text: str, limit: int = SNIPPET_MAX) -> str:
     """把 pdftotext 输出收拾成可推的一段摘要 (Batch 7).
@@ -1072,6 +1251,9 @@ def pdf_clean(text: str, limit: int = SNIPPET_MAX) -> str:
     ③ 版式标记 (`[Table_StockNameRptType]`、`图 2`). 只保留「含 ≥6 个汉字且 ≥10 字」的
     成句行; 成句行合计不足 limit 时退回全部非空行 —— 中金所月报几乎全是表格, 只有
     小节标题是成句行, 退回策略保证有文本层的 PDF 不被误判成「无文本层」。
+
+    Batch 14: 先剔除尾部的免责/版权/地址样板段 (pdf_tail_cut + pdf_tail_trim), 再按
+    limit 截断 —— 声明段本来就不该占推送配额, 也不该成为最后一条 (i/N) 消息。
     """
     lines: list[str] = []
     for raw in (text or "").splitlines():
@@ -1079,6 +1261,9 @@ def pdf_clean(text: str, limit: int = SNIPPET_MAX) -> str:
         if not s or PDF_TABLE.match(s) or PDF_NUM.match(s):
             continue
         lines.append(s)
+    cut = pdf_tail_cut(lines)                 # Batch 14: 尾部声明样板段起点
+    if cut < len(lines):                      # 只有真找到声明起点时才动刀
+        lines = lines[:pdf_tail_trim(lines, cut)]
     good = [s for s in lines if len(s) >= 10 and len(PDF_CJK.findall(s)) >= 6]
     body = re.sub(r"\s+", " ", " ".join(good or lines)).strip()
     body = re.sub(r"[\ue000-\uf8ff\ufffd\x0c]", "", body)   # Wingdings 项目符号/换页符
@@ -3218,6 +3403,15 @@ def source_health(seen: dict, outcomes: list[tuple[str, str]], conf: dict,
     return changed
 
 
+def render_snippet(it: dict) -> str:
+    """研报渲染前对 snippet 再跑一次尾部声明剔除 (Batch 15 纵深防御).
+
+    覆盖所有研报正文消费点 (research_line 单条 / research_parts 分片); 只读队列里的
+    snippet, **不改写 state/queue**: 已落盘的老条目按原样留存, 只在推送这一刻被清理。
+    """
+    return pdf_tail_trim_text(str(it.get("snippet") or "").strip())
+
+
 def research_line(it: dict, dt: datetime) -> str:
     """研报条目渲染 (Batch 7): 标题 / 机构·日期 / 摘要 / 「查看原文」链接.
 
@@ -3239,7 +3433,7 @@ def research_line(it: dict, dt: datetime) -> str:
              f"<b>{esc_quote_limited(head, ITEM_MAX)}</b>"]
     if meta:
         lines.append(esc_quote_limited(meta, RESEARCH_META_MAX))
-    snip = str(it.get("snippet") or "").strip()
+    snip = render_snippet(it)
     if snip:
         lines.append(esc_quote_limited(snip, SNIPPET_MAX + 20))
     href = esc_url(url) if len(url) <= RESEARCH_URL_MAX else ""
@@ -3320,7 +3514,7 @@ def research_parts(it: dict, dt: datetime) -> list[str]:
     单片且整条消息 <= MSG_MAX 时**逐字节**沿用 research_line() —— 非分片路径零改动,
     老条目 (240 字) 与无正文条目因此与 Batch 10 完全一致 (B11-06)。
     """
-    body = str(it.get("snippet") or "").strip()
+    body = render_snippet(it)
     if not is_http_url(it.get("url")) or not body:
         return [research_line(it, dt)]
     parts = split_research_body(body, RESEARCH_PART_MAX)
@@ -9740,7 +9934,635 @@ target="_blank">石脑油市场早间提示（20261109）</a>
     _b12_case("B13-19 东财 详情源内轮转 (a1 -> a2 -> 不再下载)", _b13_a19)
     _b12_case("B13-20 化销网 慢轮 7s: 13/14 详情优先, 后续类目截断", _b13_a20)
     _b12_case("B13-21 东财 列表请求不带 -L / 详情带 -L", _b13_a21)
+    # ---- Batch 14: 研报 PDF 尾部免责/版权/地址样板段剔除 (全部离线)
+    # 夹具口径: 东方金诚/万联/国信 的尾部行逐字取自 2026-11 东财真实 PDF 的 pdftotext
+    # 输出 (东方金诚 AP202611101831579729 / 万联 AP202611051831461744 /
+    # 国信 AP202611031831347443); 国信为节选 (省中间评级表与声明正文, 以 `[节选]` 标注);
+    # 华鑫/开源 两份按 CTO 尾部采样的原句构造 (未逐字复核, 仅锁规则形态)。
+    _b14_body = '2026 年 10 月，国内动力煤价格延续上行，港口库存环比下降 3.2%，电厂日耗同比回升。'
+    _b14_body_tail = '11 月港口调出量环比回升 4.1%，锚地船舶数同比下降 6 艘。'
+    _b14_wm3 = '万联证券版权所有发送给上海东方财富金融数据服务有限公司.张嘉仪.ybjieshou@eastmoney.com p3'
+    _b14_wm5 = '万联证券版权所有发送给上海东方财富金融数据服务有限公司.张嘉仪.ybjieshou@eastmoney.com p5'
+    _b14_wm6 = '万联证券版权所有发送给上海东方财富金融数据服务有限公司.张嘉仪.ybjieshou@eastmoney.com p6'
+    _b14_gx_foot = '请务必阅读正文之后的免责声明及其项下所有内容'
+    _b14_wl_tail = [
+        '证券分析师承诺',
+        '本人具有中国证券业协会授予的证券投资咨询执业资格并登记为证券分析师，以勤勉的执业态度，独立、客观',
+        '地出具本报告。本报告清晰准确地反映了本人的研究观点。本人不曾因，不因，也将不会因本报告中的具体推',
+        '荐意见或观点而直接或间接收到任何形式的补偿。',
+        '[Tale_ReliefInfo]',
+        '免责条款',
+        '万联证券股份有限公司（以下简称“本公司”）是一家覆盖证券经纪、投资银行、投资管理和证券咨询等多项',
+        '业务的全国性综合类证券公司。本公司具有中国证监会许可的证券投资咨询业务资格。',
+        '本报告仅供本公司的客户使用。本公司不会因接收人收到本报告而视其为客户。在任何情况下，本报告中的信',
+        '息或所表述的意见并不构成对任何人的投资建议。本报告中的信息或所表述的意见并未考虑到个别投资者的具',
+        '体投资目的、财务状况以及特定需求。客户应自主作出投资决策并自行承担投资风险。本公司不对任何人因使',
+        '用本报告中的内容所导致的损失负任何责任。在法律许可情况下，本公司或其关联机构可能会持有报告中提到',
+        '的公司所发行的证券头寸并进行交易，还可能为这些公司提供或争取提供投资银行、财务顾问或类似的金融服',
+        '务。',
+        '市场有风险，投资需谨慎。本报告是基于本公司认为可靠且已公开的信息撰写，本公司力求但不保证这些信息',
+        '的准确性及完整性，也不保证文中的观点或陈述不会发生任何变更。在不同时期，本公司可发出与本报告所载',
+        '资料、意见及推测不一致的报告。分析师任何形式的分享证券投资收益或者分担证券投资损失的书面或口头承',
+        '诺均为无效。',
+        '本报告的版权仅为本公司所有，未经书面许可任何机构和个人不得以任何形式翻版、复制、刊登、发表和引用。',
+        '未经我方许可而引用、刊发或转载的引起法律后果和造成我公司经济损失的概由对方承担，我公司保留追究的',
+        '权利。',
+        '[Table_AdressInfo]',
+        '万联证券股份有限公司研究所',
+        '上海浦东新区世纪大道 1528 号陆家嘴基金大厦',
+        '北京西城区平安里西大街 28 号中海国际中心',
+        '深圳福田区深南大道 2007 号金地中心',
+        '广州天河区珠江东路 11 号高德置地广场',
+        '万联证券研究所 www.wlzq.cn',
+        '第8页共8页',
+    ]
+    _b14_djc_tail = [
+        '权利及免责声明：',
+        '本研究报告及相关的信用分析数据、模型、软件、研究观点等所有内容的著作权和其他相关知识产权均归东方金诚所有，东方金诚保留一',
+        '切与此相关的权利，任何机构及个人未经东方金诚书面授权不得修改、复制、逆向工程、销售、分发、储存、引用或以任何方式传播。未',
+        '获书面授权的机构及人士不应获取或以任何方式使用本研究报告，东方金诚对本研究报告的未授权使用、超授权使用和非法使用等不当使',
+        '用行为所造成的一切后果均不承担任何责任。',
+        '本研究报告中引用的标明出处的公开资料，其合法性、真实性、准确性、完整性均由资料提供方或/及发布方负责，东方金诚对该等资料进',
+        '行了合理审慎的核查，但不应视为东方金诚对其合法性、真实性、准确性及完整性提供了任何形式的保证。',
+        '本研究报告的结论，是在最初发表本报告日期当日按照东方金诚的研究流程及标准做出的独立判断，遵循了客观、公正的原则，未受第三',
+        '方组织或个人的干预和影响。东方金诚可能不时补充、修订或更新有关信息，也可能发出其他与本报告所载内容不一致或有不同结论的报',
+        '告，但没有义务和责任更新本报告并通知报告使用者。',
+        '本研究报告仅用于为投资人、发行人等授权使用方提供第三方参考意见，并非是对某种决策的结论或建议；投资者应审慎使用本研究报',
+        '告，自行对投资行为和投资结果负责，东方金诚不对其承担任何责任。',
+        '本声明为本研究报告不可分割的内容，任何使用者使用或引用本报告，应转载本声明。并且，相关引用必须注明来自东方金诚且不得篡',
+        '改、歪曲或有任何类似性质的修改行为。',
+        '3',
+    ]
+    _b14_gx_tail = [
+        '免责声明',
+        '分析师声明',
+        '作者保证报告所采用的数据均来自合规渠道；分析逻辑基于作者的职业理解，通过合理判断并得出结论，',
+        '力求独立、客观、公正，结论不受任何第三方的授意或影响；作者在过去、现在或未来未就其研究报告',
+        '所提供的具体建议或所表述的意见直接或间接收取任何报酬，特此声明。',
+        '重要声明',
+        '本报告由国信证券股份有限公司（已具备中国证监会许可的证券投资咨询业务资格）制作；报告版权归',
+        '国信证券股份有限公司',
+        '关本报告的摘要或节选都不代表本报告正式完整的观点，一切须以我公司向客户发布的本报告完整版本',
+        '本报告仅供参考之用，不构成出售或购买证券或其他投资标的要约或邀请。在任何情况下，本报告中的信息和',
+        '意见均不构成对任何个人的投资建议。任何形式的分享证券投资收益或者分担证券投资损失的书面或口头承诺',
+        '均为无效。投资者应结合自己的投资目标和财务状况自行判断是否采用本报告所载内容和信息并自行承担风险，',
+        '我公司及雇员对投资者使用本报告及其内容而造成的一切后果不承担任何法律责任。',
+        '证券投资咨询业务的说明',
+        '本公司具备中国证监会核准的证券投资咨询业务资格。证券投资咨询，是指从事证券投资咨询业务的机',
+        '构及其投资咨询人员以下列形式为证券投资人或者客户提供证券投资分析、预测或者建议等直接或者间',
+        '证券研究报告',
+        '国信证券经济研究所',
+        '深圳',
+        '深圳市福田区福华一路 125 号国信金融大厦 36 层',
+        '邮编：518046',
+        '总机：0755-82130833',
+        '上海',
+        '上海浦东民生路 1199 弄证大五道口广场 1 号楼 12 层',
+        '邮编：200135',
+        '北京',
+        '北京西城区金融大街兴盛街 6 号国信证券 9 层',
+        '邮编：100032',
+    ]
+    # 正文 60 行 + 声明尾: 声明起点 81.5%, 与东财实测 (2644/3243) 同比例
+    _b14_djc = "\n".join([_b14_body] * 60 + _b14_djc_tail)
+    _b14_djc_long = "\n".join([_b14_body] * 80 + _b14_djc_tail)
+    # 万联: 正文 + 3 条东财水印 (末条落在 55% 之后) + 声明尾
+    _b14_wl = "\n".join([_b14_body] * 12 + [_b14_wm3] + [_b14_body] * 10
+                         + [_b14_wm5] + [_b14_body] * 10 + [_b14_wm6]
+                         + [_b14_body] * 2 + _b14_wl_tail)
+    # 国信: 正文 + 3 条重复页脚 (含「免责声明」字样) + 一条水印后正文 + 声明尾
+    _b14_gx = "\n".join([_b14_body] * 30 + [_b14_gx_foot] + [_b14_body] * 8
+                         + [_b14_gx_foot] + [_b14_body] * 5 + [_b14_gx_foot]
+                         + [_b14_body_tail] + [_b14_body] * 2
+                         + ["证券研究报告"] + _b14_gx_tail)
+    _b14_ky = "\n".join([_b14_body] * 30
+                         + ["数据来源：Mysteel、开源证券研究所"])
+    _b14_risk = "\n".join([_b14_body] * 30
+                           + ["风险提示：近期港口库存累积，价格存在回调压力。",
+                              "数据来源：Mysteel、开源证券研究所"])
+    _b14_hd = "\n".join([_b14_body] * 30
+                         + ["免责条款",
+                            "本节口径说明：进口关税按到岸价计征，与上一节测算一致。",
+                            "关税调整会改变进口成本，进而影响国内价格。",
+                            "数据来源：Mysteel、开源证券研究所"])
+    _b14_hd_decl = "\n".join([_b14_body] * 30 + ["免责条款"] + _b14_wl_tail[1:])
+    _b14_hx = "\n".join([_b14_body] * 30
+                         + ["请阅读最后一页重要免责声明", "诚信、专业、稳健、高效"])
+    _b14_addr = "\n".join([_b14_body] * 30
+                           + ["万联证券研究所 www.wlzq.cn",
+                              "上海浦东新区世纪大道 1528 号陆家嘴基金大厦",
+                              "北京西城区平安里西大街 28 号中海国际中心"])
+    _b14_foot3 = "\n".join([_b14_body] * 30 + [_b14_gx_foot] * 3)
+    _b14_short = "\n".join([_b14_body] * 4 + _b14_wl_tail)
+    _b14_dt = datetime.fromtimestamp(_B11_TS, TZ_CN)
 
+    def _b14_case(name, fn):
+        try:
+            ok, detail = fn()
+        except Exception as e:                       # noqa: BLE001 - 旧码缺符号 -> 本条红
+            ok, detail = False, f"{type(e).__name__}: {e}"
+        check(name, bool(ok), str(detail))
+
+
+    def _b14_a01():
+        body = pdf_clean(_b14_djc)
+        ok = ("著作权" not in body and "保留一切" not in body
+              and "本声明为本研究报告" not in body
+              and body.endswith("电厂日耗同比回升。")
+              and len(body) >= 2000 and len(_b14_djc) - len(body) >= 500)
+        return ok, f"len={len(body)} raw={len(_b14_djc)} tail={body[-16:]!r}"
+
+
+    def _b14_a02():
+        body = pdf_clean(_b14_wl)
+        ok = ("版权仅为本公司所有" not in body and "www.wlzq.cn" not in body
+              and "金地中心" not in body and "万联证券研究所" not in body
+              and "未经我方许可" not in body
+              and body.endswith("电厂日耗同比回升。") and len(body) >= 1500)
+        return ok, f"len={len(body)} tail={body[-16:]!r}"
+
+
+    def _b14_a03():
+        body = pdf_clean(_b14_gx)
+        ok = ("重要声明" not in body and "证券投资咨询业务的说明" not in body
+              and "国信证券经济研究所" not in body and "上海浦东民生路" not in body
+              and "国信证券股份有限公司" not in body
+              and _b14_body_tail in body          # 重复页脚之后的正文一行都不许丢
+              and body.endswith("。")             # 尾行清理: 不留「证券研究报告」孤行
+              and not body.endswith("证券研究报告"))
+        return ok, f"len={len(body)} tail={body[-16:]!r}"
+
+
+    def _b14_a04():
+        body = pdf_clean(_b14_hx)
+        ok = ("请阅读最后一页" not in body and "诚信、专业、稳健、高效" not in body
+              and body.endswith("电厂日耗同比回升。"))
+        return ok, f"len={len(body)} tail={body[-16:]!r}"
+
+
+    def _b14_a05():
+        body = pdf_clean(_b14_ky)
+        pair = pdf_clean(_b14_ky + "\n" + "\n".join(_b14_wl_tail))
+        no_loss = len(body) >= sum(len(x) for x in _b14_ky.splitlines())
+        ok = (body.endswith("数据来源：Mysteel、开源证券研究所") and no_loss
+              and "版权仅为本公司所有" not in pair
+              and len(pair) < len(body) + sum(len(x) for x in _b14_wl_tail) - 500)
+        return ok, f"ky={len(body)} pair={len(pair)} no_loss={no_loss}"
+
+
+    def _b14_a06():
+        body = pdf_clean(_b14_risk)
+        pair = pdf_clean(_b14_risk + "\n" + "\n".join(_b14_wl_tail))
+        ok = ("风险提示：近期港口库存累积" in body
+              and "数据来源：Mysteel、开源证券研究所" in body
+              and "版权仅为本公司所有" not in pair
+              and pair.endswith("开源证券研究所"))
+        return ok, f"risk={len(body)} pair={len(pair)}"
+
+
+    def _b14_a07():
+        body = pdf_clean(_b14_hd)
+        decl = "\n".join([_b14_body] * 30 + ["免责条款"] + _b14_wl_tail[1:])
+        body2 = pdf_clean(decl)
+        ok = ("本节口径说明：进口关税按到岸价计征" in body
+              and "关税调整会改变进口成本" in body
+              and "数据来源：Mysteel、开源证券研究所" in body
+              and "版权仅为本公司所有" not in body
+              and "证券分析师承诺" not in body2
+              and "版权仅为本公司所有" not in body2
+              and body2.endswith("电厂日耗同比回升。"))
+        return ok, f"hd={len(body)} decl={len(body2)}"
+
+
+    def _b14_a08():
+        foot = pdf_clean(_b14_foot3)               # 每页重复的页脚: 不是声明起点
+        once = pdf_clean("\n".join([_b14_body] * 30
+                                    + ["本报告的版权仅为本公司所有，未经书面许可不得翻印。"]))
+        base = pdf_clean("\n".join([_b14_body] * 30))
+        ok = (foot.count(_b14_gx_foot) == 3 and len(foot) > 1300
+              and once == base and "版权仅为本公司所有" not in once
+              and len(foot) > len(once))
+        return ok, f"foot={len(foot)} once={len(once)}"
+
+
+    def _b14_a09():
+        body = pdf_clean(_b14_short)               # 正文只有 4 行 -> 不裁
+        long_ = pdf_clean("\n".join([_b14_body] * 30 + _b14_wl_tail))
+        ok = ("万联证券研究所 www.wlzq.cn" in body
+              and "版权仅为本公司所有" in body
+              and "万联证券研究所" not in long_ and "金地中心" not in long_)
+        return ok, f"short={len(body)} long={len(long_)}"
+
+
+    def _b14_a10():
+        raw = _b14_djc
+        ok = (pdf_clean.__defaults__ == (SNIPPET_MAX,)
+              and pdf_clean(raw) == pdf_clean(raw, SNIPPET_MAX)
+              and pdf_clean(pdf_clean(raw)) == pdf_clean(raw)
+              and pdf_clean(raw, 600) == pdf_clean(raw)[:600]
+              and len(pdf_clean(raw, 600)) == 600
+              and "著作权" not in pdf_clean(raw, 3000)
+              and SNIPPET_MAX == 24000 and SNIPPET_FULL_MAX == 40000)
+        return ok, f"sig={pdf_clean(raw, 600)[-8:]!r}"
+
+
+    def _b14_a11():
+        it = {"src": "东财研报", "ts": _B11_TS,
+               "text": "10 月进出口数据解读｜东方金诚 · 2026-11-10",
+               "url": "https://example.com/b14.pdf",
+               "snippet": pdf_clean(_b14_djc_long), "key": "研究:东财研报:b14"}
+        parts = research_parts(it, _b14_dt)
+        joined = "".join(parts)
+        ok = (len(parts) >= 2 and "著作权" not in joined
+              and "本声明为本研究报告" not in joined
+              and all(u16(p) <= MSG_MAX for p in parts)
+              and all(f"({i}/{len(parts)})" in p for i, p in enumerate(parts, 1)))
+        return ok, f"n={len(parts)} u16={[u16(p) for p in parts]}"
+
+
+    def _b14_a12():
+        body = pdf_clean(_b14_addr)                # 地址/研究所/网站本身不是裁切依据
+        decl = pdf_clean("\n".join([_b14_body] * 30
+                                    + ["本报告的版权仅为本公司所有，未经书面许可不得翻印。"]
+                                    + ["万联证券研究所 www.wlzq.cn"]))
+        ok = ("万联证券研究所" in body and "www.wlzq.cn" in body
+              and "陆家嘴基金大厦" in body
+              and "万联证券研究所" not in decl and "www.wlzq.cn" not in decl)
+        return ok, f"addr={len(body)} decl={len(decl)}"
+
+
+    _b14_case("B14-01 东方金诚尾部声明被剔除 (真实尾部夹具)", _b14_a01)
+    _b14_case("B14-02 万联 版权/三地地址被裁且每页水印不误裁", _b14_a02)
+    _b14_case("B14-03 国信 重要声明/地址被裁 + 重复页脚不误裁 + 尾行清理", _b14_a03)
+    _b14_case("B14-04 华鑫 单次「请阅读最后一页」+ 标语被裁", _b14_a04)
+    _b14_case("B14-05 开源 无声明一字不裁; 同正文接真声明则裁", _b14_a05)
+    _b14_case("B14-06 正文自带风险提示小节 -> 不裁; 尾部真声明 -> 裁", _b14_a06)
+    _b14_case("B14-07 正文「免责条款」小标题+内容 -> 不裁; 标题下接声明 -> 裁", _b14_a07)
+    _b14_case("B14-08 重复页脚/水印不作裁切依据; 单次版权行才裁", _b14_a08)
+    _b14_case("B14-09 短报告护栏: 正文 < 600 字不清空", _b14_a09)
+    _b14_case("B14-10 契约/幂等: 签名与默认值不变, 声明裁切幂等", _b14_a10)
+    _b14_case("B14-11 与分片联动: 末片不再独占声明且分片无损", _b14_a11)
+    _b14_case("B14-12 地址/研究所/网站本身不作裁切依据", _b14_a12)
+
+    # ---- Batch 14 修复 F-01/F-02: 表格行保留 + 四道护栏逐条钉死 (B14-13..B14-18) ----
+    # F-01 反例取自国信真实 PDF (AP202611031831347443): 声明段紧邻的两行正文表格行
+    # 「长飞光纤光缆 107.2000」「中国海洋石油 24.5200」; 旧码的「<=60 字半句」把两行砍掉
+    # (29690->29636)。这里要求: 声明照裁, 两行表格逐字保留。
+    _b14_tbl = ["长飞光纤光缆 107.2000", "中国海洋石油 24.5200"]
+    _b14_orphan = "证券研究报告"           # 国信 PDF 声明前的孤立报告类型行
+    _b14_neutral = "10 月进口煤到港量维持高位，贸易商观望情绪较浓。"
+
+    def _b14_lines(text):
+        out = []
+        for raw in (text or "").splitlines():
+            s = raw.strip()
+            if not s or PDF_TABLE.match(s) or PDF_NUM.match(s):
+                continue
+            out.append(s)
+        return out
+
+    def _b14_first(lines):
+        counts = {}
+        for s in lines:
+            counts[s] = counts.get(s, 0) + 1
+        return next((i for i, s in enumerate(lines)
+                     if counts[s] < PDF_TAIL_REPEAT_MIN
+                     and not PDF_TAIL_NOISE.search(s) and PDF_TAIL_MARKER.search(s)),
+                    len(lines))
+
+    def _b14_prefix(lines, idx):
+        return sum(len(x) + 1 for x in lines[:idx])
+
+    def _b14_cut_keeps_tbl():
+        """F-01 行为断言: 声明段紧邻的表格行在裁声明后必须逐字保留 (不受护栏变异影响)."""
+        text = "\n".join([_b14_body] * 28 + _b14_tbl + [_b14_orphan] + _b14_djc_tail)
+        body = pdf_clean(text)
+        return (all(body.count(row) == 1 for row in _b14_tbl)
+                and "著作权" not in body)
+
+
+    def _b14_a13():
+        # 护栏①: marker 落在全文 ~30% 处 -> 不裁 (②③④ 单独都满足)
+        text = "\n".join([_b14_body] * 13 + _b14_djc_tail + _b14_wl_tail[1:20])
+        lines = _b14_lines(text)
+        first = _b14_first(lines)
+        pct = 100.0 * _b14_prefix(lines, first) / max(1, _b14_prefix(lines, len(lines)))
+        cut = pdf_tail_cut(lines)
+        ok = (first < len(lines) and pct < 100 * PDF_TAIL_MIN_PCT
+              and cut == len(lines) and _b14_cut_keeps_tbl())
+        return ok, f"cut={cut} n={len(lines)} marker@{pct:.1f}%"
+
+
+    def _b14_a14():
+        # 护栏②: marker 前只有 ~470 字 (<600) -> 不裁 (①③④ 单独都满足)
+        tail = ["免责声明",
+                "本报告版权归本公司所有，未经书面许可不得翻印。",
+                "证券分析师承诺"]
+        lines = _b14_lines("\n".join([_b14_body] * 10 + tail))
+        first = _b14_first(lines)
+        prefix = _b14_prefix(lines, first)
+        cut = pdf_tail_cut(lines)
+        ok = (first < len(lines) and prefix < PDF_TAIL_MIN_KEEP
+              and cut == len(lines) and _b14_cut_keeps_tbl())
+        return ok, f"cut={cut} n={len(lines)} prefix={prefix}"
+
+
+    def _b14_a15():
+        # 护栏③: marker 之后仍有正文特征 (「数据来源」) -> 不裁 (①②④ 单独都满足)
+        tail = ["免责声明",
+                "本报告版权归本公司所有，未经书面许可不得翻印。",
+                "数据来源：Wind、国信证券经济研究所整理",
+                "本公司具备中国证监会核准的业务资格。"]
+        lines = _b14_lines("\n".join([_b14_body] * 30 + tail))
+        first = _b14_first(lines)
+        cut = pdf_tail_cut(lines)
+        ok = (first < len(lines) and PDF_TAIL_BODY_HINT.search(" ".join(lines[first:]))
+              and cut == len(lines) and _b14_cut_keeps_tbl())
+        return ok, f"cut={cut} n={len(lines)} prefix={_b14_prefix(lines, first)}"
+
+
+    def _b14_a16():
+        # 护栏④: 标记起 4 行内只有 1 处标记 -> 不裁 (①②③ 单独都满足)
+        tail = ["免责声明",
+                "本报告中的信息或所表述的意见并不构成对任何人的投资建议，投资者应自行判断。",
+                "本报告中的信息或所表述的意见并不构成对任何人的投资建议，投资者应自行判断。",
+                "本报告中的信息或所表述的意见并不构成对任何人的投资建议，投资者应自行判断。"]
+        lines = _b14_lines("\n".join([_b14_body] * 30 + tail))
+        first = _b14_first(lines)
+        cut = pdf_tail_cut(lines)
+        n_mark = sum(len(PDF_TAIL_MARKER.findall(x))
+                     for x in lines[first:first + PDF_TAIL_CONFIRM_LINES])
+        ok = (first < len(lines) and n_mark < 2
+              and cut == len(lines) and _b14_cut_keeps_tbl())
+        return ok, f"cut={cut} n={len(lines)} window_marks={n_mark}"
+
+
+    def _b14_a17():
+        # 切点必须是标记行行首 (不是 marker 词本身): 前半行是正文时不得只砍词
+        head = [_b14_body] * 30
+        tail = ["本节内容为补充说明，详见如下：免责声明",
+                "证券分析师承诺",
+                "本人具有中国证券业协会授予的证券投资咨询执业资格并登记为证券分析师。"]
+        lines = _b14_lines("\n".join(head + tail))
+        cut = pdf_tail_cut(lines)
+        body = pdf_clean("\n".join(head + tail))
+        ok = (cut == len(head) and "本节内容为补充说明" not in body
+              and body.count(_b14_body) == 30 and _b14_cut_keeps_tbl())
+        return ok, f"cut={cut} n={len(lines)} tail={body[-12:]!r}"
+
+
+    def _b14_a18():
+        # 噪声抑制: 同一行重复 >=3 次 (页脚) 与命中东财水印都不作标记 -> 不裁
+        text = "\n".join([_b14_neutral] * 24 + [_b14_wm3, _b14_neutral, _b14_neutral,
+                                               _b14_gx_foot, _b14_neutral, _b14_neutral,
+                                               _b14_gx_foot, _b14_neutral, _b14_gx_foot]
+                         + [_b14_neutral] * 8)
+        lines = _b14_lines(text)
+        first = _b14_first(lines)
+        cut = pdf_tail_cut(lines)
+        ok = (first == len(lines) and cut == len(lines) and _b14_cut_keeps_tbl())
+        return ok, f"cut={cut} n={len(lines)} suppressed_marker={first == len(lines)}"
+
+
+    # ---- Batch 14 修复 F-05: 尾行残片必须锚定行首 + 正文句一律逃逸 (B14-19..B14-22) ----
+    # 反例来自定向复验 F-05: 「www.」「电话」是子串模式, 旧码 (f29ec766) 会把含它们的
+    # **完整正文句**整行删掉 (new body 1439 vs old 1480). 四条断言都同时钉住「该删的仍删」,
+    # 防止把残片清理整个关掉.
+    _b14_f05_url_sent = "更多数据请见 www.mysteel.com 公布的周度库存，该口径与上月一致。"
+    _b14_f05_url_end = "本周港口库存环比下降 3.2%，明细数据请见 www.mysteel.com"
+    _b14_f05_url_only = "https://www.mysteel.com/report/2026-11-10"
+    _b14_f05_tel_sent = "如需核对本周库存明细，请联系研究员电话：010-88001234。"
+    _b14_f05_tel_end = "本周库存环比下降 3.2%，明细请联系电话：010-88001234"
+    _b14_f05_tel_only = "总机：0755-82130833"
+    _b14_f05_post_only = "邮编：100033"
+    _b14_f05_addr_only = "北京市西城区金融大街 7 号"
+    _b14_f05_decl = ["免责声明",
+                     "本报告版权归本公司所有，未经书面许可不得翻印。",
+                     "证券分析师承诺"]
+
+    def _b14_f05_text(kept):
+        return "\n".join([_b14_body] * 30 + list(kept) + _b14_f05_decl)
+
+    def _b14_f05_trim(kept):
+        lines = _b14_lines(_b14_f05_text(kept))
+        cut = pdf_tail_cut(lines)
+        return lines, cut, pdf_tail_trim(lines, cut)
+
+    def _b14_a19():
+        # ① 正文句 + 行尾 URL (句中/句末两种形态) -> 整行保留
+        # (旧码 FRAG 命中子串 www. -> 整行删)
+        kept = [_b14_f05_url_sent, _b14_f05_url_end]
+        body = pdf_clean(_b14_f05_text(kept))
+        ok = (all(x in body for x in kept) and "免责声明" not in body
+              and "版权归本公司所有" not in body and len(body) > 1200)
+        return ok, f"len={len(body)} kept={[x in body for x in kept]}"
+
+    def _b14_a20():
+        # ② 整行只有一个 URL -> 当残片删除; 同一夹具的正文句(带 URL)仍保留
+        kept = [_b14_f05_url_sent, _b14_f05_url_only]
+        lines, cut, trim = _b14_f05_trim(kept)
+        body = pdf_clean(_b14_f05_text(kept))
+        ok = (cut < len(lines) and trim == cut - 1
+              and _b14_f05_url_only in lines[trim:cut]
+              and _b14_f05_url_sent in lines[:trim]
+              and _b14_f05_url_only not in body and _b14_f05_url_sent in body)
+        return ok, f"cut={cut} trim={trim} url_only_gone={_b14_f05_url_only not in body}"
+
+    def _b14_a21():
+        # ③ 正文句 + 行尾电话 (句中/句末两种形态) -> 整行保留
+        # (旧码 FRAG 命中子串 电话 -> 整行删)
+        kept = [_b14_f05_tel_sent, _b14_f05_tel_end]
+        body = pdf_clean(_b14_f05_text(kept))
+        ok = (all(x in body for x in kept) and "免责声明" not in body
+              and "版权归本公司所有" not in body)
+        return ok, f"len={len(body)} kept={[x in body for x in kept]}"
+
+    def _b14_a22():
+        # ④ 整行只有电话/邮编/门牌 -> 删除; 同一夹具的正文句(带电话)仍保留
+        kept = [_b14_f05_tel_sent, _b14_f05_post_only,
+                _b14_f05_addr_only, _b14_f05_tel_only]
+        lines, cut, trim = _b14_f05_trim(kept)
+        body = pdf_clean(_b14_f05_text(kept))
+        gone = [_b14_f05_tel_only not in body, _b14_f05_post_only not in body,
+                _b14_f05_addr_only not in body]
+        ok = (cut < len(lines) and trim == cut - 3 and all(gone)
+              and _b14_f05_tel_sent in body and _b14_f05_tel_sent in lines[:trim])
+        return ok, f"cut={cut} trim={trim} gone={gone}"
+
+    # ---- Batch 14 修复 F-06: 三个机制各自单点钉住 (B14-23..B14-25) ----
+    # 定向复验实测: 破坏「正文逃逸 / 行首锚定 / 网址整段匹配」任一机制, 上面 B14-19..22
+    # 仍 498 全绿 (三个机制互为冗余, 端到端断言只钉净效果). 下面三条各只钉一个机制,
+    # 且只在对应该机制的变异下变红 (B14-23<-X1 去逃逸, B14-24<-X2 去行首锚定,
+    # B14-25<-X3 网址改宽匹配) —— X1 正是 F-05 (正文误删) 的复发路径: 删掉逃逸逻辑,
+    # 下面 B14-23 必须红, 否则缺陷会静默回来.
+    _b14_f06_esc_url = "库存 3.2% www.mysteel.com"    # 逃逸「库存」-> 留; 去逃逸 -> URL 子串 -> 删
+    _b14_f06_esc_yoy = "同比 www.example.com"         # 逃逸「同比」-> 留
+    _b14_f06_edge = "www.mysteel.com 2026年11月港口调度数据一览已发布"  # 行首锚定 -> 删
+    _b14_f06_ref = "参考 www.mysteel.com"             # 网址整段 -> 剩余 <=10 字 -> 删
+
+    def _b14_a23():
+        # X1: 去掉正文逃逸 -> 两行都成了「整行基本就是 URL」-> 整行删
+        kept = [_b14_f06_esc_url, _b14_f06_esc_yoy]
+        lines, cut, trim = _b14_f05_trim(kept)
+        kept_in = all(x in lines[:trim] for x in kept)
+        ok = (cut < len(lines) and trim == cut and kept_in
+              and all(not _pdf_tail_frag(x) for x in kept))
+        return ok, f"cut={cut} trim={trim} kept={kept_in}"
+
+    def _b14_a24():
+        # X2: 去掉行首锚定 -> URL 开头但剩余正文 >10 字 -> 由删变留
+        kept = [_b14_f06_edge]
+        lines, cut, trim = _b14_f05_trim(kept)
+        body = pdf_clean(_b14_f05_text(kept))
+        ok = (cut < len(lines) and trim == cut - 1
+              and _b14_f06_edge in lines[trim:cut]
+              and _b14_f06_edge not in body)
+        return ok, f"cut={cut} trim={trim} gone={_b14_f06_edge not in body}"
+
+    def _b14_a25():
+        # X3: 网址改宽匹配 (只吃 www.) -> 剩余 ".mysteel.com" >10 字 -> 由删变留
+        kept = [_b14_f06_ref]
+        lines, cut, trim = _b14_f05_trim(kept)
+        ok = (cut < len(lines) and trim == cut - 1
+              and _b14_f06_ref in lines[trim:cut])
+        return ok, f"cut={cut} trim={trim} dropped={_b14_f06_ref in lines[trim:cut]}"
+
+    _b14_case("B14-13 护栏①: marker 在全文 ~30% 处 -> 不裁 (+ 表格行保留)", _b14_a13)
+    _b14_case("B14-14 护栏②: marker 前 <600 字 -> 不裁 (+ 表格行保留)", _b14_a14)
+    _b14_case("B14-15 护栏③: marker 后仍有「数据来源」正文特征 -> 不裁 (+ 表格行保留)", _b14_a15)
+    _b14_case("B14-16 护栏④: 标记起 4 行内 <2 处标记 -> 不裁 (+ 表格行保留)", _b14_a16)
+    _b14_case("B14-17 切点 = 标记行行首: 前半行正文完整保留 (+ 表格行保留)", _b14_a17)
+    _b14_case("B14-18 噪声抑制: 重复页脚/东财水印不作标记 -> 不裁 (+ 表格行保留)", _b14_a18)
+    _b14_case("B14-19 正文句+行尾 URL -> 整行保留 (残片锚定 F-05)", _b14_a19)
+    _b14_case("B14-20 整行只有一个 URL -> 删除, 同夹具正文句保留 (F-05)", _b14_a20)
+    _b14_case("B14-21 正文句+行尾电话 -> 整行保留 (残片锚定 F-05)", _b14_a21)
+    _b14_case("B14-22 整行只有电话/邮编/门牌 -> 删除, 同夹具正文句保留 (F-05)", _b14_a22)
+    _b14_case("B14-23 正文逃逸: 「库存/同比」短句+行尾 URL -> 整行保留 (F-06 X1)", _b14_a23)
+    _b14_case("B14-24 行首锚定: 行首 URL + 行内正文 -> 整行删除 (F-06 X2)", _b14_a24)
+    _b14_case("B14-25 网址整段匹配: 「参考 + 网址」-> 整行删除 (F-06 X3)", _b14_a25)
+
+    # ---- Batch 15: 渲染前对已入库 snippet 再跑一次尾部声明剔除 (纵深防御) ----
+    # 反例来源 (CTO 实测): 2026-11-10 15:14 抓取 / 15:42 推送的万联研报 (10784 字) 在 batch14
+    # 上线前就已写入队列 snippet, 尾部 196 字版权段 (「不得以任何形式翻版…」+ 三地地址 +
+    # www.wlzq.cn) 随全文分片原样推给了用户 —— 提取期的修复管不到已落盘的老条目,
+    # 故在渲染前再裁一次。下面 _b15_old_clean 复刻 batch14 之前的 pdf_clean (只做行过滤 +
+    # 空白归一, 不裁尾部声明), 用来构造「历史 snippet 真实形态」(单行扁平正文)。
+    _b15_dt = datetime.fromtimestamp(_B11_TS, TZ_CN)
+    _b15_decl = ("著作权", "保留一切", "不得以任何形式翻版", "版权所有",
+                 "万联证券研究所", "金地中心", "www.")
+
+    def _b15_old_clean(text):
+        rows = [s.strip() for s in (text or "").splitlines()]
+        rows = [s for s in rows if s and not PDF_TABLE.match(s) and not PDF_NUM.match(s)]
+        good = [s for s in rows if len(s) >= 10 and len(PDF_CJK.findall(s)) >= 6]
+        return re.sub(r"\s+", " ", " ".join(good or rows)).strip()
+
+    def _b15_item(snippet, ident="b15"):
+        return {"src": "东财研报", "ts": _B11_TS,
+                "text": "10 月进出口数据解读｜万联证券 · 2026-11-10",
+                "url": f"https://example.com/{ident}.pdf", "snippet": snippet,
+                "key": f"研究:东财研报:{ident}"}
+
+    _b15_raw = "\n".join([_b14_body] * 300 + _b14_wl_tail)
+    _b15_dirty = _b15_old_clean(_b15_raw)      # 历史/在队条目: 带万联 196 字版权段 (整段声明尾 ~900 字) 的单行正文
+    _b15_clean = pdf_clean(_b15_raw)           # batch14 上线后 pdf_text 的产物 (已裁)
+
+    def _b15_a01():
+        # 历史脏 snippet 走**完整渲染路径**: 尾部声明一个字符都不许出现在推送载荷里
+        parts = research_parts(_b15_item(_b15_dirty), _b15_dt)
+        joined = "".join(parts)
+        hits = [w for w in _b15_decl if w in joined]
+        ok = (not hits and joined.count(_b14_body) == 300
+              and all(u16(p) <= MSG_MAX for p in parts))
+        return ok, f"parts={len(parts)} hits={hits} body={joined.count(_b14_body)}"
+
+    def _b15_a02():
+        # 已干净 snippet: 缝隙逐字节不变, 分片与单条渲染都不丢字/不改字
+        it = _b15_item(_b15_clean)
+        parts = research_parts(it, _b15_dt)
+        n_expect = len(split_research_body(_b15_clean))   # 未受本批影响的切分器
+        short = "沪铜库存下降 3.2%，现货升水扩大。"
+        line = research_line(_b15_item(short, "b15s"), _b15_dt)
+        ok = (render_snippet(it) == it["snippet"]
+              and len(parts) == n_expect
+              and "".join(parts).count(_b14_body) == 300
+              and short in line
+              and render_snippet(_b15_item("")) == ""
+              and render_snippet(_b15_item("  摘要  ")) == "摘要")
+        return ok, f"seam={render_snippet(it) == it['snippet']} parts={len(parts)}/{n_expect}"
+
+    def _b15_a03():
+        # 幂等: trim(trim(x)) == trim(x); 且「已裁文本再裁」恒等于原串
+        xs = [_b15_dirty, _b15_clean, " ".join(_b14_wl_tail), _b14_body]
+        once = [pdf_tail_trim_text(x) for x in xs]
+        twice = [pdf_tail_trim_text(y) for y in once]
+        ok = (once == twice
+              and pdf_tail_trim_text(_b15_clean) == _b15_clean
+              and len(once[0]) >= 300 * len(_b14_body)
+              and not any(w in once[0] for w in _b15_decl))
+        return ok, f"idem={once == twice} lens={[len(y) for y in once]}"
+
+    def _b15_a04():
+        # 非研报渲染逐字节不变: 正文里带「免责声明/著作权/www.」也不许被裁,
+        # 且**伪造**的 snippet 字段在无 url 条目上完全不可达 (研报判据只有 url)
+        n = {"src": "财联社", "ts": _B11_TS,
+             "text": "沪铜夜盘上涨 1.2%，免责声明：著作权归原作者所有，详见 www.example.com。"}
+        bare = build_messages([n])[0][0]
+        forged = build_messages([{**n, "snippet": _b15_dirty}])[0][0]
+        ok = (forged == bare
+              and all(w in bare for w in ("免责声明", "著作权", "www."))
+              and callable(globals().get("pdf_tail_trim_text"))
+              and callable(globals().get("render_snippet")))
+        return ok, f"same={forged == bare} kept={all(w in bare for w in ('免责声明', '著作权', 'www.'))}"
+
+    def _b15_a05():
+        # 生产实测形态 (~10784 字正文 + 196 字尾): 末片不再以版权段收尾, 正文一字不丢,
+        # 分片数只许不变或少一片 (少的那片正是全版权片)
+        raw = "\n".join([_b14_body] * 307 + _b14_wl_tail)
+        snip = _b15_old_clean(raw)
+        parts = research_parts(_b15_item(snip, "b15prod"), _b15_dt)
+        joined = "".join(parts)
+        old_n = len(split_research_body(snip))
+        ok = (len(parts) >= 2 and old_n - 1 <= len(parts) <= old_n
+              and not any(w in joined for w in _b15_decl)
+              and joined.count(_b14_body) == 307
+              and all(u16(p) <= MSG_MAX for p in parts))
+        return ok, f"parts={len(parts)} old_n={old_n} body={joined.count(_b14_body)}"
+
+    def _b15_a06():
+        # 正文后段自带声明词 -> 渲染期不误裁 (F-01 回归锚). 旧夹具的「免责条款」只有 4 字,
+        # 被 _b15_old_clean 的 len>=10 过滤掉, 全文 0 个 marker -> 走快路径, 断言空转
+        # (F-02). 这里改用两条**正文句**承载 2 处标记, 相距 >12 段, 且其后不含正文特征词:
+        # confirm=None 会以第一处为裁切点丢掉后半段正文, confirm=12 的窗口内只有 1 处 ->
+        # 四护栏拒裁. 先断言 marker >= 2, 保证走的不是「无标记快路径」.
+        mid = "本文引用的第三方图表著作权归其原作者所有，本报告仅作研究参考。"
+        later = "本报告仅供机构投资者参考，不构成任何投资建议。"
+        plain = ("本节口径说明：进口关税按到岸价计征，与上一节测算一致。"
+                 "行业景气度仍将延续，供给侧改革持续深化，需求端边际改善。"
+                 "第三节对样本区间做了稳健性检验，结论与基准情形一致。"
+                 "上述判断基于公开资料整理，不构成对任何机构的操作建议。")
+        snip = _b15_old_clean("\n".join([_b14_body] * 30 + [mid] + [plain] * 4
+                                         + [later] + [plain] * 2))
+        markers = len(PDF_TAIL_MARKER.findall(snip))
+        out = render_snippet(_b15_item(snip))
+        ok = (markers >= 2 and out == snip
+              and pdf_tail_trim_text(snip) == snip
+              and "本节口径说明" in snip and "著作权" in snip and "本报告仅供" in snip)
+        return ok, f"len={len(snip)} markers={markers} kept={out == snip}"
+
+    def _b15_case(name, fn):
+        try:
+            ok, detail = fn()
+        except Exception as e:                       # noqa: BLE001 - 旧码缺符号 -> 本条红
+            ok, detail = False, f"{type(e).__name__}: {e}"
+        check(name, bool(ok), str(detail))
+
+    _b15_case("B15-01 历史脏 snippet: 渲染输出不含版权/地址/www 且正文 300 句全留", _b15_a01)
+    _b15_case("B15-02 干净 snippet: 缝隙与单条渲染逐字节不变", _b15_a02)
+    _b15_case("B15-03 幂等: trim(trim(x)) == trim(x) 且已裁文本再裁恒等", _b15_a03)
+    _b15_case("B15-04 非研报渲染逐字节不变 (正文含声明词/伪造 snippet 均不受影响)", _b15_a04)
+    _b15_case("B15-05 生产形态: 末片不再以版权段收尾, 正文不丢且分片数不增", _b15_a05)
+    _b15_case("B15-06 正文自带声明词: 渲染期不误裁 (护栏在文本层同样生效)", _b15_a06)
     print(f"selftest: {'PASS' if not fails else str(len(fails)) + ' FAILED: ' + ', '.join(fails)}")
     return 0 if not fails else 1
 
