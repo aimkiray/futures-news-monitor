@@ -49,7 +49,6 @@ import ast
 import difflib
 import email.utils
 import errno
-import fcntl
 import hashlib
 import json
 import math
@@ -74,6 +73,11 @@ from datetime import datetime, timedelta, timezone
 from http.client import IncompleteRead   # 不能 import http.client: 会被 def http() 覆盖
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+try:                                     # POSIX only: 单实例文件锁 (深审 R7); Windows 无 fcntl -> None,
+    import fcntl                         # import/离线测试可过, main 在 flock 调用点人话报错拒跑
+except ImportError:                      # (与下方 resource 同降级模式, POSIX 部署面不受影响)
+    fcntl = None
 
 try:                                     # POSIX only: pdftotext 子进程内存上限 (Batch 7 修复 A5)
     import resource
@@ -543,9 +547,11 @@ RESEARCH_INDUSTRY = [
 #   (见 filter_reason 第 5 步); 研报门没有「强品种短路」这层结构, 命中行业词就放行,
 #   所以权益/信用/分红口径的稿必须**硬否决**才拦得住 (实测: 基础化工ETF双周报 /
 #   农林牧渔基金持仓 / 港口信用风险 三条都能靠行业词过关, 而它们讲的是基金、债券与评级)。
+#   深审 R6 窄化: 「回购」->「股份回购/回购股份」 (「逆回购」是公开市场操作口径误杀),
+#   「持仓分析」->「机构持仓/北向持仓」 (「沪铜持仓分析」是品种口径误杀); 权益口径照拦。
 RESEARCH_DENY = [
-    "ETF", "基金持仓", "持仓分析", "信用风险", "债券",
-    "评级调整", "股东", "回购", "业绩预告", "分红", "股息",
+    "ETF", "基金持仓", "机构持仓", "北向持仓", "信用风险", "债券",
+    "评级调整", "股东", "股份回购", "回购股份", "业绩预告", "分红", "股息",
 ]
 
 # 全大写缩写需要词边界, 否则 PE 命中 APPLE / PP 命中 APP;
@@ -969,9 +975,11 @@ def read_items_archive() -> list[dict]:
 
     容错口径: 单行 JSON 解析失败的坏行跳过; 非法 UTF-8/IO 错在迭代中途抛出时
     返回「已读前缀」 (prefix-return, 不是整文件判废)——完整行保留, 撕裂/腐化
-    后缀留给 items_archive_append 的自愈截断收拾。
+    后缀留给 items_archive_append 的自愈截断收拾。跳过的坏行与截断丢弃的尾段
+    计数入日志 (深审 R1: 坏行不再静默消失)。
     """
     out: list[dict] = []
+    skipped = 0                                   # 不可解析行/非对象行计数
     try:
         with open(ITEMS_ARCHIVE, "r", encoding="utf-8") as fh:
             for line in fh:
@@ -980,14 +988,20 @@ def read_items_archive() -> list[dict]:
                     continue
                 try:
                     rec = json.loads(line)
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, RecursionError):
+                    skipped += 1                  # 病态嵌套 JSON 同坏行跳过 (:1065/:1088 同口径)
                     continue
                 if isinstance(rec, dict):
                     out.append(rec)
+                else:
+                    skipped += 1                  # 顶层非对象同样不算有效条目
     except FileNotFoundError:
         pass
     except (OSError, ValueError) as e:              # ValueError 含 UnicodeDecodeError: 非法 UTF-8 存档不崩栈
-        err(f"items 存档读取失败 {ITEMS_ARCHIVE.name}: {type(e).__name__}: {e}")
+        err(f"items 存档读取失败 {ITEMS_ARCHIVE.name}: {type(e).__name__}: {e} "
+            f"(已读前缀 {len(out)} 条保留, 其后整尾丢弃)")
+    if skipped:
+        log(f"items 存档读取: 跳过 {skipped} 行坏行/非对象行, 保留 {len(out)} 条")
     return out
 
 
@@ -1071,8 +1085,10 @@ def items_archive_append(new_items: list[dict]) -> int:
         old_lines.append(s)
         try:
             k = json.loads(s).get("key")
-        except (json.JSONDecodeError, AttributeError, RecursionError):
-            continue                                  # 坏行照原样保留, 仅不参与 key 集合
+        except (json.JSONDecodeError, ValueError, AttributeError, RecursionError):
+            continue                                  # 坏行照原样保留, 仅不参与 key 集合;
+                                                      # 裸 ValueError 补大整数 int() 位限溢出
+                                                      # (腐化行不再穿透崩轮, 与 :1065 同口径)
         if k:
             keys.add(str(k))
     rows: list[dict] = []
@@ -4469,6 +4485,32 @@ def digest_policy(conf: dict, opts: RunOpts, seen: dict,
         oldest_age=oldest_age, next_try=next_try)
 
 
+def _send_cap_notice(plan: DigestPlan, conf: dict, tk: str,
+                     ctx: RoundContext, send_ctx: SendContext) -> bool:
+    """触顶提示 (一日一次; 提示自身占 1 条日额度, 允许越过 DAILY_MSG_CAP).
+
+    cap_notified 已置真 -> 直接返回; 逐次闸门余量不够 -> 推迟下轮, cap_notified/msgs
+    两值不动; 否则当场发并把 msgs+1, 发送失败回滚两值并排 CAP_NOTICE_RETRY_S 后重试
+    (别每 120s 打一次, V1-P2-3a)。返回 False 仅当「发起发送且失败」
+    (已提示过/闸门推迟均算 True, 与既有 notice_ok 口径一致)。
+    """
+    if cap_notified_already(plan.day):
+        return True
+    if not send_time_ok(ctx):            # 逐次闸门: 触顶提示推迟, cap_notified/msgs 不动
+        log("今日触顶提示推迟到下一轮 (本轮再发会顶到 120s 上界)")
+        return True
+    plan.day["cap_notified"] = True
+    plan.day["msgs"] = int(plan.day.get("msgs") or 0) + 1
+    if send(f"⚠️ 今日快讯已达 {DAILY_MSG_CAP} 条上限, 新条目暂缓推送, "
+            f"明天 0 点恢复 (队列上限 {QUEUE_MAX} 条, 超出按最旧丢弃)", conf, tk):
+        return True
+    plan.day["cap_notified"] = False          # 没发出去就下轮再试
+    plan.day["msgs"] = to_int(plan.day.get("msgs")) - 1
+    plan.meta["next_try"] = plan.now_f + retry_gap(CAP_NOTICE_RETRY_S, send_ctx.retry_after)
+    err(f"触顶提示发送失败, {int(plan.meta['next_try'] - plan.now_f)}s 后重试")
+    return False
+
+
 def flush_round(conf: dict, opts: RunOpts, seen: dict,
                 plan: DigestPlan, tk: str, pending: list[str],
                 ctx: RoundContext, send_ctx: SendContext) -> int:
@@ -4495,19 +4537,8 @@ def flush_round(conf: dict, opts: RunOpts, seen: dict,
                   f"窗口已过, 但只有 {len(plan.queue)} 条 < {plan.digest_min_items} 条, "
                   f"最早一条 {plan.oldest_age / 60:.0f}/{plan.max_hold / 60:.0f} 分钟 (到点兜底发)"))))
         notice_ok = True
-        if plan.cap_hit and not cap_notified_already(plan.day):
-            if not send_time_ok(ctx):    # 逐次闸门: 触顶提示推迟, cap_notified/msgs 不动
-                log("今日触顶提示推迟到下一轮 (本轮再发会顶到 120s 上界)")
-            else:
-                plan.day["cap_notified"] = True
-                plan.day["msgs"] = int(plan.day.get("msgs") or 0) + 1
-                notice_ok = send(f"⚠️ 今日快讯已达 {DAILY_MSG_CAP} 条上限, 新条目暂缓推送, "
-                                 f"明天 0 点恢复 (队列上限 {QUEUE_MAX} 条, 超出按最旧丢弃)", conf, tk)
-                if not notice_ok:
-                    plan.day["cap_notified"] = False          # 没发出去就下轮再试
-                    plan.day["msgs"] = to_int(plan.day.get("msgs")) - 1
-                    plan.meta["next_try"] = plan.now_f + retry_gap(CAP_NOTICE_RETRY_S, send_ctx.retry_after)  # 别每 120s 打一次 (V1-P2-3a)
-                    err(f"触顶提示发送失败, {int(plan.meta['next_try'] - plan.now_f)}s 后重试")
+        if plan.cap_hit:
+            notice_ok = _send_cap_notice(plan, conf, tk, ctx, send_ctx)
         if plan.queue_dirty and not save_queue(plan.queue):
             err("队列落盘失败, 下轮可能重复入队")
             queue_save_ok = False
@@ -4560,6 +4591,16 @@ def flush_round(conf: dict, opts: RunOpts, seen: dict,
             deferred = True
             log(f"第 {idx}/{len(msgs)} 批发送推迟到下一轮 "
                 f"(再发会顶到 {SEND_GATE_S}s 上界), 已送达 {len(sent)} 条")
+            break
+        if (not opts.force_flush
+                and to_int(plan.day.get("msgs")) + sent_msgs >= DAILY_MSG_CAP):
+            # 深审 R5 逐条日上限闸: cap_hit 只在轮首判定一次, 单轮内分片/补发可越过
+            # 上限; 触顶即停发 (deferred 非失败, 剩余条目留队下轮补, 不老化)。
+            # 触顶提示自身占 1 条额度, break 前仍照常尝试发 (下轮 cap_hit 分支兜底)。
+            deferred = True
+            _send_cap_notice(plan, conf, tk, ctx, send_ctx)
+            log(f"今日通知已达 {DAILY_MSG_CAP} 条上限, 第 {idx}/{len(msgs)} 批起 "
+                f"推迟到下一轮 (本轮已发 {sent_msgs} 条)")
             break
         if not send(text, conf, tk):
             failed = True
@@ -4782,6 +4823,10 @@ def main() -> int:
     rotate_log()
 
     # 单实例锁: 防止 launchd 上一轮未结束又起一轮 -> 重复推送
+    if fcntl is None:                            # 深审 R7: 无 flock 平台 (Windows) fail-loud 拒跑,
+        err("本平台无 fcntl/flock, 单实例锁不可用, 本轮不跑")   # 不静默放行 (双实例会重复推送)
+        print("本平台无 fcntl/flock, 单实例锁不可用 (POSIX 部署面不受影响)")
+        return 7                                 # 7 = 锁面不可用 (与锁文件不可写同族)
     LOCK.parent.mkdir(parents=True, exist_ok=True)
     try:
         lock_fh = open(LOCK, "w")
@@ -11203,8 +11248,8 @@ target="_blank">石脑油市场早间提示（20261109）</a>
           and hit("港口行业2026年三季度信用风险回顾及四季度展望——多节点摩擦下的港口韧性 航运港口",
                   PRODUCT_WORDS + RESEARCH_INDUSTRY),
           research_gate_reason("港口行业2026年三季度信用风险回顾及四季度展望——多节点摩擦下的港口韧性", "航运港口"))
-    check("B16-35 研报否决表卫生: 11 条/无子串冗余/不误杀 11 条保留样本",
-          len(RESEARCH_DENY) == 11 and len(set(RESEARCH_DENY)) == 11
+    check("B16-35 研报否决表卫生: 13 条/无子串冗余/不误杀 11 条保留样本",
+          len(RESEARCH_DENY) == 13 and len(set(RESEARCH_DENY)) == 13
           and all(not [v for v in RESEARCH_DENY if v != w and w in v] for w in RESEARCH_DENY)
           and all(not hit(f"{_t} {_ind}", RESEARCH_DENY) for _t, _ind in _b16_keep)
           and not (set(RESEARCH_DENY) & set(RESEARCH_INDUSTRY)),
@@ -11224,6 +11269,22 @@ target="_blank">石脑油市场早间提示（20261109）</a>
           and _b16_em_got == ["煤炭行业周报：动力煤价止跌企稳｜某证券 · 2026-11-11"]
           and len(_b16_official) == 5 and all(_b16_official_reasons),
           _b16_em_err or f"em={_b16_em_got} official={_b16_official_reasons}")
+    # 深审 R6 钉: 否决表窄化 —— 「逆回购/沪铜持仓分析」在旧表 (回购/持仓分析) 下误杀,
+    # 新表放行; 「股份回购/回购股份/机构持仓/北向持仓」权益口径仍硬拦。
+    check("B16-38 否决表窄化 (深审 R6): 逆回购/沪铜持仓分析放行, 权益口径仍拦",
+          research_gate_reason("沪铜持仓分析：铜价重心上移，多头氛围渐浓", "") == ""
+          and not research_gate_reason("央行公开市场逆回购操作跟踪", "").startswith("研报否决")
+          and research_gate_reason("上市公司股份回购进展公告点评", "") == "研报否决:股份回购"
+          and research_gate_reason("某公司回购股份方案点评", "") == "研报否决:回购股份"
+          and research_gate_reason("煤炭开采机构持仓变动点评", "煤炭开采") == "研报否决:机构持仓"
+          and research_gate_reason("有色金属北向持仓周报", "有色金属") == "研报否决:北向持仓",
+          " / ".join(research_gate_reason(t, i) for t, i in
+                     [("沪铜持仓分析：铜价重心上移，多头氛围渐浓", ""),
+                      ("央行公开市场逆回购操作跟踪", ""),
+                      ("上市公司股份回购进展公告点评", ""),
+                      ("某公司回购股份方案点评", ""),
+                      ("煤炭开采机构持仓变动点评", "煤炭开采"),
+                      ("有色金属北向持仓周报", "有色金属")]))
 
     # ==== Batch 18: 日上限 160 的边界行为 (只读离线; 旧码 cap=80 时 B18-01/02 必红) ====
     def _b18_cap_round(msgs: int):
@@ -11255,10 +11316,37 @@ target="_blank">石脑油市场早间提示（20261109）</a>
           and int((_b18_s2.get("_day") or {}).get("msgs") or 0) == 161
           and len(_b18_q2) == 4,
           f"rc={_b18_r2} n={len(_b18_p2)} day={_b18_s2.get('_day')} q={len(_b18_q2)}")
+    # 深审 R5 钉: 逐条 cap 闸 —— cap_hit 只在轮首判定, 旧码 msgs=159 时一篇 3 片研报
+    # 整轮发完越顶 163; 新码发 1 片+触顶提示即闸 (提示自身占额度), 余量留队下轮补.
+    with tempfile.TemporaryDirectory() as _td:
+        _clk = _B6Clock(1793800000)
+        _b18_mid_q = [{"src": "S0", "ts": int(_clk.time()) - 60,
+                       "text": "煤炭行业周报：动力煤价止跌企稳｜某证券 · 2026-11-11",
+                       "key": "b18-mid",
+                       "url": "https://example.com/r/b18",
+                       "snippet": "动力煤现货价格环比上涨，坑口库存持续下降。" * 300}]
+        _b18_r3, _b18_p3, _b18_s3, _b18_q3, _ = _b6_run_main(
+            Path(_td), _clk,
+            [("S0", lambda deadline=None: [
+                {"src": "S0", "ts": int(_clk.time()) - 60,
+                 "text": "沪铜库存变化9吨环比9%"}])],
+            conf_extra={"digest_min_items": 1},
+            state={"seedmarker": 1,
+                   "_day": {"date": datetime.now(TZ_CN).strftime("%Y-%m-%d"),
+                            "msgs": DAILY_MSG_CAP - 1},
+                   "_digest": {"last_flush": 1793800000 - 31 * 60}},
+            queue_raw=json.dumps({"items": _b18_mid_q, "ts": 1793800000},
+                                 ensure_ascii=False))
+    check("B18-03 逐条 cap 闸 (深审 R5): msgs=159 一轮内再发 1 条即触顶, 提示照发且余量留队",
+          _b18_r3 == 0 and len(_b18_p3) == 2 and "上限" in _b18_p3[1]
+          and int((_b18_s3.get("_day") or {}).get("msgs") or 0) == 161
+          and len(_b18_q3) == 2,
+          f"rc={_b18_r3} n={len(_b18_p3)} day={_b18_s3.get('_day')} q={len(_b18_q3)}")
 
     # ==== Batch 17: 内嵌真实 PDF 样本 / 缺工具显式 SKIP ====
     # 旧码 (batch16, 00be299) 样本缺失时打桩仍 ok; B17-01/02/03/04 在旧码上均红.
-    _B17_TOTAL = 552                         # 544 (Batch 16 实测) + 6 (B17-01..06) + 2 (B18-01..02) = 552
+    _B17_TOTAL = 554                         # 544 (Batch 16 实测) + 6 (B17-01..06) + 2 (B18-01..02)
+                                             # + 1 (B16-38 深审 R6) + 1 (B18-03 深审 R5) = 554
     _B17_COUNTER_ENV = "FUTNEWS_SELFTEST_COUNTER_PROBE"
 
     def _b17_a01():

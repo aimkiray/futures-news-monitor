@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """items 存档契约测试 — spec-fnm-source-tg-notify §3.11 / T-31 / T-32 + --dump-items。
 
-stdlib-only, Windows/POSIX 通用。monitor.py 顶层 `import fcntl` 为 POSIX 硬依赖
-(部署目标 macOS launchd), 测试导入前向 sys.modules 注入最小 stub, 不改生产面。
+stdlib-only, Windows/POSIX 通用。monitor.py 顶层 `import fcntl` 历史上是 POSIX 硬依赖
+(部署目标 macOS launchd), 测试导入前向 sys.modules 注入最小 stub, 不改生产面;
+深审 R7 后 fcntl 缺席降级为 None, stub 保留无害 (POSIX 面行为不变)。
 直接运行: python tests/test_items_archive.py
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -451,6 +454,120 @@ class TestDumpItems(_ArchiveCase):
         finally:
             sys.argv = old
         self.assertEqual(rc, 2)
+
+
+class TestDeepReviewFixes(_ArchiveCase):
+    """深审必修批回归钉 (R1/R2 存档异常面 / R3 merge 守卫 / R4 cp936 / R7 fcntl 降级)。"""
+
+    def test_r1_read_recursion_and_bad_lines_skipped_counted(self):
+        """R1: 病态嵌套行 (RecursionError)/非对象行/语法坏行逐条跳过并计数入日志,
+        完整前缀照常返回——旧码 RecursionError 穿透崩溃。"""
+        good = json.dumps(_item("k1"), ensure_ascii=False)
+        deep = "[" * 3000 + "]" * 3000                      # json.loads -> RecursionError
+        nonobj = json.dumps([1, 2, 3])                      # 合法 JSON 但顶层非 dict
+        garbage = "{not json"                               # JSONDecodeError
+        self.arch.write_text("\n".join([good, deep, nonobj, garbage, good]) + "\n",
+                             encoding="utf-8")
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            items = monitor.read_items_archive()
+        self.assertEqual([i["key"] for i in items], ["k1", "k1"])
+        self.assertIn("跳过 3 行", buf.getvalue())          # 计数入日志: 不再静默丢行
+
+    def test_r2_append_huge_int_corrupt_line_no_crash(self):
+        """R2: 大整数腐化行 (json.loads -> 裸 ValueError int() 位限溢出) 不再穿透崩
+        items_archive_append: 行照原样保留、不参与 key 集合, 新条目正常落档。"""
+        huge = '{"key": ' + "9" * 5000 + ', "ts": 1, "text": "x"}'
+        self.arch.write_text(huge + "\n", encoding="utf-8")
+        n = monitor.items_archive_append([_item("k9")])
+        self.assertEqual(n, 1)
+        lines = self._lines()
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(lines[0], huge)                    # 腐化行原样留存 (轮转底账)
+        self.assertEqual(json.loads(lines[1])["key"], "k9")
+
+    def test_r3_merge_non_dict_analysis_element_no_crash(self):
+        """R3: analyses 含非对象元素 -> validate_chunk 已记 error;
+        覆盖/查重循环跳过它, 汇总报错退 1 而非 AttributeError 崩溃。"""
+        spec = importlib.util.spec_from_file_location(
+            "merge_research_reports", ROOT / "merge_research_reports.py")
+        mm = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mm)
+        d = Path(self._td.name)
+        raw = d / "research-raw.json"
+        adir = d / "analysis"
+        adir.mkdir()
+        raw.write_text(json.dumps(
+            {"items": [{"record_key": "k1", "tight": True}],
+             "counts": {"unique_items": 1}}, ensure_ascii=False), encoding="utf-8")
+        (adir / "chunk-001.json").write_text(json.dumps(
+            {"schema_version": "1.0", "chunk": "001",
+             "analyses": ["oops", {"infoCode": "k1"}]}, ensure_ascii=False),
+            encoding="utf-8")
+        saved = {k: getattr(mm, k) for k in ("RAW_PATH", "ANALYSIS_DIR", "OUT_PATH")}
+        try:
+            mm.RAW_PATH, mm.ANALYSIS_DIR = raw, adir
+            mm.OUT_PATH = d / "out.json"
+            errbuf = io.StringIO()
+            with contextlib.redirect_stderr(errbuf):
+                rc = mm.main()
+        finally:
+            for k, v in saved.items():
+                setattr(mm, k, v)
+        self.assertEqual(rc, 1)
+        self.assertIn("not a JSON object", errbuf.getvalue())
+        self.assertFalse((d / "out.json").exists())
+
+    def test_r4_cp936_stdout_no_unicode_encode_error(self):
+        """R4: cp936 控制台下打印含 emoji 的统计行不再 UnicodeEncodeError 假败
+        (stdout reconfigure utf-8/errors=replace)。"""
+        spec = importlib.util.spec_from_file_location(
+            "extract_telegram", ROOT / "extract_telegram.py")
+        et = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(et)
+        d = Path(self._td.name)
+        src = d / "result.json"
+        src.write_text(json.dumps({"messages": [
+            {"id": 1, "type": "message", "date": "2026-07-29T20:54:58",
+             "from": "u", "text": "🚨沪铜库存变化1吨环比1%"},
+        ]}, ensure_ascii=False), encoding="utf-8")
+        fake_out = io.TextIOWrapper(io.BytesIO(), encoding="cp936")
+        old_out, old_argv = sys.stdout, sys.argv
+        try:
+            sys.stdout = fake_out                             # cp936 终端: emoji 必炸
+            sys.argv = ["extract_telegram.py", "--input", str(src),
+                        "--out-dir", str(d), "--sample", "1"]
+            rc = et.main()
+        finally:
+            sys.stdout = old_out
+            sys.argv = old_argv
+        self.assertEqual(rc, 0)
+        self.assertTrue((d / "futures-news.json").exists())
+
+    def test_r7_fcntl_absent_main_refuses_round(self):
+        """R7: fcntl 缺席平台 -> import 不崩 (符号为 None), main 在锁点人话报错
+        rc=7 拒跑——fail-loud, 不静默放行双实例。"""
+        self.assertTrue(hasattr(monitor, "fcntl"))
+        d = Path(self._td.name)
+        saved = {"fcntl": monitor.fcntl}
+        saved.update({k: getattr(monitor, k) for k in ("CONF", "LOCK", "LOG", "ERRLOG")})
+        old_argv = sys.argv
+        errbuf = io.StringIO()
+        try:
+            monitor.fcntl = None
+            monitor.CONF = d / "conf.json"
+            monitor.LOCK = d / "lock"
+            monitor.LOG = d / "out.log"
+            monitor.ERRLOG = d / "err.log"
+            sys.argv = ["monitor.py"]
+            with contextlib.redirect_stderr(errbuf):
+                rc = monitor.main()
+        finally:
+            for k, v in saved.items():
+                setattr(monitor, k, v)
+            sys.argv = old_argv
+        self.assertEqual(rc, 7)
+        self.assertIn("fcntl", errbuf.getvalue())
 
 
 if __name__ == "__main__":

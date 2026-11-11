@@ -86,6 +86,12 @@ def write_atomic(path: Path, content: str) -> None:
 
 
 def main() -> int:
+    try:                                      # cp936 控制台打印中文防 UnicodeEncodeError 假败
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:                         # 管道/测试桩无 reconfigure 时不致命 (merge:144 同款)
+        pass
+
     ap = argparse.ArgumentParser(description="Telegram 导出 JSON -> 期货相关消息提取")
     ap.add_argument("--input", required=True, help="Telegram Desktop 导出的 result.json")
     ap.add_argument("--out-dir", default="", help="输出目录 (缺省=输入文件所在目录)")

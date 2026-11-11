@@ -183,6 +183,8 @@ def main():
             continue
         chunks.append((p, d))
         for a in d["analyses"]:
+            if not isinstance(a, dict):
+                continue                    # 非对象元素已被 validate_chunk 记 error, 不参与覆盖/查重
             ic = a.get("infoCode")
             if not isinstance(ic, str):
                 continue
