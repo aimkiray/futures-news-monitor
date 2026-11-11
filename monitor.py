@@ -188,6 +188,110 @@ PDFTOTEXT = (os.environ.get("FUTNEWS_PDFTOTEXT")
              or next((p for p in ("/opt/homebrew/bin/pdftotext", "/usr/local/bin/pdftotext")
                       if os.path.exists(p)), ""))
 
+# [canonical] Batch 17: selftest 真实 PDF 样本 (4,079B 合成, base64 内嵌). 不依赖 tests/fixtures/;
+# 运行期解码到 tempfile, 用完删除; FUTNEWS_SAMPLE_PDF 仍优先, 可覆盖为外部真实 PDF.
+PDF_SAMPLE_B64 = (
+    "JVBERi0xLjQKJeLjz9MKMSAwIG9iago8PCAvVHlwZSAvRm9udCAvU3VidHlwZSAvQ0lERm9udFR5cGUwIC9CYXNlRm9udCAv"
+    "U1RTb25nLUxpZ2h0IC9DSURTeXN0ZW1JbmZvIDw8IC9SZWdpc3RyeSAoQWRvYmUpIC9PcmRlcmluZyAoR0IxKSAvU3VwcGxl"
+    "bWVudCA0ID4+ID4+CmVuZG9iagoyIDAgb2JqCjw8IC9UeXBlIC9Gb250IC9TdWJ0eXBlIC9UeXBlMCAvQmFzZUZvbnQgL1NU"
+    "U29uZy1MaWdodCAvRW5jb2RpbmcgL1VuaUdCLVVDUzItSCAvRGVzY2VuZGFudEZvbnRzIFsxIDAgUl0gPj4KZW5kb2JqCjMg"
+    "MCBvYmoKPDwgL1R5cGUgL0ZvbnQgL1N1YnR5cGUgL1R5cGUxIC9CYXNlRm9udCAvSGVsdmV0aWNhIC9FbmNvZGluZyAvV2lu"
+    "QW5zaUVuY29kaW5nID4+CmVuZG9iago0IDAgb2JqCjw8IC9MZW5ndGggMzcxIC9GaWx0ZXIgL0ZsYXRlRGVjb2RlID4+CnN0"
+    "cmVhbQp42u2SO4qeMQxF+1mF6zSRrZcFw4AfUpXyW0JIkf0vIPI/Q7KIuDAYfK17JZ35lO9RS63l+VUqludHQSkqUJ6fb+9G"
+    "o/dOi7wOcjCegtIGK0zrc1EErJdmE4kbpMa1y+q7dSboVnclD5WOKYaqA5FxbQ608zf1Uxw7NwCuqn2OxsisOELmJmE05k4I"
+    "0Iz20jVdNUJxQnootwG8nftGUw/6KM/v8nx7exeESkGeZx8jrlMy9GLsTfoCCvc0q9xq425+Ch3dMThGFDbVt/WYZkKcQUTT"
+    "8CvINm5bDbN+HeyGPLmrZzb3fZrKP5++HkMnV87WRBk44BVYsStLXpD06P4F5xhnyqYAsqiRr53JLdvLpXwG6DqHegajke9D"
+    "ra7gBcFOfIrmvPbXZtppmFsz2UNO02zwGSwXIJxlh4e0CqJtCbcQsvoaSOA4Xn+DXRQuCheFi8JF4aJwUbgoXBQuCheFi8JF"
+    "4aJwUbgo/G8o+PMHOdFV/wplbmRzdHJlYW0KZW5kb2JqCjUgMCBvYmoKPDwgL0xlbmd0aCAzNzIgL0ZpbHRlciAvRmxhdGVE"
+    "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"
+    "Ualp9LGSaMdC6ifoxOi1MQV8sS7MAmFqIAkYrfsi2sibfp2s6koHuG+4u93eM8qInjkpN2SKoiwkno+4aV5Lrfz3j9Kco8Q5"
+    "Y5x1btxhZWYWQ4ra0YdcWLS0KwL7FMUYlikmRiiLdLWU2TZ5/RVzbeVmstFutBvtf9K+uV9RcodDCmVuZHN0cmVhbQplbmRv"
+    "YmoKMTAgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAxNiAwIFIgL01lZGlhQm94IFswIDAgNjEyIDc5Ml0gL1Jlc291"
+    "cmNlcyA8PCAvRm9udCA8PCAvRjEgMiAwIFIgPj4gPj4gL0NvbnRlbnRzIDQgMCBSID4+CmVuZG9iagoxMSAwIG9iago8PCAv"
+    "VHlwZSAvUGFnZSAvUGFyZW50IDE2IDAgUiAvTWVkaWFCb3ggWzAgMCA2MTIgNzkyXSAvUmVzb3VyY2VzIDw8IC9Gb250IDw8"
+    "IC9GMSAyIDAgUiA+PiA+PiAvQ29udGVudHMgNSAwIFIgPj4KZW5kb2JqCjEyIDAgb2JqCjw8IC9UeXBlIC9QYWdlIC9QYXJl"
+    "bnQgMTYgMCBSIC9NZWRpYUJveCBbMCAwIDYxMiA3OTJdIC9SZXNvdXJjZXMgPDwgL0ZvbnQgPDwgL0YxIDIgMCBSID4+ID4+"
+    "IC9Db250ZW50cyA2IDAgUiA+PgplbmRvYmoKMTMgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAxNiAwIFIgL01lZGlh"
+    "Qm94IFswIDAgNjEyIDc5Ml0gL1Jlc291cmNlcyA8PCAvRm9udCA8PCAvRjEgMiAwIFIgPj4gPj4gL0NvbnRlbnRzIDcgMCBS"
+    "ID4+CmVuZG9iagoxNCAwIG9iago8PCAvVHlwZSAvUGFnZSAvUGFyZW50IDE2IDAgUiAvTWVkaWFCb3ggWzAgMCA2MTIgNzky"
+    "XSAvUmVzb3VyY2VzIDw8IC9Gb250IDw8IC9GMSAzIDAgUiA+PiA+PiAvQ29udGVudHMgOCAwIFIgPj4KZW5kb2JqCjE1IDAg"
+    "b2JqCjw8IC9UeXBlIC9QYWdlIC9QYXJlbnQgMTYgMCBSIC9NZWRpYUJveCBbMCAwIDYxMiA3OTJdIC9SZXNvdXJjZXMgPDwg"
+    "L0ZvbnQgPDwgL0YxIDMgMCBSID4+ID4+IC9Db250ZW50cyA5IDAgUiA+PgplbmRvYmoKMTYgMCBvYmoKPDwgL1R5cGUgL1Bh"
+    "Z2VzIC9LaWRzIFsxMCAwIFIgMTEgMCBSIDEyIDAgUiAxMyAwIFIgMTQgMCBSIDE1IDAgUl0gL0NvdW50IDYgPj4KZW5kb2Jq"
+    "CjE3IDAgb2JqCjw8IC9UeXBlIC9DYXRhbG9nIC9QYWdlcyAxNiAwIFIgPj4KZW5kb2JqCnhyZWYKMCAxOAowMDAwMDAwMDAw"
+    "IDY1NTM1IGYgCjAwMDAwMDAwMTUgMDAwMDAgbiAKMDAwMDAwMDE2NCAwMDAwMCBuIAowMDAwMDAwMjg2IDAwMDAwIG4gCjAw"
+    "MDAwMDAzODMgMDAwMDAgbiAKMDAwMDAwMDgyNiAwMDAwMCBuIAowMDAwMDAxMjcwIDAwMDAwIG4gCjAwMDAwMDE3MTMgMDAw"
+    "MDAgbiAKMDAwMDAwMjE1NiAwMDAwMCBuIAowMDAwMDAyNDU0IDAwMDAwIG4gCjAwMDAwMDI3MzkgMDAwMDAgbiAKMDAwMDAw"
+    "Mjg2NyAwMDAwMCBuIAowMDAwMDAyOTk1IDAwMDAwIG4gCjAwMDAwMDMxMjMgMDAwMDAgbiAKMDAwMDAwMzI1MSAwMDAwMCBu"
+    "IAowMDAwMDAzMzc5IDAwMDAwIG4gCjAwMDAwMDM1MDcgMDAwMDAgbiAKMDAwMDAwMzYwMSAwMDAwMCBuIAp0cmFpbGVyCjw8"
+    "IC9TaXplIDE4IC9Sb290IDE3IDAgUiA+PgpzdGFydHhyZWYKMzY1MgolJUVPRgo="
+)
+
+SELFTEST_SAMPLE_ENV = "FUTNEWS_SAMPLE_PDF"
+SELFTEST_NESTED_ENV = "FUTNEWS_SELFTEST_NESTED"
+
+
+def _embedded_sample_path() -> Path:
+    import base64
+    import tempfile
+    data = base64.b64decode(PDF_SAMPLE_B64, validate=True)
+    fd, name = tempfile.mkstemp(prefix="fnm-selftest-", suffix=".pdf")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+    except BaseException:
+        try:
+            os.unlink(name)
+        except OSError:
+            pass
+        raise
+    return Path(name)
+
+
+def _selftest_sample_pdf() -> tuple[str, str, Path | None]:
+    """定位 selftest 真实 PDF 样本, 返回 (state, source, path).
+
+    state: ok | bad. 显式 env 指向缺失路径 = bad (配置错误必须红);
+    内嵌样本 base64 解码/落盘失败 = bad (样本损坏必须红).
+    source: env | embedded. 内嵌样本每次调用落一个 temp 文件, 调用方负责删除.
+    """
+    raw = os.environ.get(SELFTEST_SAMPLE_ENV, "").strip()
+    if raw:
+        path = Path(raw).expanduser()
+        try:
+            exists = path.is_file()
+        except OSError:
+            exists = False
+        return ("ok" if exists else "bad"), "env", path
+    try:
+        return "ok", "embedded", _embedded_sample_path()
+    except Exception:
+        return "bad", "embedded", None
+
+
 ROUND_HARD_S = 120                   # launchd StartInterval 硬上界(秒): 单轮总耗时不得超过
 ROUND_MARGIN_S = 6                   # 本地阶段(锁/落盘/过滤)余量(秒)
 SEND_GATE_S = ROUND_HARD_S - ROUND_MARGIN_S   # 发送预算硬顶(秒): 闸门与软截止的唯一派生源
@@ -4767,11 +4871,12 @@ def main() -> int:
 def selftest() -> int:
     """回归用例: F-01 去重签名 / F-10 大盘噪声 / F-11 日历 / F-16 漏报词表 / F-21 可单测."""
     fails: list[str] = []
+    oks: list[str] = []
+    skips: list[str] = []
 
     def check(name: str, cond: bool, detail: str = "") -> None:
         print(f"{'ok ' if cond else 'BAD'} {name}{(' -> ' + detail) if not cond else ''}")
-        if not cond:
-            fails.append(name)
+        (oks if cond else fails).append(name)
 
     # ---- F-01: 签名必须同时保留实义标题与正文
     k1 = dedupe_key("【钢联数据快讯】螺纹钢库存环比减少12万吨")
@@ -8487,11 +8592,20 @@ def selftest() -> int:
         return _C()
 
 
+    class _B11Skip:
+        def __init__(self, reason: str):
+            self.reason = reason
+
     def _b11_case(name: str, fn) -> None:
         try:
-            ok, detail = fn()
+            res = fn()
         except Exception as e:                       # noqa: BLE001 - 旧码缺符号 -> 本条红
-            ok, detail = False, f"{type(e).__name__}: {e}"
+            res = (False, f"{type(e).__name__}: {e}")
+        if isinstance(res, _B11Skip):
+            print(f"SKIP {name} -> {res.reason}")
+            skips.append(name)
+            return
+        ok, detail = res
         check(name, bool(ok), str(detail))
 
 
@@ -8670,35 +8784,42 @@ def selftest() -> int:
 
 
     def _b11_a04():
-        g = globals()
-        run0, http0, bin0 = subprocess.run, g["http"], g["PDFTOTEXT"]
-        # 真 PDF 走环境变量 FUTNEWS_SAMPLE_PDF, 未设置则走下方打桩分支 (离线可跑)
-        _pdf_env = os.environ.get("FUTNEWS_SAMPLE_PDF", "")
-        pdf = Path(_pdf_env or "/nonexistent/futures-news-sample.pdf")
-        mode = "real-file"
+        """内嵌/外部真实 PDF 样本走真 pdftotext; 缺工具显式 SKIP, 绝不打桩冒充 ok (Batch 17)."""
+        state, source, pdf = _selftest_sample_pdf()
+        if state == "bad":
+            reason = "env-missing" if source == "env" else "embed-decode-failed"
+            return (False, f"state=bad reason={reason} source={source} path={pdf}")
         try:
-            if not (pdf.exists() and bin0 and os.path.exists(bin0)):   # 离线兜底: 打桩 pdftotext
-                mode = "stub-text"
+            bin0 = globals()["PDFTOTEXT"]
+            if not bin0 or not os.path.exists(bin0):
+                return _B11Skip(f"state=skip reason=pdftotext-missing PDFTOTEXT={bin0!r}")
+            g = globals()
+            http0, run0 = g["http"], subprocess.run
+            calls: list[list] = []
 
-                class _R:
-                    returncode = 0
-                    stdout = ("钨行业三季报点评，钨资源与硬质合金价格企稳反弹，"
-                              "硬质合金及刀具公司季度营收环比改善。" * 100).encode()
+            def _counting_run(cmd, **kw):
+                calls.append(list(cmd))
+                return run0(cmd, **kw)
 
-                def _run(cmd, **kw):
-                    return _R()
-
-                g["http"] = lambda *a, **k: b"%PDF-1.4\n"
-                g["PDFTOTEXT"] = sys.executable
-                subprocess.run = _run
-            else:
+            try:
                 g["http"] = lambda *a, **k: pdf.read_bytes()
-            out = pdf_text("https://pdf.dfcfw.com/pdf/H3_AP202611091831546847_1.pdf")
+                subprocess.run = _counting_run
+                out = pdf_text("https://pdf.dfcfw.com/pdf/H3_AP202611091831546847_1.pdf")
+            finally:
+                subprocess.run = run0
+                g["http"] = http0
+            real_calls = [c for c in calls if c and c[0] == bin0]
+            ok = (isinstance(out, str) and 3000 < len(out) <= SNIPPET_MAX
+                  and len(real_calls) >= 1)
+            return (ok, f"state={'ok' if ok else 'bad'} mode=real-file source={source} "
+                        f"path={pdf} pdftotext_calls={len(real_calls)} "
+                        f"len={len(out) if isinstance(out, str) else out}")
         finally:
-            subprocess.run = run0
-            g["http"], g["PDFTOTEXT"] = http0, bin0
-        ok = isinstance(out, str) and 3000 < len(out) <= SNIPPET_MAX
-        return (ok, f"mode={mode} len={len(out) if isinstance(out, str) else out}")
+            if source == "embedded" and pdf is not None:
+                try:
+                    pdf.unlink()
+                except OSError:
+                    pass
 
 
     def _b11_a05():
@@ -8989,7 +9110,7 @@ def selftest() -> int:
     _b11_case("B11-01 存储上限与解析上限的常量关系", _b11_a01)
     _b11_case("B11-02 PDF 页数上限 32 且真传给 pdftotext", _b11_a02)
     _b11_case("B11-03 snip_truncate 未超限逐字节 / 超限带标记且不超上限", _b11_a03)
-    _b11_case("B11-04 pdf_text 全文入库 (真实东财 PDF / 离线兜底)", _b11_a04)
+    _b11_case("B11-04 pdf_text 全文入库 (内嵌真实 PDF 样本; 缺工具显式 SKIP 不冒充 ok)", _b11_a04)
     _b11_case("B11-05 分片无损 + 片内预算", _b11_a05)
     _b11_case("B11-06 句末优先 + 最小填充 (防碎片)", _b11_a06)
     _b11_case("B11-07 单片路径与今日逐字节相同", _b11_a07)
@@ -11104,6 +11225,176 @@ target="_blank">石脑油市场早间提示（20261109）</a>
           and len(_b16_official) == 5 and all(_b16_official_reasons),
           _b16_em_err or f"em={_b16_em_got} official={_b16_official_reasons}")
 
+    # ==== Batch 17: 内嵌真实 PDF 样本 / 缺工具显式 SKIP ====
+    # 旧码 (batch16, 00be299) 样本缺失时打桩仍 ok; B17-01/02/03/04 在旧码上均红.
+    _B17_TOTAL = 550                         # 548 (Batch 17 前) + B17-05/06 计数断言
+    _B17_COUNTER_ENV = "FUTNEWS_SELFTEST_COUNTER_PROBE"
+
+    def _b17_a01():
+        if os.environ.get(SELFTEST_NESTED_ENV):
+            res = _b11_a04()
+            if isinstance(res, _B11Skip):
+                return res
+            ok, detail = res
+            m = re.search(r"pdftotext_calls=(\d+)", detail)
+            return (ok and "mode=real-file" in detail and "source=embedded" in detail
+                    and bool(m) and int(m.group(1)) >= 1,
+                    f"nested-embedded: {detail}")
+        bin0 = globals()["PDFTOTEXT"]
+        if not bin0 or not os.path.exists(bin0):
+            return _B11Skip(f"state=skip reason=pdftotext-missing PDFTOTEXT={bin0!r}")
+        with tempfile.TemporaryDirectory(prefix="fnm-b17-clean-") as td:
+            dst = Path(td) / "monitor.py"
+            dst.write_bytes(Path(__file__).read_bytes())
+            env = dict(os.environ)
+            env.pop(SELFTEST_SAMPLE_ENV, None)
+            env[SELFTEST_NESTED_ENV] = "1"
+            env[_B17_COUNTER_ENV] = "1"
+            try:
+                r = subprocess.run(
+                    [sys.executable, "-B", str(dst), "--selftest"],
+                    cwd=td, env=env, capture_output=True,
+                    encoding="utf-8", errors="replace", timeout=30)
+            except Exception as e:
+                return (False, f"clean-dir spawn failed: {type(e).__name__}: {e}")
+        out = r.stdout or ""
+        err = r.stderr or ""
+        lines = [ln for ln in out.splitlines() if ln.strip()]
+        tail = lines[-3:]
+        ok = (r.returncode == 0
+              and f"selftest: {_B17_TOTAL} ok / 0 skip / 0 BAD" in out
+              and bool(lines) and lines[-1] == "selftest: PASS"
+              and any(ln.startswith("ok  B11-04") for ln in lines)
+              and not any(ln.startswith("SKIP ") for ln in lines))
+        return (ok, f"clean-dir rc={r.returncode} tail={tail} stderr={err[-120:]!r}")
+
+    def _b17_a02():
+        env0 = os.environ.get(SELFTEST_SAMPLE_ENV)
+        tmp = _embedded_sample_path()
+        try:
+            os.environ[SELFTEST_SAMPLE_ENV] = str(tmp)
+            bin0 = globals()["PDFTOTEXT"]
+            if not bin0 or not os.path.exists(bin0):
+                state, source, path = _selftest_sample_pdf()
+                return (state == "ok" and source == "env" and path == tmp,
+                        f"env-override(tool-missing): state={state} source={source} path={path}")
+            res = _b11_a04()
+            if isinstance(res, _B11Skip):
+                return (False, f"env 覆盖被 SKIP: {res.reason}")
+            ok, detail = res
+            m = re.search(r"pdftotext_calls=(\d+)", detail)
+            return (ok and "mode=real-file" in detail and "source=env" in detail
+                    and str(tmp) in detail and bool(m) and int(m.group(1)) >= 1,
+                    f"env-override: {detail}")
+        finally:
+            if env0 is None:
+                os.environ.pop(SELFTEST_SAMPLE_ENV, None)
+            else:
+                os.environ[SELFTEST_SAMPLE_ENV] = env0
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+    def _b17_a03():
+        env0 = os.environ.get(SELFTEST_SAMPLE_ENV)
+        b64_0 = PDF_SAMPLE_B64
+        try:
+            os.environ[SELFTEST_SAMPLE_ENV] = "/nonexistent/b17-env-sample.pdf"
+            res = _b11_a04()
+            if isinstance(res, _B11Skip):
+                return (False, f"env 显式缺失却 SKIP: {res.reason}")
+            ok1, detail1 = res
+            os.environ.pop(SELFTEST_SAMPLE_ENV, None)
+            globals()["PDF_SAMPLE_B64"] = "!!!not-base64!!!"
+            res2 = _b11_a04()
+            if isinstance(res2, _B11Skip):
+                return (False, f"内嵌样本损坏却 SKIP: {res2.reason}")
+            ok2, detail2 = res2
+            return (not ok1 and "state=bad" in detail1 and "env-missing" in detail1
+                    and not ok2 and "state=bad" in detail2 and "embed-decode-failed" in detail2,
+                    f"env-bad={detail1} | decode-bad={detail2}")
+        finally:
+            globals()["PDF_SAMPLE_B64"] = b64_0
+            if env0 is None:
+                os.environ.pop(SELFTEST_SAMPLE_ENV, None)
+            else:
+                os.environ[SELFTEST_SAMPLE_ENV] = env0
+
+    def _b17_a04():
+        env0 = os.environ.get(SELFTEST_SAMPLE_ENV)
+        bin0 = globals()["PDFTOTEXT"]
+        try:
+            os.environ.pop(SELFTEST_SAMPLE_ENV, None)
+            globals()["PDFTOTEXT"] = "/nonexistent/b17-pdftotext"
+            res = _b11_a04()
+        finally:
+            globals()["PDFTOTEXT"] = bin0
+            if env0 is None:
+                os.environ.pop(SELFTEST_SAMPLE_ENV, None)
+            else:
+                os.environ[SELFTEST_SAMPLE_ENV] = env0
+        if isinstance(res, _B11Skip):
+            return ("pdftotext-missing" in res.reason, f"tool-missing: {res.reason}")
+        if isinstance(res, tuple) and len(res) == 2 and not res[0] and "state=bad" in str(res[1]):
+            return (False, f"sample-bad before tool probe: {res[1]}")   # F-02: 不误归因为缺工具
+        return (False, f"缺 pdftotext 却未 SKIP: {res!r}")
+
+    def _b17_a05():
+        """缺工具子进程: 计数恒等式 + skip 不计入 ok (F-01 回归护栏)."""
+        if os.environ.get(_B17_COUNTER_ENV):
+            return (True, "counter-probe: nested guard")   # 探针自身 / B17-01 子进程不再递归
+        env = dict(os.environ)
+        env.pop(SELFTEST_SAMPLE_ENV, None)
+        env.pop(SELFTEST_NESTED_ENV, None)
+        env["FUTNEWS_PDFTOTEXT"] = "/nonexistent/b17-counter-pdftotext"
+        env[_B17_COUNTER_ENV] = "1"
+        try:
+            with tempfile.TemporaryDirectory(prefix="fnm-b17-counter-") as td:
+                dst = Path(td) / "monitor.py"
+                dst.write_bytes(Path(os.path.abspath(__file__)).read_bytes())
+                r = subprocess.run(
+                    [sys.executable, "-B", str(dst), "--selftest"],
+                    cwd=td, env=env, capture_output=True,
+                    encoding="utf-8", errors="replace", timeout=60)
+        except Exception as e:
+            return (False, f"counter-probe spawn failed: {type(e).__name__}: {e}")
+        out = r.stdout or ""
+        lines = [ln for ln in out.splitlines() if ln.strip()]
+        m = re.search(r"^selftest: (\d+) ok / (\d+) skip / (\d+) BAD$", out, re.M)
+        if not m:
+            return (False, f"counter-probe summary missing: rc={r.returncode} tail={lines[-3:]}")
+        ok_n, skip_n, bad_n = (int(x) for x in m.groups())
+        p_ok = sum(1 for ln in lines if ln.startswith("ok  "))
+        p_skip = sum(1 for ln in lines if ln.startswith("SKIP "))
+        p_bad = sum(1 for ln in lines if ln.startswith("BAD "))
+        total = ok_n + skip_n + bad_n
+        printed = p_ok + p_skip + p_bad
+        cond = (skip_n >= 1
+                and ok_n == _B17_TOTAL - skip_n - bad_n
+                and total == _B17_TOTAL
+                and printed == _B17_TOTAL
+                and p_ok == ok_n and p_skip == skip_n and p_bad == bad_n)
+        return (cond, f"counter-probe rc={r.returncode} summary=({ok_n}ok/{skip_n}skip/{bad_n}bad) "
+                      f"total={total} printed=({p_ok}ok/{p_skip}skip/{p_bad}bad) "
+                      f"expected={_B17_TOTAL} tail={lines[-2:]}")
+
+    def _b17_a06():
+        """顶层计数恒等式: 每条断言恰好落进 ok/skip/bad 之一, 总数 == 断言总数."""
+        recorded = len(oks) + len(skips) + len(fails)
+        unique = len(set(oks) | set(skips) | set(fails))
+        cond = (recorded + 1 == _B17_TOTAL and unique + 1 == _B17_TOTAL)
+        return (cond, f"counter-invariant recorded={recorded}+1 unique={unique}+1 "
+                      f"expected={_B17_TOTAL}")
+
+    _b11_case(f"B17-01 单文件临时目录 (无 tests/fixtures) 内嵌样本 -> 子 selftest {_B17_TOTAL} ok", _b17_a01)
+    _b11_case("B17-02 FUTNEWS_SAMPLE_PDF 覆盖内嵌样本 -> source=env 真跑", _b17_a02)
+    _b11_case("B17-03 FUTNEWS_SAMPLE_PDF 缺失 / 内嵌样本解码失败 -> 红", _b17_a03)
+    _b11_case("B17-04 缺 pdftotext -> 显式 SKIP (不冒充 ok)", _b17_a04)
+    _b11_case("B17-05 缺工具子进程 -> skip>=1 且 ok==total-skip-bad / 计数恒等", _b17_a05)
+    _b11_case("B17-06 顶层计数恒等: ok+skip+bad == 断言总数", _b17_a06)
+
+    print(f"selftest: {len(oks)} ok / {len(skips)} skip / {len(fails)} BAD")
     print(f"selftest: {'PASS' if not fails else str(len(fails)) + ' FAILED: ' + ', '.join(fails)}")
     return 0 if not fails else 1
 

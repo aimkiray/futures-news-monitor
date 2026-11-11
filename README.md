@@ -198,7 +198,7 @@ launchd 定时任务由使用者自行创建，推荐 `StartInterval` 设为 120
 ## 测试
 
 ```bash
-python3 monitor.py --selftest    # 内嵌断言回归（476 条）
+python3 monitor.py --selftest    # 内嵌断言回归（550 条）
 python3 tests/sim.py             # 23 个行为场景（临时目录，不碰真实状态）
 python3 tests/probe2.py          # 69 条语料判定回归
 python3 tests/probe4.py          # 词表边界正反例
@@ -207,6 +207,22 @@ python3 tests/golden.py --check  # 31 个确定性场景的行为等价基线
 ```
 
 测试全部离线运行，使用临时目录隔离状态，不会发送真实消息。
+
+### selftest 的真实 PDF 样本
+
+`--selftest` 里的 PDF 全文解析断言（B11-04）跑的是**真实 PDF**，不是打桩：
+
+- 样本以 base64 内嵌在 `monitor.py`（4,079B 的合成 PDF，6 页、含中文正文），运行期解码到临时文件，
+  断言结束在 `finally` 里删除——**单文件**即可自测，不依赖 `tests/fixtures/` 或任何外部夹具。
+- `FUTNEWS_SAMPLE_PDF=/path/to/sample.pdf` 可覆盖成外部真 PDF，优先级高于内嵌样本。
+- `pdftotext` 默认在 `/opt/homebrew/bin`、`/usr/local/bin` 探测，可用 `FUTNEWS_PDFTOTEXT` 指定路径。
+
+缺少 `pdftotext` 时这条断言**显式打印 `SKIP` 并单独计数**，不计入 ok，其余断言照跑；环境变量指向的样本
+不存在、内嵌样本解码失败、解析失败（含 `pdftotext` 报错或取不到正文）一律判红。summary 行因此是三段式
+`selftest: <ok> ok / <skip> skip / <BAD> BAD`，`ok + skip + BAD` 恒等于断言总数。
+
+设计原则：**测试跑不了必须说出来，不能显示通过**——样本或工具缺失只降级为 `SKIP` 并单独计数，
+不允许用打桩结果冒充 `ok`；需要真解析的断言宁可红，也不静默放过。
 
 ### 行为等价基线
 
