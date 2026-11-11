@@ -1,0 +1,1 @@
+{"seedmarker": 1, "_digest": {"last_flush": 1793800000.0, "last_round": 1793806600.0, "block_acc": 0.0}, "_day": {"date": "2026-11-04", "msgs": 0}, "_src_fail": {"财联社": {"rounds": 12, "since": 1793800000, "last_err": "RuntimeError: boom", "pend": false, "last_sent": 1793806600, "alerts": 2}}, "_research": {"东财研报": 1793805400, "中金所": 1793805400, "中期协": 1793805400}}

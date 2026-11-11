@@ -1,0 +1,2 @@
+{"method": "sendMessage", "payload": {"chat_id": 1, "disable_web_page_preview": "true", "parse_mode": "HTML", "text": "⚠️ 快讯源「财联社」已连续失败 6 轮: RuntimeError: boom"}, "proxy": "", "timeout": 8}
+{"method": "sendMessage", "payload": {"chat_id": 1, "disable_web_page_preview": "true", "parse_mode": "HTML", "text": "✅ 快讯源「财联社」已恢复 (此前连续失败 7 轮)"}, "proxy": "", "timeout": 8}

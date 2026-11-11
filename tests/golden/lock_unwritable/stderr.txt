@@ -1,0 +1,1 @@
+[<TS>] 锁文件不可写, 本轮不跑: IsADirectoryError: [Errno 21] Is a directory: '<TMP>/state/lock' (<TMP>/state/lock)
