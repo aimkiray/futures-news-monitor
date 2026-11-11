@@ -3,3 +3,4 @@ __pycache__/
 *.bak
 *.new
 deploy.log
+research-reports.json
