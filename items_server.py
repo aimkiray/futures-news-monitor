@@ -249,7 +249,8 @@ class _Handler(BaseHTTPRequestHandler):
             if self.command == "HEAD":           # HEAD 响应禁带体; Content-Length 头仍如实保留
                 return
             self.wfile.write(body)
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionAbortedError,
+                ConnectionResetError, TimeoutError):
             _log(f"客户端断连, 响应未写完 ({self.client_address[0]})")   # F8: 单行收容, 不刷 traceback
 
     def _send_tg_error(self, code: int, desc: str) -> None:
