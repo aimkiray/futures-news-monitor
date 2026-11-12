@@ -272,6 +272,7 @@ python3 tests/golden.py --check --scenario proxy_leg    # 只跑单个场景（�
 - `GET /bot/items` + `Authorization: Bearer <token>` → 同上（bearer 形，token 不进 URL/进程表）
 - 存档缺席或为空 → `200 {"schema":1,"items":[]}`（不是 404）
 - 错误一律 TG 包络形：`401 unauthorized` / `404 not found` / `405 method not allowed`
+- 存档在但读径坏（中道 `OSError`/`UnicodeDecodeError`）→ `503 archive read error`（TG 包络，区别于 `FileNotFoundError`/meta 闸的 200 空档；消费端按 `HTTPError` fail-closed，非鉴权问题）
 - 请求日志中 token 段一律掩码为字面 `/bot<token>/items`；token 永不进日志/响应体
 
 ### 配置（`~/.pi/agent/etc/futures-news.json` 同档）
