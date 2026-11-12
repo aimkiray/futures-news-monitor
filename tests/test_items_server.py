@@ -316,6 +316,65 @@ class _ServerCase(unittest.TestCase):
         self.assertRegex(logs, r"\[20\d\d-\d\d-\d\d \d\d:\d\d:\d\d\]")
         self.assertNotRegex(logs, r"\[\d{2}/[A-Z][a-z]{2}/20\d\d")
 
+    # ---- fnm-obs R3 钉: 存档在但读径坏 -> 503 显形 (不再吞成 200 与真空窗同形) ----
+    def test_r3_1_midread_oserror_503(self):
+        """R3-1: 文件在且已读 1 条后迭代中道炸 OSError -> 503 + TG 包络
+        {"ok":false,"error_code":503,"description":"archive read error"};
+        旧径吞异常回 200+已读前缀, CTB 侧与真空窗同形 (本钉即断此同形)。"""
+
+        class _BoomFile:                                 # 中道败桩: 出一条真行再炸 OSError
+            def __init__(self):
+                self._it = iter(['{"src":"s","ts":1,"text":"x","key":"k1","schema":1}\n'])
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                try:
+                    return next(self._it)
+                except StopIteration:
+                    raise OSError("simulated mid-read failure")
+
+        self._write_archive([{"src": "s", "ts": 1, "text": "x", "key": "k1"}])
+        self.assertTrue(self.arch.is_file())             # 文件在 (缺席径见 R3-2)
+        with mock.patch("builtins.open", return_value=_BoomFile()):
+            code, obj = self._get(f"/bot{TOKEN}/items")
+        self.assertEqual(503, code)
+        self.assertEqual({"ok": False, "error_code": 503,
+                          "description": "archive read error"}, obj)   # 包络精确形, 无 items 键
+
+    def test_r3_1b_midread_decode_error_503(self):
+        """R3-1 补: 存档混非法 UTF-8 字节, 迭代 decode 中道炸 UnicodeDecodeError
+        (ValueError 子类) -> 同 503 包络 (真实坏字节, 非 mock)。"""
+        self.arch.write_bytes(
+            b'{"src":"s","ts":1,"text":"x","key":"k1"}\n\xff\xfe bad bytes\n')
+        code, obj = self._get(f"/bot{TOKEN}/items")
+        self.assertEqual(503, code)
+        self.assertEqual({"ok": False, "error_code": 503,
+                          "description": "archive read error"}, obj)
+
+    def test_r3_2_filenotfound_200_empty(self):
+        """R3-2: FileNotFoundError (存档缺席) -> 200 items:[] 零差分保留 (合法空)."""
+        self.assertFalse(self.arch.exists())
+        code, obj = self._get(f"/bot{TOKEN}/items")
+        self.assertEqual(200, code)
+        self.assertEqual({"schema": 1, "items": []}, obj)
+
+    def test_r3_3_meta_gate_200_empty(self):
+        """R3-3: 文件在但 meta 闸 schema 不符 -> 200 items:[] 零差分保留
+        (fail-closed 空档是合法语义, 不升 503)。"""
+        self._write_archive([{"src": "s", "ts": 1, "text": "x", "key": "k"}])
+        self.meta.write_text('{"schema": 2}', encoding="utf-8")
+        code, obj = self._get(f"/bot{TOKEN}/items")
+        self.assertEqual(200, code)
+        self.assertEqual({"schema": 1, "items": []}, obj)
+
 
 class _TokenGateCase(unittest.TestCase):
     """FS-11: token 两者皆无 -> 启动即退 3 + stderr fail-loud (不监听端口)."""

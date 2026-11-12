@@ -11,6 +11,8 @@
   401  {"ok":false,"error_code":401,"description":"unauthorized"}
   404  {"ok":false,"error_code":404,"description":"not found"}
   405  {"ok":false,"error_code":405,"description":"method not allowed"}
+  503  {"ok":false,"error_code":503,"description":"archive read error"}
+       (存档在但读径坏——显形上报, 不吞成 200 与真空窗同形; spec-fnm-obs R3)
 
 凭据: token 只从环境变量 FNM_ITEMS_TOKEN 或 ~/.pi/agent/etc/futures-news.json 的
       items_token 字段读取 (env 优先); 两者皆无 -> stderr fail-loud + exit 3
@@ -27,6 +29,7 @@
       futures-news-monitor.py, 非合法模块标识符, 自重读才是可部署形态)。
       meta 旁路闸: .meta.json 为 dict 且 schema 键明示 != 1 -> 空档 (fail-closed);
       meta 缺席/坏 JSON/无 schema 键 -> 不阻断 (行内 schema 自足, 写侧才是真源)。
+      读径坏 (文件在但 open/迭代 OSError 或 decode 错) -> 503, 不吃前缀装空档。
 
 服务模型: ThreadingHTTPServer 单进程多线程, launchd KeepAlive 保活;
       请求日志中 /bot<...>/items 的 token 段一律掩码为 /bot<token>/items。
@@ -183,11 +186,17 @@ def _load_meta():
         return None
 
 
+class _ArchiveReadError(Exception):
+    """内部哨兵: 存档在但读径坏 (open/迭代 OSError 或 decode 错) ——
+    _read_items 抛出, do_GET 捕之回 503 TG 包络; 读径坏显形, 不吞成
+    200 前缀/空档与真空窗同形 (spec-fnm-obs R3, CTB 侧经 HTTPError 衔接)。"""
+
+
 def _read_items() -> list[dict]:
     """每请求现读 JSONL 存档 (与 monitor.read_items_archive 同口径, 不 import monitor).
 
     逐行解析: 坏行/非对象行跳过计数入日志; 文件缺席 -> [];
-    非法 UTF-8/IO 错 -> 已读前缀保留 (不是整文件判废)。
+    非法 UTF-8/IO 错 -> 抛 _ArchiveReadError (本请求 503, 已读前缀随整尾丢弃)。
     meta 闸: meta 为 dict 且显含 schema 键且 != ITEMS_SCHEMA -> [] (fail-closed);
     其余 meta 形态不阻断 (monitor 写侧每次追加都自愈 meta, 缺席=陈旧非不兼容)。
     """
@@ -220,7 +229,8 @@ def _read_items() -> list[dict]:
         _log("items 存档缺席, 按空档响应")          # F3: 缺席才记一行, 远端可分辨真空窗 vs 读径坏
     except (OSError, ValueError) as e:              # ValueError 含 UnicodeDecodeError
         _err(f"items 存档读取失败 {ITEMS_ARCHIVE.name}: {type(e).__name__}: {e} "
-             f"(已读前缀 {len(out)} 条保留, 其后整尾丢弃)")
+             f"(已读前缀 {len(out)} 条随整尾丢弃, 本请求 503 显形)")  # R3: 读径坏不回前缀
+        raise _ArchiveReadError(f"{type(e).__name__}: {e}") from e
     if skipped:
         _log(f"items 存档读取: 跳过 {skipped} 行坏行/非对象行, 保留 {len(out)} 条")
     return out
@@ -277,7 +287,13 @@ class _Handler(BaseHTTPRequestHandler):
         if token != self.server.items_token:
             self._send_tg_error(401, "unauthorized")
             return
-        self._send_json(200, {"schema": ITEMS_SCHEMA, "items": _read_items()})
+        try:
+            items = _read_items()
+        except _ArchiveReadError:
+            # R3: 读径坏显形——503 TG 包络, 不回 200 前缀/空档与真空窗同形
+            self._send_tg_error(503, "archive read error")
+            return
+        self._send_json(200, {"schema": ITEMS_SCHEMA, "items": items})
 
     def _m405(self) -> None:
         self._send_tg_error(405, "method not allowed")
