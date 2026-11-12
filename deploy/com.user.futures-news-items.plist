@@ -13,8 +13,7 @@
     <string>com.user.futures-news-items</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/env</string>
-        <string>python3</string>
+        <string>/Users/meow/.hermes/hermes-agent/venv/bin/python</string>
         <string>/Users/meow/.pi/agent/bin/futures-news-items.py</string>
     </array>
     <key>RunAtLoad</key>
