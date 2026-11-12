@@ -995,9 +995,9 @@ def read_items_archive() -> list[dict]:
                     continue
                 try:
                     rec = json.loads(line)
-                except (json.JSONDecodeError, RecursionError):
-                    skipped += 1                  # 病态嵌套 JSON 同坏行跳过 (:1065/:1088 同口径)
-                    continue
+                except (json.JSONDecodeError, RecursionError, ValueError):
+                    skipped += 1                  # 病态嵌套/超位大整数行同坏行跳过 (:1065/:1088 同口径);
+                    continue                      # 裸 ValueError (>4300 位 int 字面量) 不穿外层丢整尾
                 if isinstance(rec, dict):
                     out.append(rec)
                 else:
@@ -3402,7 +3402,11 @@ def discover_chat_id(conf: dict, tk: str) -> int | None:
             chat = (upd.get("message") or upd.get("channel_post") or {}).get("chat") or {}
             if chat.get("id"):
                 conf["chat_id"] = int(chat["id"])
-                save_json(CONF, conf)
+                fresh = load_json(CONF, {})             # 回写前重读: 启动时 conf 被宽容读成 {}
+                if not isinstance(fresh, dict):         # (坏 JSON) 或盘中另有 items_* 键时, 只合
+                    fresh = {}                           # chat_id 一键再写——不再连带清掉
+                fresh["chat_id"] = conf["chat_id"]       # items_token/items_bind/items_port/
+                save_json(CONF, fresh)                   # items_cidrs/token (F4)
                 return conf["chat_id"]
     except Exception as e:
         log(f"getUpdates failed: {e}")
@@ -4171,6 +4175,25 @@ class DigestPlan:
     next_try: float = 0.0
 
 
+# F5: CLI 旗标白名单——任何 --xxx 形未列的参 fail-loud 拒跑 (exit 2),
+# --collect=x / 拼错旗标不再静默落入正常模式带 TG 出站.
+# --selftest 实际在 __main__ 先行拦截, 列入仅为清单完整性 (load_conf 永远看不到它);
+# --dump-items 在 main 早退于 load_conf 之前, 列入同理 + 兼容等号形 --dump-items=PATH.
+ARGS_KNOWN = frozenset({
+    "--dry-run", "--seed", "--all", "--limit", "--stats", "--explain",
+    "--flush-now", "--queue", "--selftest", "--dump-items", "--collect",
+})
+
+
+def _check_cli_args(args: list[str]) -> None:
+    """未知 --xxx 参 -> stderr fail-loud + exit 2 (F5); 只回显旗标名 (= 后值永不入日志)."""
+    for a in args:
+        if a.startswith("--") and a not in ARGS_KNOWN \
+                and not a.startswith("--dump-items="):
+            err(f"未知参数 {a.split('=', 1)[0]}: 不在旗标白名单, 本轮拒跑 (exit 2)")
+            sys.exit(2)
+
+
 def load_conf(args: list[str]) -> tuple[dict, RunOpts]:
     """解析 CLI 与 conf (R2 阶段 1). 只读 CONF, 不写 CFG、不加锁、不读 state.
 
@@ -4178,6 +4201,7 @@ def load_conf(args: list[str]) -> tuple[dict, RunOpts]:
     重装配 —— FLAGS(参数开关) -> CFGPARSE(conf 派生) -> BUDGET(预算). 三段都只读
     args / CONF, 因此一次解析完再交给 main 做 CFG 注入 / 加锁 / 读 state, 行为不变.
     """
+    _check_cli_args(args)                            # F5: 未知旗标 fail-loud, 不静默放行
     # 检视模式 (--stats / --queue) 一律按 dry 语义: 不发送、零落盘、rc=0 (Batch 9 D-D-03 / U4-F-01/F-02)
     # 变量名 inspect 与标准库 inspect 模块同名 (历史命名): 本函数内不引用该模块,
     # 该布尔值原样进入 RunOpts.inspect (字段名沿用规格 canonical 命名).

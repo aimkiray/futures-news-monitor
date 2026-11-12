@@ -238,6 +238,84 @@ class _ServerCase(unittest.TestCase):
         self.assertEqual(404, code)
         self.assertEqual({"ok": False, "error_code": 404, "description": "not found"}, obj)
 
+    # ---- 四轨深审必修钉 (读面侧 F1/F2/F3/F7/F9) ----
+    def test_f1_handler_socket_timeout_set(self):
+        """F1 slowloris: setup() 后 request socket settimeout(REQ_TIMEOUT_S)——
+        白名单内 connect-not-send 客户端不再无限占线程。"""
+        self.assertEqual(30, items_server.REQ_TIMEOUT_S)        # 钉住规格常量
+        seen = {}
+
+        class _Probe(items_server._Handler):
+            def setup(self):
+                super().setup()
+                seen["timeout"] = self.request.gettimeout()
+
+        with mock.patch.object(items_server, "_Handler", _Probe):
+            srv = items_server._ItemsServer(
+                ("127.0.0.1", 0), TOKEN, items_server._parse_cidrs(None))
+        try:
+            th = threading.Thread(target=srv.serve_forever, daemon=True)
+            th.start()
+            conn = http.client.HTTPConnection(
+                "127.0.0.1", srv.server_address[1], timeout=5)
+            try:
+                conn.request("GET", f"/bot{TOKEN}/items")
+                self.assertEqual(200, conn.getresponse().status)
+            finally:
+                conn.close()
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            th.join(timeout=5)
+        self.assertEqual(items_server.REQ_TIMEOUT_S, seen.get("timeout"))
+
+    def test_f2_poison_hugeint_line_no_tail_drop(self):
+        """F2 毒行截尾: >4300 位整数字面量行 json.loads 抛裸 ValueError——旧码
+        穿透内层进外层 -> 该行起整尾丢; 现按坏行跳过, 其后行照常读到。"""
+        good1 = {"src": "s", "ts": 1, "text": "a", "key": "k1", "schema": 1}
+        good2 = {"src": "s", "ts": 2, "text": "b", "key": "k2", "schema": 1}
+        huge = '{"key": ' + "9" * 5000 + ', "ts": 1, "text": "x"}'
+        self.arch.write_text(
+            json.dumps(good1) + "\n" + huge + "\n" + json.dumps(good2) + "\n",
+            encoding="utf-8")
+        code, obj = self._get(f"/bot{TOKEN}/items")
+        self.assertEqual(200, code)
+        self.assertEqual(["k1", "k2"], [i["key"] for i in obj["items"]])
+
+    def test_f3_absent_archive_logged(self):
+        """F3: 存档缺席按空档响应且记一行 _log——远端可分辨真空窗 vs 读径坏。"""
+        self.assertFalse(self.arch.exists())
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code, obj = self._get(f"/bot{TOKEN}/items")
+        self.assertEqual(200, code)
+        self.assertEqual([], obj["items"])
+        self.assertIn("items 存档缺席", buf.getvalue())
+
+    def test_f7_read_cap_truncates(self):
+        """F7 读界: 超 ITEMS_READ_MAX 行截断 + _err 记档 (腐化巨型档不内存放大)。"""
+        self.assertEqual(20000, items_server.ITEMS_READ_MAX)    # 钉住规格常量
+        self._write_archive([
+            {"src": "s", "ts": i, "text": "x", "key": f"k{i}", "schema": 1}
+            for i in range(5)])
+        obuf, sbuf = io.StringIO(), io.StringIO()
+        with mock.patch.object(items_server, "ITEMS_READ_MAX", 3), \
+                contextlib.redirect_stdout(obuf), contextlib.redirect_stderr(sbuf):
+            code, obj = self._get(f"/bot{TOKEN}/items")
+        self.assertEqual(200, code)
+        self.assertEqual(3, len(obj["items"]))
+        self.assertIn("超行数帽", obuf.getvalue() + sbuf.getvalue())
+
+    def test_f9_log_timestamp_tz_cn_format(self):
+        """F9: 请求日志时间戳改 TZ_CN 形 [YYYY-MM-DD HH:MM:SS] (与 _log/_err
+        同口径), 不再 GMT 的 [12/Nov/2026 ...] Apache 形。"""
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            self._get(f"/bot{TOKEN}/items")
+        logs = buf.getvalue()
+        self.assertRegex(logs, r"\[20\d\d-\d\d-\d\d \d\d:\d\d:\d\d\]")
+        self.assertNotRegex(logs, r"\[\d{2}/[A-Z][a-z]{2}/20\d\d")
+
 
 class _TokenGateCase(unittest.TestCase):
     """FS-11: token 两者皆无 -> 启动即退 3 + stderr fail-loud (不监听端口)."""
@@ -357,6 +435,50 @@ class _MainAndUnitCase(unittest.TestCase):
             self.assertEqual([], srv.cidrs)
         finally:
             srv.server_close()
+
+    # ---- 四轨深审必修钉 (单元素 F6/F8) ----
+    def test_f6_bad_conf_logged_absent_silent(self):
+        """F6: conf 文件在但坏 JSON/非 dict -> _err 记档 + {}; 缺席仍静默 (正常拓扑)."""
+        with tempfile.TemporaryDirectory() as td:
+            conf = Path(td) / "conf.json"
+            saved = items_server.CONF
+            items_server.CONF = conf
+            try:
+                sbuf, obuf = io.StringIO(), io.StringIO()     # 缺席: 静默 {}
+                with contextlib.redirect_stderr(sbuf), \
+                        contextlib.redirect_stdout(obuf):
+                    self.assertEqual({}, items_server._load_conf())
+                self.assertEqual("", sbuf.getvalue() + obuf.getvalue())
+                for bad in ("{not json", "[1,2]"):            # 坏 JSON / 非 dict: 记档 + {}
+                    conf.write_text(bad, encoding="utf-8")
+                    sbuf, obuf = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stderr(sbuf), \
+                            contextlib.redirect_stdout(obuf):
+                        self.assertEqual({}, items_server._load_conf())
+                    self.assertIn("conf 不可解析", sbuf.getvalue() + obuf.getvalue(), bad)
+            finally:
+                items_server.CONF = saved
+
+    def test_f8_client_abort_contained_no_traceback(self):
+        """F8 断连收容: wfile.write BrokenPipe/ConnectionReset -> 单行 _log,
+        不再每段刷 traceback (客户端 abort 是常态, 不是故障)."""
+
+        class _DeadWfile:
+            def write(self, _b):
+                raise BrokenPipeError(32, "simulated client abort")
+
+        h = items_server._Handler.__new__(items_server._Handler)
+        h.request_version = "HTTP/1.1"
+        h.requestline = "GET /bot<token>/items HTTP/1.1"
+        h.command = "GET"
+        h.client_address = ("127.0.0.1", 0)
+        h.wfile = _DeadWfile()
+        sbuf, obuf = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stderr(sbuf), contextlib.redirect_stdout(obuf):
+            h._send_json(200, {"schema": 1, "items": []})      # 不得抛
+        out = sbuf.getvalue() + obuf.getvalue()
+        self.assertIn("断连", out)
+        self.assertNotIn("Traceback", out)
 
 
 if __name__ == "__main__":

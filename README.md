@@ -297,6 +297,18 @@ cp deploy/com.user.futures-news-items.plist ~/Library/LaunchAgents/
 launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.user.futures-news-items.plist
 ```
 
+已 bootstrap 之后更新 `items_server.py` 不会自动生效——launchd 常驻进程仍跑旧码，
+必须手动重启服务：
+
+```bash
+launchctl kickstart -k gui/$UID/com.user.futures-news-items
+```
+
+**解释器路径耦合**：plist 的 `ProgramArguments` 写死 venv 解释器
+（`/Users/meow/.hermes/hermes-agent/venv/bin/python`，与 monitor 服务同一 venv），不是
+PATH 里的 `python3`——venv 迁移/重建后必须同步改 plist 并重新 bootstrap（或 kickstart -k），
+否则服务起不来或跑错解释器。
+
 stdout/stderr 分别落在 `/tmp/futures-news-items.stdout.log` / `/tmp/futures-news-items.stderr.log`。
 
 采集侧配套：无 TG 出口的机器（如 meow）用 `python3 monitor.py --collect` 跑抓取——跳过 token 闸

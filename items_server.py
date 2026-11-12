@@ -55,6 +55,8 @@ ITEMS_SCHEMA = 1                            # 与 monitor.ITEMS_SCHEMA 同值 (�
 TOKEN_ENV = "FNM_ITEMS_TOKEN"
 DEFAULT_BIND = "127.0.0.1"
 DEFAULT_PORT = 8766
+ITEMS_READ_MAX = 20000                  # 读界: 每请求最多解析的非空行数, 超帽截断 (腐化巨型档不内存放大)
+REQ_TIMEOUT_S = 30                      # 连接读/写超时(秒): 白名单内 connect-not-send 不再无限占线程 (F1)
 
 TZ_CN = ZoneInfo("Asia/Shanghai")           # 与 monitor.py 日志时区一致
 
@@ -82,12 +84,19 @@ def _err(msg: str) -> None:
 
 # ------------------------------------------------------------------ 配置/凭据
 def _load_conf() -> dict:
-    """宽容读取 conf (仅启动期一次); 缺席/坏 JSON/非 dict -> {}."""
+    """宽容读取 conf (仅启动期一次); 缺席 -> {} (正常拓扑, 静默);
+    文件在但坏 JSON/非 dict -> _err 记档 + {} (不再静默落空; 值/内容永不回显)."""
     try:
         data = json.loads(CONF.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
+    except FileNotFoundError:
+        return {}                                   # 缺席 = 正常拓扑 (env token 面), 静默
+    except (OSError, ValueError) as e:
+        _err(f"conf 不可解析, 按空配置处理: {type(e).__name__}")
         return {}
+    if not isinstance(data, dict):
+        _err(f"conf 不可解析, 按空配置处理: {type(data).__name__}")
+        return {}
+    return data
 
 
 def _resolve_token(conf: dict) -> str:
@@ -194,17 +203,21 @@ def _read_items() -> list[dict]:
                 line = line.strip()
                 if not line:
                     continue
+                if len(out) + skipped >= ITEMS_READ_MAX:
+                    _err(f"items 存档超行数帽 {ITEMS_READ_MAX}, 截断 "
+                         f"(已留 {len(out)} 条, 其后整尾丢弃)")   # F7 读界
+                    break
                 try:
                     rec = json.loads(line)
-                except (json.JSONDecodeError, RecursionError):
-                    skipped += 1                  # 病态嵌套 JSON 同坏行跳过
-                    continue
+                except (json.JSONDecodeError, RecursionError, ValueError):
+                    skipped += 1                  # 病态嵌套/超位大整数 (>4300 位 int 字面量
+                    continue                      # 抛裸 ValueError) 同坏行跳过——不穿外层丢整尾
                 if isinstance(rec, dict):
                     out.append(rec)
                 else:
                     skipped += 1                  # 顶层非对象不算有效条目
     except FileNotFoundError:
-        pass
+        _log("items 存档缺席, 按空档响应")          # F3: 缺席才记一行, 远端可分辨真空窗 vs 读径坏
     except (OSError, ValueError) as e:              # ValueError 含 UnicodeDecodeError
         _err(f"items 存档读取失败 {ITEMS_ARCHIVE.name}: {type(e).__name__}: {e} "
              f"(已读前缀 {len(out)} 条保留, 其后整尾丢弃)")
@@ -222,15 +235,22 @@ class _Handler(BaseHTTPRequestHandler):
     server_version = "fnm-items/1.0"
     protocol_version = "HTTP/1.1"                     # 每响应都显式 Content-Length
 
+    def setup(self) -> None:
+        super().setup()
+        self.request.settimeout(REQ_TIMEOUT_S)        # F1: connect-not-send 不再无限占线程
+
     def _send_json(self, code: int, payload: dict) -> None:
         body = _json_body(payload)
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        if self.command == "HEAD":            # HEAD 响应禁带体; Content-Length 头仍如实保留
-            return
-        self.wfile.write(body)
+        try:
+            self.end_headers()                   # flush_headers 亦走 wfile.write, 同收容
+            if self.command == "HEAD":           # HEAD 响应禁带体; Content-Length 头仍如实保留
+                return
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            _log(f"客户端断连, 响应未写完 ({self.client_address[0]})")   # F8: 单行收容, 不刷 traceback
 
     def _send_tg_error(self, code: int, desc: str) -> None:
         self._send_json(code, {"ok": False, "error_code": code, "description": desc})
@@ -264,9 +284,9 @@ class _Handler(BaseHTTPRequestHandler):
     do_POST = do_PUT = do_DELETE = do_PATCH = do_HEAD = do_OPTIONS = _m405
 
     def log_message(self, fmt, *args) -> None:
-        """请求日志: token 段掩码 + 客户端 IP; 凭据永不入日志."""
+        """请求日志: token 段掩码 + 客户端 IP + TZ_CN 时间戳 (与 _log/_err 同口径); 凭据永不入日志."""
         msg = fmt % args if args else fmt
-        sys.stderr.write(f"[{self.log_date_time_string()}] "
+        sys.stderr.write(f"[{datetime.now(TZ_CN).strftime('%Y-%m-%d %H:%M:%S')}] "
                          f"{self.client_address[0]} {_mask_path(msg)}\n")
 
 
