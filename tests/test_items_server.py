@@ -13,6 +13,7 @@ import importlib.util
 import io
 import json
 import os
+import socket
 import sys
 import tempfile
 import threading
@@ -135,6 +136,24 @@ class _ServerCase(unittest.TestCase):
             code, _ = self._req(method, f"/bot{TOKEN}/items")
             self.assertEqual(405, code, method)
 
+    def test_fs06c_head_405_no_body_keepalive(self):
+        # HEAD->405 禁带体 (HTTP/1.1): 漏写体会错位同 keep-alive 连接的后续响应
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        try:
+            conn.request("HEAD", f"/bot{TOKEN}/items")
+            r1 = conn.getresponse()
+            cl = r1.getheader("Content-Length")
+            self.assertEqual(405, r1.status)
+            self.assertIsNotNone(cl)
+            self.assertGreater(int(cl), 0)             # Content-Length 头仍如实保留
+            self.assertEqual(b"", r1.read())           # 但响应体必须为 absent
+            conn.request("GET", f"/bot{TOKEN}/items")  # 同连接续请: 流未被错位的体毒化
+            r2 = conn.getresponse()
+            self.assertEqual(200, r2.status)
+            self.assertEqual(1, json.loads(r2.read())["schema"])
+        finally:
+            conn.close()
+
     # ---- FS-07/08: 存档读面 ----
     def test_fs07_archive_absent(self):
         self.assertFalse(self.arch.exists())
@@ -213,6 +232,12 @@ class _ServerCase(unittest.TestCase):
         self.assertEqual(200, code)
         self.assertIn("items", obj)
 
+    def test_extra_malformed_uri_404(self):
+        # 畸形 absolute-URI (urlsplit 抛 ValueError): 回 404 包络而非连接裸崩
+        code, obj = self._get("//[bad")
+        self.assertEqual(404, code)
+        self.assertEqual({"ok": False, "error_code": 404, "description": "not found"}, obj)
+
 
 class _TokenGateCase(unittest.TestCase):
     """FS-11: token 两者皆无 -> 启动即退 3 + stderr fail-loud (不监听端口)."""
@@ -243,6 +268,95 @@ class _TokenGateCase(unittest.TestCase):
             os.environ.pop(items_server.TOKEN_ENV, None)
             self.assertEqual("conf-tok", items_server._resolve_token(conf))
             self.assertEqual("", items_server._resolve_token({}))
+
+
+class _MainAndUnitCase(unittest.TestCase):
+    """回归钉: 不起服务的 main() 门径与工具函数面 (bind/port/cidrs/属性前移)."""
+
+    def _run_main(self, conf_obj: dict):
+        """写临时 conf + 清 TOKEN_ENV 后跑 main(); 返回 (rc, 全部输出)."""
+        with tempfile.TemporaryDirectory() as td:
+            conf = Path(td) / "conf.json"
+            conf.write_text(json.dumps(conf_obj), encoding="utf-8")
+            saved = items_server.CONF
+            items_server.CONF = conf
+            sbuf, obuf = io.StringIO(), io.StringIO()
+            try:
+                with mock.patch.dict(os.environ):
+                    os.environ.pop(items_server.TOKEN_ENV, None)
+                    with contextlib.redirect_stderr(sbuf), \
+                            contextlib.redirect_stdout(obuf):
+                        rc = items_server.main()
+            finally:
+                items_server.CONF = saved
+            return rc, sbuf.getvalue() + obuf.getvalue()
+
+    def test_bind_occupied_exit2(self):
+        # 端口占用 -> fail-loud 退 2 + 错误消息含地址, 而非裸 traceback (launchd 崩环源)
+        hold = socket.socket()
+        try:
+            hold.bind(("127.0.0.1", 0))
+            hold.listen(1)
+            port = hold.getsockname()[1]
+            rc, out = self._run_main({"items_token": TOKEN,
+                                      "items_bind": "127.0.0.1",
+                                      "items_port": port})
+            self.assertEqual(2, rc)
+            self.assertIn("绑定失败", out)
+            self.assertIn(f"127.0.0.1:{port}", out)
+            self.assertNotIn(TOKEN, out)               # 凭据永不入日志
+        finally:
+            hold.close()
+
+    def test_bad_port_value_not_echoed(self):
+        # 非法 items_port -> 退 2, 错误只报类型名+长度, 值本身不回显
+        secret = "PORTSECRET-9f8e"                     # len 15
+        rc, out = self._run_main({"items_token": TOKEN, "items_port": secret})
+        self.assertEqual(2, rc)
+        self.assertIn("items_port 非法", out)
+        self.assertIn("str(len 15)", out)
+        self.assertNotIn(secret, out)
+
+    def test_cidrs_non_list_warns_not_silent(self):
+        # items_cidrs 写成裸字符串 -> 警告径 + fail-closed 仅环回 (原先静默)
+        sbuf, obuf = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stderr(sbuf), contextlib.redirect_stdout(obuf):
+            nets = items_server._parse_cidrs("CIDRSECRET")
+        out = sbuf.getvalue() + obuf.getvalue()
+        self.assertIn("items_cidrs 须为列表", out)
+        self.assertIn("str", out)                      # 只记类型名
+        self.assertNotIn("CIDRSECRET", out)            # 值不回显
+        self.assertEqual(2, len(nets))                 # 仅环回 = fail-closed
+
+    def test_cidrs_bad_entry_no_echo(self):
+        # 坏条目逐个忽略, 错误消息不带条目值 (类型+长度口径)
+        sbuf, obuf = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stderr(sbuf), contextlib.redirect_stdout(obuf):
+            nets = items_server._parse_cidrs(["ENTRYSECRET", "10.0.0.0/8"])
+        out = sbuf.getvalue() + obuf.getvalue()
+        self.assertNotIn("ENTRYSECRET", out)           # len 11 不回显值
+        self.assertIn("str(len 11)", out)
+        self.assertEqual(3, len(nets))                 # 环回×2 + 有效条目
+        self.assertTrue(items_server._cidr_allows("10.0.0.5", nets))
+
+    def test_attrs_set_before_super_init(self):
+        # items_token/cidrs 须在 super().__init__ (其内 bind+listen) 之前挂上,
+        # 否则 bind/listen 与属性赋值窗内进来的请求吃 AttributeError 掉连接
+        seen = {}
+
+        class _Probe(items_server._ItemsServer):
+            def server_bind(self):                     # 父类构造内回调; 此刻属性须在
+                seen["attrs"] = (hasattr(self, "items_token"),
+                                 hasattr(self, "cidrs"))
+                super().server_bind()
+
+        srv = _Probe(("127.0.0.1", 0), "tok", [])
+        try:
+            self.assertEqual((True, True), seen["attrs"])
+            self.assertEqual("tok", srv.items_token)
+            self.assertEqual([], srv.cidrs)
+        finally:
+            srv.server_close()
 
 
 if __name__ == "__main__":

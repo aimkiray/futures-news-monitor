@@ -95,6 +95,11 @@ def _resolve_token(conf: dict) -> str:
     return str(os.environ.get(TOKEN_ENV) or conf.get("items_token") or "").strip()
 
 
+def _conf_desc(v) -> str:
+    """配置值安全描述: 类型名(+str 时长度); 值本身永不入日志/响应体."""
+    return type(v).__name__ + (f"(len {len(v)})" if isinstance(v, str) else "")
+
+
 def _resolve_port(conf: dict) -> int | None:
     """items_port 缺省 8766; 显式但非法 (含 bool/str 非数字/越界) -> None (调用方退 2)."""
     v = conf.get("items_port")
@@ -118,7 +123,10 @@ def _parse_cidrs(raw) -> list:
             try:
                 nets.append(ipaddress.ip_network(str(c), strict=False))
             except ValueError:
-                _err(f"items_cidrs 条目不可解析, 已忽略: {c!r}")
+                _err(f"items_cidrs 条目不可解析, 已忽略: {_conf_desc(c)}")
+    elif raw is not None:
+        # 非 list 配置 (如裸字符串) 原先静默落仅环回——记警告 (只记类型名不回显值)
+        _err(f"items_cidrs 须为列表, 已按仅环回(收到 {type(raw).__name__})")
     return nets
 
 
@@ -220,6 +228,8 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
+        if self.command == "HEAD":            # HEAD 响应禁带体; Content-Length 头仍如实保留
+            return
         self.wfile.write(body)
 
     def _send_tg_error(self, code: int, desc: str) -> None:
@@ -230,7 +240,11 @@ class _Handler(BaseHTTPRequestHandler):
         if not _cidr_allows(self.client_address[0], self.server.cidrs):
             self._send_tg_error(401, "unauthorized")
             return
-        path = urllib.parse.urlsplit(self.path).path   # 查询串不影响路由
+        try:
+            path = urllib.parse.urlsplit(self.path).path   # 查询串不影响路由
+        except ValueError:                       # 畸形 absolute-URI -> 404 包络, 不让连接裸崩
+            self._send_tg_error(404, "not found")
+            return
         token = _url_path_token(path)                  # url-path 形
         if token is None:
             if path == _BEARER_PATH:
@@ -261,9 +275,10 @@ class _ItemsServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
     def __init__(self, addr, token: str, cidrs) -> None:
-        super().__init__(addr, _Handler)
+        # 先挂属性再 super(): 父类构造内已 bind+listen, 窗内请求须能读到 (免 AttributeError)
         self.items_token = token
         self.cidrs = cidrs
+        super().__init__(addr, _Handler)
 
 
 # ------------------------------------------------------------------ selftest
@@ -348,11 +363,15 @@ def main() -> int:
         return 3                                       # 与 monitor.py token 缺位退码对齐
     port = _resolve_port(conf)
     if port is None:
-        _err(f"items_port 非法 (需 1-65535 整数): {conf.get('items_port')!r}")
+        _err(f"items_port 非法 (需 1-65535 整数): 类型 {_conf_desc(conf.get('items_port'))}")
         return 2                                       # 配置非法 fail-loud, 不静默回退
     bind = str(conf.get("items_bind") or DEFAULT_BIND).strip() or DEFAULT_BIND
     cidrs = _parse_cidrs(conf.get("items_cidrs"))
-    srv = _ItemsServer((bind, port), token, cidrs)
+    try:
+        srv = _ItemsServer((bind, port), token, cidrs)
+    except OSError as e:
+        _err(f"items server 绑定失败 {bind}:{port}: {e}")
+        return 2                                       # bind 失败 fail-loud 退 2, 不裸崩
     _log(f"items server 启动 {bind}:{port} (白名单 {len(cidrs)} 网段, 每请求现读存档)")
     try:
         srv.serve_forever()
