@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  futures-news-items: FNM items 存档只读 HTTP 读面 (spec-fnm-http §3.1.3), launchd KeepAlive 常驻。
+  部署: cp items_server.py ~/.pi/agent/bin/futures-news-items.py 后
+        修正 ProgramArguments 中的用户目录 (/Users/meow -> 实际用户), 再:
+        launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.user.futures-news-items.plist
+  日志: /tmp/futures-news-items.{stdout,stderr}.log (与 monitor 的 /tmp/futures-news.* 惯例同形)
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.futures-news-items</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/env</string>
+        <string>python3</string>
+        <string>/Users/meow/.pi/agent/bin/futures-news-items.py</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/futures-news-items.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/futures-news-items.stderr.log</string>
+</dict>
+</plist>

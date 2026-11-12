@@ -35,7 +35,14 @@
 
 用法:
   futures-news-monitor.py [--dry-run] [--seed] [--all] [--limit N] [--stats] [--explain]
-                          [--flush-now] [--queue] [--selftest] [--dump-items PATH]
+                          [--flush-now] [--queue] [--selftest] [--dump-items PATH] [--collect]
+
+  --collect 采集模式 (spec-fnm-http §3.1.2): 跳 token 闸, 零 TG 出站
+      (flush_round/send/alert_all_failed/note_recovered/getUpdates/reset-probe 全免,
+      全源告警与恢复通知面整体冻结, 单源失败计数照记但发送抑制);
+      数据面全保留 fetch -> filter -> queue_upsert -> items 存档 -> queue/state 落盘,
+      退码照常 (发送段不参与合成, 落盘失败仍计 5/6)。供 items_server 读面机
+      (无 TG 出口) 跑采集; 与 --dry-run 正交, 组合取交集 (零落盘+零 TG)。
 
 读面 (spec §3.11): 新进队列的条目按 key 去重真追加到 items 存档
       ~/.pi/agent/state/futures-news-items.jsonl (JSONL 每行一条
@@ -4120,6 +4127,7 @@ class RunOpts:
     keywords: list[str]
     use_filter: bool
     budget: int
+    collect: bool                                   # --collect: 零 TG 出站采集模式 (spec-fnm-http §3.1.2)
 
 
 @dataclass
@@ -4175,6 +4183,7 @@ def load_conf(args: list[str]) -> tuple[dict, RunOpts]:
     # 该布尔值原样进入 RunOpts.inspect (字段名沿用规格 canonical 命名).
     inspect = "--stats" in args or "--queue" in args
     dry = "--dry-run" in args or inspect
+    collect = "--collect" in args                  # spec-fnm-http §3.1.2: 与 dry 正交, 组合取交集
     seed = "--seed" in args
     force_all = "--all" in args
     stats = "--stats" in args or dry
@@ -4215,7 +4224,7 @@ def load_conf(args: list[str]) -> tuple[dict, RunOpts]:
         force_flush=force_flush, show_queue=show_queue, inspect=inspect,
         digest_items=digest_items, digest_min_items=digest_min_items,
         max_hold=max_hold, digest_min=digest_min, keywords=keywords,
-        use_filter=use_filter, budget=budget)
+        use_filter=use_filter, budget=budget, collect=collect)
 
 
 def fetch_round(conf: dict, opts: RunOpts, seen: dict, ctx: RoundContext,
@@ -4719,6 +4728,28 @@ def flush_round(conf: dict, opts: RunOpts, seen: dict,
     return 0 if queue_save_ok else 6
 
 
+def collect_flush(seen: dict, plan: DigestPlan) -> int:
+    """--collect 尾段 (spec-fnm-http §3.1.2): digest_policy 之后只走数据面落盘.
+
+    零 TG 出站: 不评估 due/cap、不构造消息、不进 flush_round 发送段——触顶提示、
+    退避、老化整条发送面冻结, 发送段不参与退码合成。落盘口径与 flush_round
+    「本轮不发送」分支一致: queue_dirty 才落队列 (失败 rc=6); record_stale
+    有 stale 时自落 state, 无 stale 时 persist_state 兜底 (state 落盘失败只
+    err 留痕不改 rc)。条目留队的生命周期与不发送路径相同: QUEUE_MAX 后
+    最旧按 stale 记账丢弃, items 存档在 digest_policy 内已真追加。
+    """
+    queue_save_ok = True
+    if plan.queue_dirty and not save_queue(plan.queue):
+        err("队列落盘失败, 下轮可能重复入队")
+        queue_save_ok = False
+    record_stale(seen, plan.stale, plan.max_age)
+    if not plan.stale:
+        if not persist_state(seen):
+            err("state 落盘失败 (collect 本轮不发送), 下轮计数从旧值起算")
+    log(f"collect 队列 {len(plan.queue)} 条 (+{plan.added}), 本轮不发送 (collect 零 TG)")
+    return 0 if queue_save_ok else 6
+
+
 # ---------------------------------------------------------------- selftest helpers
 def _err_line() -> str:
     """抓 err() 写到 stderr 的那一行 (log() 只进 stdout)."""
@@ -4849,7 +4880,7 @@ def main() -> int:
         return 4                                      # 4 = state 不可读 (7 才是锁不可写)
 
     tk = resolve_token(conf)
-    if not opts.dry and not tk:
+    if not opts.dry and not opts.collect and not tk:   # --collect 零 TG 出站 -> token 非必需 (§3.1.2)
         err(f"缺少 bot token: 需设置 FUTNEWS_TOKEN 或 {CONF} 的 token 字段")
         return 3
 
@@ -4891,24 +4922,28 @@ def main() -> int:
             log(f"本轮无可用条目: 失败 {len(fetched.errors)} 源 / 跳过 {skipped} 源: {fetched.errors}")
         else:
             log(f"无可用条目: 失败 {len(fetched.errors)} 源: {fetched.errors}")
-        alert_all_failed(seen, fetched.errors, conf, tk, opts.dry, skipped, partial, round_ctx)
-        if not opts.dry and not save_json(STATE, prune(seen)):
+        if not opts.collect:                          # collect 冻结全源告警面: 不记账也不发 (MC-03 零调用)
+            alert_all_failed(seen, fetched.errors, conf, tk, opts.dry, skipped, partial, round_ctx)
+        if not opts.dry and not save_json(STATE, prune(seen)):   # 数据面保留: _research 节流戳等照常落盘
             err("告警状态落盘失败")
         return 0 if opts.inspect else 1         # 检视模式 rc 恒 0, 不因源失败返 1 (Batch 9 U4-F-02)
 
     if prune_src_fail(seen):
         if not opts.dry and not save_json(STATE, prune(seen)):
             err("单源失败残留清理落盘失败")
-    if source_health(seen, fetched.outcomes, conf, tk, opts.dry, round_ctx):
+    if source_health(seen, fetched.outcomes, conf, tk,
+                     opts.dry or opts.collect, round_ctx):   # collect: 失败计数照记, 内部 dry 分支抑制发送
         if not opts.dry and not save_json(STATE, prune(seen)):
             err("单源告警状态落盘失败 (下轮计数从旧值起算)")
-    if note_recovered(seen, conf, tk, opts.dry, round_ctx):
-        if not opts.dry and not save_json(STATE, prune(seen)):
+    if not opts.collect and note_recovered(seen, conf, tk, opts.dry, round_ctx):
+        if not opts.dry and not save_json(STATE, prune(seen)):   # collect 冻结恢复通知面 (MC-03 零调用)
             err("恢复状态落盘失败")
 
     plan = digest_policy(conf, opts, seen, fetched, round_ctx)
     if plan.rc is not None:
         return plan.rc
+    if opts.collect:                                  # collect 尾段: 只落盘, 不进 flush_round 发送段 (零 TG)
+        return collect_flush(seen, plan)
     return flush_round(conf, opts, seen, plan, tk, pending, round_ctx, send_ctx)
 
 
@@ -8204,7 +8239,7 @@ def selftest() -> int:
         dry=False, seed=False, stats=False, explain=False, force_flush=False,
         show_queue=False, inspect=False, digest_items=40, digest_min_items=3,
         max_hold=2700, digest_min=30, keywords=DEFAULT_KEYWORDS,
-        use_filter=True, budget=45)
+        use_filter=True, budget=45, collect=False)
     _r8_seen = {"seedmarker": 1}
     _r8_send0 = globals()["send"]
     _r8_ps0 = globals()["persist_state"]
@@ -11343,10 +11378,81 @@ target="_blank">石脑油市场早间提示（20261109）</a>
           and len(_b18_q3) == 2,
           f"rc={_b18_r3} n={len(_b18_p3)} day={_b18_s3.get('_day')} q={len(_b18_q3)}")
 
+    # ==== Batch 19: --collect 采集模式 (spec-fnm-http §3.1.2 / MC-01..04) ====
+    # 钉: 跳 token 闸 / 零 TG 出站 (四函数桩零调用 + tg 载荷零) / 数据面全保留;
+    # 与 --dry-run 正交, 组合取交集 (零落盘 + 零 TG).
+    def _b19_src(key: str):
+        return lambda deadline=None: [
+            {"src": "S0", "ts": int(time.time()) - 60,
+             "text": "沪铜库存变化9吨环比9%", "key": key}]
+
+    def _b19_arch_items(td: Path) -> list[dict]:
+        p = td / "state" / "items.jsonl"
+        if not p.exists():
+            return []
+        return [json.loads(l) for l in p.read_text().splitlines() if l.strip()]
+
+    with tempfile.TemporaryDirectory() as _td:
+        _clk = _B6Clock(1793800000)
+        _calls = {n: 0 for n in ("flush_round", "send", "alert_all_failed",
+                                "note_recovered", "discover_chat_id")}
+        _b19_kept = {n: globals()[n] for n in _calls}
+        for _n in _calls:
+            globals()[_n] = (lambda n: (lambda *a, **kw: _calls.__setitem__(
+                n, _calls[n] + 1) or False))(_n)
+        _env0 = os.environ.pop("FUTNEWS_TOKEN", None)   # 钉死 token 缺位前提
+        try:
+            _rc, _pay, _stt, _q, _cfg = _b6_run_main(
+                Path(_td), _clk, [("S0", _b19_src("b19-1"))],
+                args=["--collect"], conf_extra={"token": ""},
+                state={"seedmarker": 1})
+        finally:
+            for _n, _v in _b19_kept.items():
+                globals()[_n] = _v
+            if _env0 is not None:
+                os.environ["FUTNEWS_TOKEN"] = _env0
+        _b19_items = _b19_arch_items(Path(_td))
+        check("B19-01 --collect 无 token 可启动 (不以 3 退出)",
+              _rc == 0, f"rc={_rc}")
+        check("B19-02 --collect 数据面: items 存档真追加 + 队列落盘",
+              len(_b19_items) == 1 and _b19_items[0].get("key") == "b19-1"
+              and _b19_items[0].get("schema") == ITEMS_SCHEMA
+              and any(it.get("key") == "b19-1" for it in _q),
+              f"arch={len(_b19_items)} q={len(_q)}")
+        check("B19-03 --collect 零 TG: flush_round/send/alert_all_failed/note_recovered 零调用",
+              _calls == {"flush_round": 0, "send": 0, "alert_all_failed": 0,
+                         "note_recovered": 0, "discover_chat_id": 0}
+              and not _pay,
+              f"calls={_calls} pay={len(_pay)}")
+    with tempfile.TemporaryDirectory() as _td:
+        _clk = _B6Clock(1793800000)
+        _rc, _pay, _stt, _q, _cfg = _b6_run_main(
+            Path(_td), _clk, [("S0", _b19_src("b19-2"))],
+            args=["--dry-run"], conf_extra={"token": ""},
+            state={"seedmarker": 1})
+        check("B19-04 --dry-run 对照: 存档不写, 队列不落盘",
+              _rc == 0 and not _b19_arch_items(Path(_td)) and not _q,
+              f"rc={_rc} arch={len(_b19_arch_items(Path(_td)))} q={len(_q)}")
+    with tempfile.TemporaryDirectory() as _td:
+        _clk = _B6Clock(1793800000)
+        _rc, _pay, _stt, _q, _cfg = _b6_run_main(
+            Path(_td), _clk, [("S0", _b19_src("b19-3"))],
+            args=["--collect", "--dry-run"], conf_extra={"token": ""},
+            state={"seedmarker": 1})
+        check("B19-05 --collect+--dry-run 交集: 零落盘 + 零 TG",
+              _rc == 0 and not _b19_arch_items(Path(_td)) and not _q and not _pay,
+              f"rc={_rc} q={len(_q)} pay={len(_pay)}")
+    check("B19-06 load_conf: collect 与 dry 正交可组合, 缺省 False",
+          load_conf(["--collect"])[1].collect and not load_conf(["--collect"])[1].dry
+          and load_conf(["--collect", "--dry-run"])[1].collect
+          and load_conf(["--collect", "--dry-run"])[1].dry
+          and not load_conf([])[1].collect)
+
     # ==== Batch 17: 内嵌真实 PDF 样本 / 缺工具显式 SKIP ====
     # 旧码 (batch16, 00be299) 样本缺失时打桩仍 ok; B17-01/02/03/04 在旧码上均红.
-    _B17_TOTAL = 554                         # 544 (Batch 16 实测) + 6 (B17-01..06) + 2 (B18-01..02)
-                                             # + 1 (B16-38 深审 R6) + 1 (B18-03 深审 R5) = 554
+    _B17_TOTAL = 560                         # 544 (Batch 16 实测) + 6 (B17-01..06) + 2 (B18-01..02)
+                                             # + 1 (B16-38 深审 R6) + 1 (B18-03 深审 R5)
+                                             # + 6 (B19-01..06 --collect, spec-fnm-http §3.1.2) = 560
     _B17_COUNTER_ENV = "FUTNEWS_SELFTEST_COUNTER_PROBE"
 
     def _b17_a01():

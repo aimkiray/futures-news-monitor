@@ -203,12 +203,16 @@ launchd 定时任务由使用者自行创建，推荐 `StartInterval` 设为 120
 ## 测试
 
 ```bash
-python3 monitor.py --selftest    # 内嵌断言回归（552 条）
-python3 tests/sim.py             # 23 个行为场景（临时目录，不碰真实状态）
-python3 tests/probe2.py          # 69 条语料判定回归
-python3 tests/probe4.py          # 词表边界正反例
-python3 tests/ab.py              # 与旧版本 baseline-v4.py 的语料 A/B 对照
-python3 tests/golden.py --check  # 31 个确定性场景的行为等价基线
+python3 monitor.py --selftest        # 内嵌断言回归（560 条，含 B19 --collect 钉）
+python3 items_server.py --selftest   # items 读面离线自检（不监听端口）
+python3 tests/sim.py                 # 23 个行为场景（临时目录，不碰真实状态）
+python3 tests/probe2.py              # 69 条语料判定回归
+python3 tests/probe4.py              # 词表边界正反例
+python3 tests/ab.py                  # 与旧版本 baseline-v4.py 的语料 A/B 对照
+python3 tests/golden.py --check      # 31 个确定性场景的行为等价基线
+python3 tests/test_items_archive.py  # items 存档契约（JSONL/去重/轮转/dump）
+python3 tests/test_items_server.py   # items 读面契约（FS-01..FS-11，真端口）
+python3 tests/test_collect.py        # --collect 采集模式（MC-01..MC-04，实跑 main）
 ```
 
 测试全部离线运行，使用临时目录隔离状态，不会发送真实消息。
@@ -256,12 +260,57 @@ python3 tests/golden.py --check --scenario proxy_leg    # 只跑单个场景（�
 脚本默认使用 `PATH` 中的 `python3`，可用 `PY=/path/to/python3 ./deploy.sh` 指定解释器。
 目标目录为 `~/.pi/agent/bin/`，替换失败或部署后 selftest 不通过会自动回滚到备份。
 
+## items 读面服务（items_server.py）
+
+`items_server.py` 是 items 存档的只读 HTTP 读面，供 LAN 内消费端（如 commodity-trade-brief 的
+`fnm_adapter --fnm-url` / `--fnm-config`）跨机拉取 `~/.pi/agent/state/futures-news-items.jsonl`。
+单文件、stdlib-only，launchd `KeepAlive` 常驻；每请求现读存档，无缓存。
+
+### 契约
+
+- `GET /bot<token>/items` → `200 {"schema":1,"items":[...]}`（裸形，非 TG ok 包络）
+- `GET /bot/items` + `Authorization: Bearer <token>` → 同上（bearer 形，token 不进 URL/进程表）
+- 存档缺席或为空 → `200 {"schema":1,"items":[]}`（不是 404）
+- 错误一律 TG 包络形：`401 unauthorized` / `404 not found` / `405 method not allowed`
+- 请求日志中 token 段一律掩码为字面 `/bot<token>/items`；token 永不进日志/响应体
+
+### 配置（`~/.pi/agent/etc/futures-news.json` 同档）
+
+| 字段 | 缺省 | 说明 |
+|---|---|---|
+| `items_token` | 无（必填） | 读面 token；也可用环境变量 `FNM_ITEMS_TOKEN`（优先级更高）。两者皆无 → 启动即以退码 3 退出 |
+| `items_bind` | `127.0.0.1` | 绑定地址；开放 LAN 时写 LAN IP 或 `0.0.0.0` |
+| `items_port` | `8766` | 监听端口（非法值 → 退码 2） |
+| `items_cidrs` | 无 | 网段白名单列表，如 `["192.168.31.0/24"]`；缺席时仅环回可达（fail-closed），环回始终放行 |
+
+生产建议 bearer 形（消费端走 `--fnm-config` 文件径）：URL-path 形的 token 会出现在
+URL 与对端进程命令行。token 轮换只需改 conf/env 后重启服务（`launchctl kickstart -k`）。
+
+### 部署
+
+```bash
+cp items_server.py ~/.pi/agent/bin/futures-news-items.py
+chmod +x ~/.pi/agent/bin/futures-news-items.py
+python3 ~/.pi/agent/bin/futures-news-items.py --selftest   # 离线自检, 不监听端口
+cp deploy/com.user.futures-news-items.plist ~/Library/LaunchAgents/
+# 按实际用户名修正 plist 内 /Users/meow 路径
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.user.futures-news-items.plist
+```
+
+stdout/stderr 分别落在 `/tmp/futures-news-items.stdout.log` / `/tmp/futures-news-items.stderr.log`。
+
+采集侧配套：无 TG 出口的机器（如 meow）用 `python3 monitor.py --collect` 跑抓取——跳过 token 闸
+与全部 TG 出站（告警/发送/恢复通知全免），数据面照常 `fetch → queue_upsert → items 存档 →
+queue/state 落盘`，退码语义不变；与 `--dry-run` 正交，组合取交集（零落盘 + 零 TG）。
+
 ## 目录
 
 ```
 monitor.py          主程序（部署源）
+items_server.py     items 存档只读 HTTP 读面（部署为 futures-news-items.py）
 baseline-v4.py      旧版判定实现，供 tests/ab.py 对照
 deploy.sh           部署脚本
+deploy/             launchd plist 模板（items server KeepAlive）
 tests/              行为场景、语料回归与 A/B 对照
 tests/golden.py     行为等价基线：31 场景录制/校验
 tests/golden/       快照夹具 + MANIFEST.json（逐文件 SHA256）
