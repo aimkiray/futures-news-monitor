@@ -29,7 +29,7 @@
       futures-news-monitor.py, 非合法模块标识符, 自重读才是可部署形态)。
       meta 旁路闸: .meta.json 为 dict 且 schema 键明示 != 1 -> 空档 (fail-closed);
       meta 缺席/坏 JSON/无 schema 键 -> 不阻断 (行内 schema 自足, 写侧才是真源)。
-      读径坏 (文件在但 open/迭代 OSError 或 decode 错) -> 503, 不吃前缀装空档。
+      读径坏 (文件在但非普通文件/open/迭代 OSError 或 decode 错) -> 503, 不吃前缀装空档。
 
 服务模型: ThreadingHTTPServer 单进程多线程, launchd KeepAlive 保活;
       请求日志中 /bot<...>/items 的 token 段一律掩码为 /bot<token>/items。
@@ -59,6 +59,7 @@ TOKEN_ENV = "FNM_ITEMS_TOKEN"
 DEFAULT_BIND = "127.0.0.1"
 DEFAULT_PORT = 8766
 ITEMS_READ_MAX = 20000                  # 读界: 每请求最多解析的非空行数, 超帽截断 (腐化巨型档不内存放大)
+ITEMS_READ_MAX_BYTES = 32 * 1024 * 1024  # 读界: 迭代累计字节界, 超界截断 (单行巨型行不内存放大, 与行数帽同口径)
 REQ_TIMEOUT_S = 30                      # 连接读/写超时(秒): 白名单内 connect-not-send 不再无限占线程 (F1)
 
 TZ_CN = ZoneInfo("Asia/Shanghai")           # 与 monitor.py 日志时区一致
@@ -179,17 +180,18 @@ def _mask_path(s: str) -> str:
 
 # ------------------------------------------------------------------ 存档读面
 def _load_meta():
-    """旁路 .meta.json 宽容读取; 缺席/坏 JSON -> None (不阻断, 见 _read_items)."""
+    """旁路 .meta.json 宽容读取; 缺席/坏 JSON/病态深嵌套 -> None (不阻断, 见 _read_items)."""
     try:
         return json.loads(ITEMS_META.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
+    except (OSError, ValueError, RecursionError):
+        return None                                # RecursionError: 病态深嵌套 meta,
+                                                   # 与存档行级收容同口径 (A4)
 
 
 class _ArchiveReadError(Exception):
-    """内部哨兵: 存档在但读径坏 (open/迭代 OSError 或 decode 错) ——
+    """内部哨兵: 存档在但读径坏 (非普通文件 / open/迭代 OSError 或 decode 错) ——
     _read_items 抛出, do_GET 捕之回 503 TG 包络; 读径坏显形, 不吞成
-    200 前缀/空档与真空窗同形 (spec-fnm-obs R3, CTB 侧经 HTTPError 衔接)。"""
+    200 前缀/空档与真空窗同形 (spec-fnm-obs R3/A3, CTB 侧经 HTTPError 衔接)。"""
 
 
 def _read_items() -> list[dict]:
@@ -197,6 +199,10 @@ def _read_items() -> list[dict]:
 
     逐行解析: 坏行/非对象行跳过计数入日志; 文件缺席 -> [];
     非法 UTF-8/IO 错 -> 抛 _ArchiveReadError (本请求 503, 已读前缀随整尾丢弃)。
+    类型闸: 路径在但非普通文件 (目录/FIFO/设备/symlink 落非普通) -> _ArchiveReadError
+    -> 503 (FIFO open 永久阻塞/线程泄漏在此截断); 不存在走 FileNotFoundError 原径。
+    读界双帽: 行数帽 ITEMS_READ_MAX 与累计字节界 ITEMS_READ_MAX_BYTES 同口径——
+    超帽/超界 _err 记档 + break 截断 -> 200 前缀 (受控限量, 非读径坏不升 503)。
     meta 闸: meta 为 dict 且显含 schema 键且 != ITEMS_SCHEMA -> [] (fail-closed);
     其余 meta 形态不阻断 (monitor 写侧每次追加都自愈 meta, 缺席=陈旧非不兼容)。
     """
@@ -204,11 +210,24 @@ def _read_items() -> list[dict]:
     if isinstance(meta, dict) and "schema" in meta and meta["schema"] != ITEMS_SCHEMA:
         _log("items meta schema 不符, 本请求按空档响应")
         return []
+    if os.path.exists(ITEMS_ARCHIVE) and not os.path.isfile(ITEMS_ARCHIVE):
+        # A3 文件类型闸: exists/isfile 均 follow symlink——dangling symlink 落
+        # exists 假走 FNF 200 原径; 在而非常规文件 (目录/FIFO/设备/链接落非普通)
+        # 一律 503 显形, 不在 open 上永久阻塞 (FIFO) 或裸吃 OSError 后才 503
+        _err(f"items 存档非普通文件 {ITEMS_ARCHIVE.name}: "
+             f"本请求 503 显形 (目录/FIFO/设备/非普通文件统收)")
+        raise _ArchiveReadError("non-regular archive")
     out: list[dict] = []
     skipped = 0
+    nbytes = 0
     try:
         with open(ITEMS_ARCHIVE, "r", encoding="utf-8") as fh:
             for line in fh:
+                nbytes += len(line.encode("utf-8", errors="replace"))  # 读径字节估算
+                if nbytes > ITEMS_READ_MAX_BYTES:           # A3 字节界: 单行巨型行
+                    _err(f"items 存档超字节界 {ITEMS_READ_MAX_BYTES}, 截断 "   # 不整吃
+                         f"(已留 {len(out)} 条, 其后整尾丢弃)")   # 内存; 与行数帽同口径
+                    break
                 line = line.strip()
                 if not line:
                     continue

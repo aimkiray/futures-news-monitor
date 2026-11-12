@@ -375,6 +375,78 @@ class _ServerCase(unittest.TestCase):
         self.assertEqual(200, code)
         self.assertEqual({"schema": 1, "items": []}, obj)
 
+    # ---- fnm-obs 深审修单钉 A4/T3: meta 病态深嵌套按缺席放行 ----
+    def test_a4_meta_deep_nesting_200(self):
+        """A4/T3: .meta.json 病态深嵌套 (规格形 "["*2000+"]"*2000) -> json.loads
+        抛 RecursionError, _load_meta 收容归 None (meta 缺席口径, meta 非真源)
+        -> 200 正常读档; 旧径 RecursionError 穿透 do_GET 杀 handler 线程
+        -> 掉连接+stderr traceback。
+        深度取 100000: CPython 3.13 C scanner 递归预算 >2000 层 (实测 2000 解析
+        成功/5000 才抛), 100000 跨版本稳触发 RecursionError。"""
+        self._write_archive([{"src": "s", "ts": 1, "text": "x", "key": "k"}])
+        self.meta.write_text("[" * 100000 + "]" * 100000, encoding="utf-8")
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            code, obj = self._get(f"/bot{TOKEN}/items")     # 旧径此处 RemoteDisconnected
+        self.assertEqual(200, code)
+        self.assertEqual(1, len(obj["items"]))              # 存档照常读到
+        self.assertNotIn("Traceback", buf.getvalue())       # handler 线程不裸崩
+
+    # ---- fnm-obs 深审修单钉 A3/T4: 读径文件类型闸 + 累计字节界 ----
+    def test_a3_dir_archive_503(self):
+        """A3/T4: 存档路径是目录 -> exists 真 isfile 假 -> _ArchiveReadError -> 503
+        TG 包络 (目录/FIFO/设备/symlink 落非普通文件统收)。"""
+        self.arch.mkdir()
+        self.assertTrue(self.arch.exists())
+        self.assertFalse(self.arch.is_file())
+        code, obj = self._get(f"/bot{TOKEN}/items")
+        self.assertEqual(503, code)
+        self.assertEqual({"ok": False, "error_code": 503,
+                          "description": "archive read error"}, obj)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "POSIX only: Windows 无 mkfifo")
+    def test_a3_fifo_archive_503(self):
+        """A3/T4: 存档路径造 FIFO -> isfile 假 -> 503; 旧径 open(FIFO) 永久阻塞
+        挂死 handler 线程 (连接等死+线程泄漏), 类型闸即为此截断。"""
+        os.mkfifo(self.arch)
+        self.assertTrue(self.arch.exists())
+        self.assertFalse(self.arch.is_file())
+        code, obj = self._get(f"/bot{TOKEN}/items")         # 旧径 client 5s 超时红
+        self.assertEqual(503, code)
+        self.assertEqual("archive read error", obj["description"])
+
+    def test_a3_symlink_to_dir_503(self):
+        """A3/T4: symlink->目录 -> exists 随链接为真 / isfile 为假 -> 503
+        (exists/isfile 均 follow symlink; dangling symlink -> exists 假 -> FNF 200
+        原径, 由 fs07/r3_2 同形覆盖)。Windows 无 symlink 特权时 skip——
+        闸逻辑由 test_a3_dir_archive_503 同形覆盖。"""
+        target = Path(self._td.name) / "realdir"
+        target.mkdir()
+        try:
+            self.arch.symlink_to(target, target_is_directory=True)
+        except (OSError, NotImplementedError) as e:
+            self.skipTest(f"symlink 特权不可用: {e}")
+        self.assertTrue(self.arch.exists())                 # follow -> 目录在
+        self.assertFalse(self.arch.is_file())               # follow -> 非普通文件
+        code, obj = self._get(f"/bot{TOKEN}/items")
+        self.assertEqual(503, code)
+        self.assertEqual("archive read error", obj["description"])
+
+    def test_a3_byte_cap_truncates_200(self):
+        """A3/T4: 累计字节界 ITEMS_READ_MAX_BYTES=32MiB——首行好条目 + 33MB
+        单行无换行 -> 超界 _err 记档 + break 截断 -> 200 前缀保留 (与行数帽
+        同口径受控限量; 旧径无字节界, 33MB 行整吃内存照常解析进 items)。"""
+        self.assertEqual(32 * 1024 * 1024, items_server.ITEMS_READ_MAX_BYTES)
+        self.arch.write_bytes(
+            b'{"src":"s","ts":1,"text":"ok","key":"k0"}\n'
+            + b'{"key":"kbig","text":"' + b"x" * (33 * 1024 * 1024) + b'"}\n')
+        obuf, sbuf = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(obuf), contextlib.redirect_stderr(sbuf):
+            code, obj = self._get(f"/bot{TOKEN}/items")
+        self.assertEqual(200, code)
+        self.assertEqual(["k0"], [i["key"] for i in obj["items"]])   # 截断留前缀
+        self.assertIn("超字节界", obuf.getvalue() + sbuf.getvalue())
+
 
 class _TokenGateCase(unittest.TestCase):
     """FS-11: token 两者皆无 -> 启动即退 3 + stderr fail-loud (不监听端口)."""
