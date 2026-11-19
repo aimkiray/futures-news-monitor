@@ -35,7 +35,7 @@
 
 | 源 | 接口 | 链路 |
 |---|---|---|
-| Mining | `www.mining.com/feed` | 直连 |
+| Mining | `www.mining.com/feed/` | 直连 |
 | OilPrice | `oilprice.com/rss/main` | 直连 |
 | MiningTech | `www.mining-technology.com/feed/` | 直连 |
 | Nasdaq | `www.nasdaq.com/feed/rssoutbound?category=Commodities` | 直连 |

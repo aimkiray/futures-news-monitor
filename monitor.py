@@ -13,7 +13,7 @@
   SMM      news.smm.cn/live (SSR __NEXT_DATA__, 有色产业快讯; 站点强制 gzip, --compressed 是硬依赖)
 
   英文源 (Batch 6, RSS 2.0; 前 6 个直连, 后 2 个经 conf.proxy / HTTPS_PROXY):
-  Mining      www.mining.com/feed                                 (36 条, 矿业/金属)
+  Mining      www.mining.com/feed/                                (36 条, 矿业/金属)
   OilPrice    oilprice.com/rss/main                               (15 条, 原油/天然气)
   MiningTech  www.mining-technology.com/feed/                     (10 条, 需 Feed 客户端 UA)
   Nasdaq      www.nasdaq.com/feed/rssoutbound?category=Commodities (15 条, RTTNews)
@@ -2336,7 +2336,8 @@ def src_smm(deadline: float | None = None) -> list[dict]:
 FEED_HTTP = {"tries": 2, "cap": 8}     # 新源: 2 次重试 / 单次上限 8s (中文源仍 3 次 / 12s)
 FEED_UA = ("Feedly/1.0 (+http://www.feedly.com/fetcher.html; 4 subscribers; )")
                                        # 部分站点按 UA 拦浏览器指纹: 浏览器 UA 403, Feed 客户端 UA 200
-FEED_MINING = "https://www.mining.com/feed"
+FEED_MINING = "https://www.mining.com/feed/"
+                                       # 尾斜杠必需: 无斜杠 301 到 /feed/, feed_http 不带 -L 会硬失败
 FEED_OILPRICE = "https://oilprice.com/rss/main"
 FEED_MININGTECH = "https://www.mining-technology.com/feed/"
 FEED_NASDAQ = "https://www.nasdaq.com/feed/rssoutbound?category=Commodities"
